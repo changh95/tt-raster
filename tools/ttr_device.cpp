@@ -11,6 +11,7 @@
 //   --bench R   after the checks, run the frame R more times and report device time statistics
 //   --define    extra kernel compile-time define, for experiments (affects the checks too)
 //   --colour-only  read back only the colour plane (production read-back; checks image only)
+//   --golden    (grid mode, 1920x1088) also compare the colour plane with tests/golden/<scene>_1920x1088.png
 //   --strict    also compare pixels the reference flags as depth-ambiguous (exact ties are expected to agree)
 //
 // Checks, per scene, on the drawn tiles:
@@ -108,7 +109,7 @@ int main(int argc, char** argv) {
     std::string which = "all", mode = "crops", png_dir;
     uint32_t w = 1920, h = 1088, n_cores = 0;
     int tile_x = -1, tile_y = -1, bench = 0;
-    bool colour_only = false, strict = false;
+    bool colour_only = false, strict = false, golden = false;
     std::map<std::string, std::string> defines;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -124,6 +125,8 @@ int main(int argc, char** argv) {
             png_dir = argv[++i];
         } else if (a == "--bench" && i + 1 < argc) {
             bench = std::atoi(argv[++i]);
+        } else if (a == "--golden") {
+            golden = true;
         } else if (a == "--strict") {
             strict = true;
         } else if (a == "--colour-only") {
@@ -216,6 +219,23 @@ int main(int argc, char** argv) {
             dev.times.records ? double(dev.times.vec_partial) / double(dev.times.records) : 0.0,
             dev.times.records ? double(dev.times.vec_full) / double(dev.times.records) : 0.0, dev.times.build_ms, dev.times.upload_ms, dev.times.device_ms,
             dev.times.readback_ms);
+        if (golden) {
+            Image g;
+            const std::string path = std::string(TT_RASTER_GOLDEN_DIR) + name + "_" + std::to_string(w) + "x" + std::to_string(h) + ".png";
+            if (!read_png(path, g) || g.width != w || g.height != h) {
+                std::printf("    golden: cannot read %s\n", path.c_str());
+                all_ok = false;
+            } else {
+                const Image d = image_from_framebuffer(dev.fb, w, h);
+                // Compare everywhere except pixels the reference flags as depth-ambiguous (the golden is the reference's own output).
+                uint64_t bad = 0;
+                for (uint32_t y = 0; y < h; y++)
+                    for (uint32_t x = 0; x < w; x++)
+                        if (!ref.ambiguous[ref.index(x, y)] && std::memcmp(d.pixel(x, y), g.pixel(x, y), 4) != 0) bad++;
+                std::printf("    golden image: %llu mismatching pixels\n", static_cast<unsigned long long>(bad));
+                all_ok &= bad == 0;
+            }
+        }
         if (bench > 0) {
             std::vector<double> t_dev, t_all;
             DeviceTimes last;

@@ -14,6 +14,7 @@ if(TT_RASTER_BUILD_DEVICE)
 
     add_executable(ttr_device ttr_device.cpp)
     target_link_libraries(ttr_device PRIVATE ttraster_tensix)
+    target_compile_definitions(ttr_device PRIVATE TT_RASTER_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/")
 
     add_executable(ttr_multichip ttr_multichip.cpp)
     target_link_libraries(ttr_multichip PRIVATE ttraster_tensix)
