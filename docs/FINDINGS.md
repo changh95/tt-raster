@@ -106,6 +106,7 @@ Scalars use path A (L1 runtime immediates) in both layouts, so no slot is reserv
 ## Decisions
 
 - 2026-11-10: tt-metal is a fresh `v0.81.1` checkout next to this repository. The other tt-metal checkouts on the machine belong to other projects and are not touched.
+- 2026-11-10: Phase 1 and Phase 2 (2.1 to 2.6) finished on the same day; Phase 2 STOP reached. Track choice is open (see the Phase 2 report).
 - 2026-11-10: Phase 0 STOP answered: scalar delivery path A (L1 runtime immediates, triangle-major) and the half-sync Dest layout above are approved. Phase 1 started the same day.
 - 2026-11-10: Track G (softpipe fork) is superseded by the llvmpipe and lavapipe fork in `docs/FULL_COVERAGE_PLAN.md`. Confirmation pending.
 
@@ -159,3 +160,44 @@ The 1,824 tiny triangles that vanish in setup are zero-area after snapping or fi
 ### Incident: scenes were not portable
 
 The first gcc build of the goldens failed for the three scenes that draw several random numbers inside one function call. C++ leaves argument evaluation order unspecified (clang goes left to right, gcc right to left), so the same seed gave different scenes. Every draw is now its own statement. Rule for new scenes and tests: never put two RNG draws in one expression.
+
+## Phase 2: Tensix rasterizer v1
+
+Code: `src/tensix/` (host renderer, multi-chip driver, kernels), `tools/ttr_device` and `tools/ttr_multichip`, acceptance script `scripts/test_device.sh`. Numbers are in `docs/PERF.md`.
+
+### Result
+
+The device image is **bit-identical to the CPU reference and to the committed golden PNGs** for every scene at 1920 x 1088 on one chip (all 120 worker cores), and the 2, 4 and 8-chip images are bit-identical to the single-chip image. Coverage (checked by a separate debug run that counts covering triangles per pixel), visible triangle id and colour agree exactly on every pixel; the only differences are in depth, at most 2.4e-7 (one FP32 ulp at depth near 1), on pixels that the reference flags as depth-ambiguous, and even there the colour agrees. Exact depth ties under LESS_EQUAL (65,499 pixels in `coplanar_lequal`) also agree with no tolerance (`--strict`).
+
+So the V10 concern about the SFPU's partially fused multiply-add did not matter: edge tests are exact by construction (docs: Phase 1, evaluation contract), and the depth and colour planes came out equal to `std::fmaf` on these inputs.
+
+### Design
+
+- **Work lists.** The host builds one 128-byte record per (tile, triangle) pair from the Phase 1 setup: three edges `(a, b, c)`, depth plane `(c, gx, gy)`, four colour planes, triangle id, flags, and a 2-bit class per SFPU vector. Records are grouped in 4 KiB pages (32 records, one FP32 tile, so a circular-buffer page is a tile). A tile block is a header record plus its records, padded to whole pages. Cores get contiguous, cost-balanced runs of tiles (`split_balanced`: 1.5 + records per tile, which is within 0.5% across 8 chips on `random_10k`).
+- **Kernels.** The reader streams pages from DRAM into a 4-page circular buffer; the compute kernel clears the tile, draws every record, quantizes colour once and packs; the writer writes the planes. One program for all cores, per-core runtime arguments.
+- **Dest layout used:** FP32 full sync, 8 tiles: depth, R, G, B, A, dx, dy, triangle id. The Phase 0 proposal (half sync, packed RGBA8 in one tile) was implemented too, behind `RASTER_PACKED_COLOUR`, and measured: within about +/-10% of the planes layout on most scenes, 4% slower on `random_10k` and 38% slower on a single full-screen smooth triangle (per-pixel quantization of four channels is about 25 extra SFPU instructions per vector), a few percent faster on flat-colour scenes (a flat triangle stores one constant, and no per-tile quantization pass). Planes were kept as the default because they cost nothing in capacity here and do not penalize smooth shading; packed + half sync stays available and is the layout to use if Dest slots are ever needed.
+- **Per-vector classes (the big win).** The host classifies every one of the 32 SFPU vectors of a tile exactly, from the four extreme pixel centres (plus a bounding-box reject): class 0 = no pixel inside (skipped by the kernel), 2 = every pixel inside (no edge tests), 1 = partial. On the test scenes 82% of vectors are rejected. `tests/test_classify.cpp` checks every class against plain int64 per-pixel tests (0 wrong in 867,000 vectors).
+- **Plan item 2.2** (a scalar bounding-box check on the math thread) is not needed: the host's exact tile and vector rejection already removes everything that cannot touch the tile or the vector, and a record never reaches the device otherwise.
+- **Multi-chip** (2.6): bands of tiles per chip (same balanced split), one `render()` per chip from its own host thread, all writing disjoint tiles of one shared framebuffer. No chip-to-chip traffic.
+
+### Per-core L1 budget
+
+Kernel code: unpack 0.8 KB, math 8.3 KB, pack 1.6 KB, reader 0.8 KB, writer 1.0 KB (12.5 KB in total). Circular buffers: triangle pages 4 x 4 KiB = 16 KiB, output planes 2 x 4 KiB each: 8 KiB for colour only, 24 KiB with the depth and id debug planes. Total 36 to 52 KiB of the 1,536 KiB per core (2.3 to 3.4%). There is room for much deeper buffering.
+
+### What we learned about the hardware and tt-metal
+
+1. **The math RISC-V core is the bottleneck, not the SFPU.** It issues every SFPU instruction as a store of the instruction word, so the cost of a vector is the cost of *building and pushing* its words: about 2.4 RISC-V cycles per SFPU instruction here, against 1 SFPU cycle. Runtime vector indices (`dst_reg[slot*32 + v]`) cost three RISC-V instructions per load or store. Using the destination counter (`dst_reg++`, constant offsets) makes each word a constant: -23% time. Float scalars delivered as immediates (V5 path A) cost two `SFPLOADI` words each per use, and a full vector with smooth colour uses about 50 of them, which is why the cost per vector is about 135 cycles (depth and colour) plus 83 cycles for three edge tests. Cost model measured on `random_10k`: about 5 us per tile of fixed work, about 135 cycles per fully covered vector, about 220 per partial vector, and about 0.3 us of launch (0.75 us with 120 cores).
+2. **Colour writes are 54% of the triangle time** (ablation: removing the colour stores took `random_10k` from 2.95 to 1.82 ms). SIMD predication does not skip work, so a depth pre-pass cannot avoid colour work per vector; it would only add a second pass. Not implemented, for that reason.
+3. **MATH to UNPACK release.** The math thread reads records straight from the L1 page, but `cb_pop_front` runs on the unpack thread with no ordering against the math thread's loads, so the reader can refill a page that is still being read. tt-metal's own `triangle_solve_tile` has the identical problem and solves it with a message from MATH to UNPACK before the pop; the kernel does the same (`mailbox_write(UnpackThreadId)` / `mailbox_read(MathThreadId)`). Bit-exact output on millions of pixels shows it holds.
+4. **SFPU registers cannot be spilled.** Eight vector registers; code that keeps too many `vFloat` or `vUInt` live fails at link time with "cannot read/write SFPU object from memory". It also appears when a helper that passes vectors is not inlined: mark such helpers `always_inline`. Packing four colour channels into one word needed accumulating through Dest instead of registers.
+5. **Integer and packing idioms that work.** `sfpi::convert<vUInt16>(x, RoundMode::Nearest)` with `<<` and `|` quantizes and packs; `dst_reg[i] = vUInt` is a raw 32-bit integer store (the SFPSTORE INT32 mode); the packer to a Float32 circular buffer passes the bits through unchanged, including patterns that look like NaN (alpha 255 puts 0xFF in the top byte). `sfpi::reinterpret` does not exist in this SFPI version. `dst_reg += n` takes n in [-4, 3] only.
+6. **Batching several records into one SFPU call did not help** (start and done steps are cheap), and rewinding the destination counter between records needs eight `dst_reg += -4`; not kept.
+7. **Several devices in one process must be opened together** with `MeshDevice::create_unit_meshes`. Opening unit meshes one after the other left the first chip's first program hanging (the process was stopped by the run script's timeout; nothing else was affected and no reset was needed, the chips ran normally afterwards). With `create_unit_meshes` two to eight chips run concurrently from one process.
+8. **Host costs matter as soon as the device is fast.** A fresh multi-megabyte allocation costs page faults that serialize badly across threads: with eight chips each encoding and reading back on 64 threads, "build" went from 8 ms (one chip) to 28 ms (eight). Reusing buffers between frames, writing straight into one shared framebuffer, and giving each chip its share of the host threads brought it back to about 3 ms. Encoding the records is 80,000 pairs x 32 vector classifications per `random_10k` frame, 19 ms on one thread, 5 ms on 64.
+
+### Open items
+
+- Per-triangle cost is still dominated by instruction issue. Ideas not tried: keep more scalars in SFPU registers across vectors by splitting a triangle into passes with at most four scalars; the coefficient-tile path B from Spike B with a table built per triangle; `SFPREPLAY` / `SFPLOADMACRO` to cut the issue cost (Phase P).
+- Per-frame fixed cost is now host side: record encoding, upload of the work lists, and read-back (8.4 MB over one x1 PCIe link is 2.6 ms at best). Overlapping frames (pipelining host build, upload, device and read-back) would hide most of it.
+- Only one core's DRAM channel assignment and the 12 x 10 grid were used as given; no attempt was made to place cores near their DRAM banks.
+

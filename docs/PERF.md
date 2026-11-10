@@ -121,3 +121,88 @@ One thread of the host CPU, Release build, 1920 x 1088, FP32 tile-relative evalu
 
 Host-side setup plus binning for 10,000 triangles is about 3 ms, so it will not be the bottleneck of the first Tensix frame.
 
+## Tensix rasterizer (Phase 2)
+
+All on node 0 unless stated, 1920 x 1088, all 120 worker cores, AI clock 1.35 GHz. "Device" is the host-measured time of enqueue, run and finish of one frame with the JIT cache warm (it includes the launch, about 0.3 ms for one core and 0.75 ms for 120). Minimum of 15 runs.
+
+### Device time, v1 against now (three output planes, so both read back depth and id)
+
+| Scene | v1 (commit 5d4fb63) | Now | Colour plane only |
+| --- | --- | --- | --- |
+| one_triangle | 0.93 ms | 0.93 ms | 0.72 ms |
+| fan | 1.95 ms | 1.23 ms | 1.01 ms |
+| grid | 1.88 ms | 1.08 ms | 0.92 ms |
+| interpenetrating | 1.39 ms | 0.91 ms | 0.97 ms |
+| fullscreen | 1.00 ms | 0.87 ms | 0.83 ms |
+| tiny_10k | 1.52 ms | 0.93 ms | 0.76 ms |
+| random_10k | 6.59 ms | 3.07 ms | 2.93 ms |
+
+The floor (every tile cleared, quantized and packed, no triangles drawn, `RASTER_EXP_SKIP_TRIANGLES`) is 0.88 ms for 120 cores x 17 tiles, so the one-triangle row is almost all floor.
+
+### Experiments on `random_10k` (busiest core draws 827 of 80,668 records; v1 6.70 ms at the start)
+
+| Step | Device ms | Result |
+| --- | --- | --- |
+| v1: runtime vector index in the loop | 6.70 | baseline |
+| Constant instruction words (`dst_reg++`, counter-relative addressing) | 5.18 | -23% |
+| Flat-colour path, per-vector class skip (reject) and no edge tests for full vectors | 3.16 | -39% more, -53% in total |
+| One SFPU call per page of records instead of per record | 3.03 | no gain; not kept |
+
+Ablations of the final kernel (colour plane only, same scene):
+
+| Variant | Device ms |
+| --- | --- |
+| final | 2.95 |
+| no triangles drawn (floor) | 0.88 |
+| no colour writes | 1.82 |
+| every non-rejected vector treated as partial (all edge tests) | 3.49 |
+| every non-rejected vector treated as full (no edge tests) | 2.38 |
+
+From these: about 135 cycles per fully covered vector, about 220 per partial one, 54% of the triangle time in colour writes, and 3 edge tests are worth 83 cycles per vector. Vectors per record on this scene: 7.4 partial and 10.7 full.
+
+### Colour layout (Phase 2.4): FP32 planes against packed RGBA8 per pixel (colour plane only, ms)
+
+| Scene | Planes (default) | Packed |
+| --- | --- | --- |
+| one_triangle | 0.60 | 0.83 |
+| fan | 0.88 | 0.86 |
+| grid | 0.77 | 0.69 |
+| interpenetrating | 0.72 | 0.66 |
+| fullscreen | 0.62 | 0.58 |
+| tiny_10k | 0.63 | 0.55 |
+| random_10k | 2.66 | 2.78 |
+
+### Frame time breakdown, one chip (colour plane only, median of 10 warm frames, ms)
+
+Host setup and binning (CPU, one thread) are in the Phase 1 table (at most 3 ms). The rest, from the 1-chip rows of `ttr_multichip` (persistent host buffers, record encoding on 64 threads):
+
+| Scene | Record build | Upload | Device | Read-back (8.4 MB over one x1 PCIe link) |
+| --- | --- | --- | --- | --- |
+| one_triangle | 4.4 | 2.6 | 0.78 | 3.7 |
+| fan | 4.5 | 2.6 | 0.71 | 3.8 |
+| grid | 4.4 | 2.6 | 0.83 | 3.9 |
+| interpenetrating | 4.4 | 2.6 | 0.76 | 3.5 |
+| fullscreen | 4.5 | 2.6 | 0.93 | 4.1 |
+| tiny_10k | 4.3 | 2.7 | 0.79 | 3.9 |
+| random_10k | 4.9 | 4.9 | 2.47 | 4.0 |
+
+The device is the smallest part of a frame; before persistent buffers the same read-back took 7 ms and the record build 8 to 12 ms.
+
+### Multi-chip (Phase 2.6): frame time and identity
+
+Nodes 0 to 7 of one tray, chips opened together as independent unit meshes, colour plane only, median of 10 frames. "Frame" is the wall time of the whole frame: host partition and encode, upload, device, read-back, merge. Every cell was checked: the merged image is bit-identical to the 1-chip image and equals the reference except on the depth-ambiguous pixels (17 on `random_10k`, which agree with the single chip anyway).
+
+| Scene | 1 chip | 2 chips | 4 chips | 8 chips |
+| --- | --- | --- | --- | --- |
+| one_triangle | 12.2 ms | 8.0 ms | 6.6 ms | 6.3 ms |
+| fan | 12.2 ms | 8.0 ms | 7.1 ms | 6.2 ms |
+| grid | 12.5 ms | 8.0 ms | 6.3 ms | 6.2 ms |
+| interpenetrating | 12.3 ms | 8.0 ms | 6.8 ms | 6.5 ms |
+| fullscreen | 12.4 ms | 7.9 ms | 6.4 ms | 7.5 ms |
+| tiny_10k | 12.3 ms | 8.0 ms | 6.3 ms | 6.1 ms |
+| random_10k | 16.5 ms | 10.2 ms | 7.6 ms | 7.3 ms |
+
+Slowest chip's phases on `random_10k` (build, upload, device, read-back, ms): 1 chip 4.9 / 4.9 / 2.5 / 4.0; 2 chips 3.9 / 2.5 / 1.6 / 2.1; 4 chips 3.8 / 1.3 / 1.1 / 1.1; 8 chips 3.6 / 1.6 / 1.1 / 1.2. Records per chip with 8 chips: 10,059 to 10,107 (balanced within 0.5%), tiles 240 to 278.
+
+Reading: device and read-back shrink with the chip count (read-back runs on eight independent PCIe links), but record encoding and the fixed device launch put a floor of about 6 ms on a frame, so beyond two or three chips only heavy scenes gain. Before persistent buffers and a shared framebuffer the 8-chip frame took 34 ms (page-fault contention, see FINDINGS).
+

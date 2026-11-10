@@ -3,10 +3,15 @@
 // Render test scenes on Tensix and compare with the CPU reference (docs/PLAN.md, Phase 2).
 //
 //   scripts/run.sh <nodes> build/tools/ttr_device [scene|all] [--size WxH] [--mode crops|grid]
-//                  [--tile tx,ty] [--cores N] [--png DIR]
+//                  [--tile tx,ty] [--cores N] [--png DIR] [--bench R] [--define NAME=VALUE]...
+//                  [--colour-only]
 //
 //   crops   one core draws a set of 32x32 tiles of the scene in turn (Phase 2.1 and 2.2)
 //   grid    every tile of the target, split over N worker cores (Phase 2.3, default all cores)
+//   --bench R   after the checks, run the frame R more times and report device time statistics
+//   --define    extra kernel compile-time define, for experiments (affects the checks too)
+//   --colour-only  read back only the colour plane (production read-back; checks image only)
+//   --strict    also compare pixels the reference flags as depth-ambiguous (exact ties are expected to agree)
 //
 // Checks, per scene, on the drawn tiles:
 //   coverage  a debug run counts covering triangles per pixel; must equal the reference exactly
@@ -20,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -40,7 +46,8 @@ struct Compare {
     double max_depth_err = 0;
 };
 
-Compare compare(const Frame& frame, const Framebuffer& ref, const DeviceFrame& dev, const DeviceFrame& dev_cover) {
+Compare compare(
+    const Frame& frame, const Framebuffer& ref, const DeviceFrame& dev, const DeviceFrame& dev_cover, bool strict) {
     Compare c;
     const uint32_t w = frame.width, h = frame.height;
     for (uint32_t y = 0; y < h; y++) {
@@ -51,7 +58,7 @@ Compare compare(const Frame& frame, const Framebuffer& ref, const DeviceFrame& d
             const size_t i = ref.index(x, y);
             c.pixels++;
             c.cover_bad += dev_cover.fb.cover[i] != ref.cover[i];
-            if (ref.ambiguous[i]) {
+            if (ref.ambiguous[i] && !strict) {
                 c.skipped++;
                 continue;
             }
@@ -73,12 +80,36 @@ Compare compare(const Frame& frame, const Framebuffer& ref, const DeviceFrame& d
     return c;
 }
 
+Compare compare_colour(const Frame& frame, const Framebuffer& ref, const DeviceFrame& dev) {
+    Compare c;
+    for (uint32_t y = 0; y < frame.height; y++) {
+        for (uint32_t x = 0; x < frame.width; x++) {
+            if (!dev.tile_rendered[(y / 32) * frame.tiles_x() + x / 32]) continue;
+            const size_t i = ref.index(x, y);
+            c.pixels++;
+            if (ref.ambiguous[i]) { c.skipped++; continue; }
+            uint32_t worst = 0;
+            for (int ch = 0; ch < 4; ch++) {
+                const int a = (dev.fb.color[i] >> (8 * ch)) & 255, b = (ref.color[i] >> (8 * ch)) & 255;
+                worst = std::max<uint32_t>(worst, static_cast<uint32_t>(std::abs(a - b)));
+            }
+            c.max_color_err = std::max(c.max_color_err, worst);
+            c.color_exact += worst == 0;
+            c.color_1lsb += worst == 1;
+            c.color_bad += worst > 1;
+        }
+    }
+    return c;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string which = "all", mode = "crops", png_dir;
     uint32_t w = 1920, h = 1088, n_cores = 0;
-    int tile_x = -1, tile_y = -1;
+    int tile_x = -1, tile_y = -1, bench = 0;
+    bool colour_only = false, strict = false;
+    std::map<std::string, std::string> defines;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--size" && i + 1 < argc) {
@@ -91,6 +122,16 @@ int main(int argc, char** argv) {
             n_cores = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (a == "--png" && i + 1 < argc) {
             png_dir = argv[++i];
+        } else if (a == "--bench" && i + 1 < argc) {
+            bench = std::atoi(argv[++i]);
+        } else if (a == "--strict") {
+            strict = true;
+        } else if (a == "--colour-only") {
+            colour_only = true;
+        } else if (a == "--define" && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            const size_t eq = kv.find('=');
+            defines[kv.substr(0, eq)] = eq == std::string::npos ? "1" : kv.substr(eq + 1);
         } else if (a[0] != '-') {
             which = a;
         } else {
@@ -151,9 +192,14 @@ int main(int argc, char** argv) {
 
         DeviceOptions cover_opt;
         cover_opt.cover_count = true;
-        const DeviceFrame dev_cover = renderer.render(frame, setup, bins, plan, cover_opt);
-        const DeviceFrame dev = renderer.render(frame, setup, bins, plan);
-        const Compare c = compare(frame, ref, dev, dev_cover);
+        cover_opt.defines = defines;
+        DeviceOptions opt;
+        opt.defines = defines;
+        opt.debug_planes = !colour_only;
+        // Coverage check needs the id plane; in colour-only mode it is skipped.
+        const DeviceFrame dev_cover = colour_only ? DeviceFrame{} : renderer.render(frame, setup, bins, plan, cover_opt);
+        const DeviceFrame dev = renderer.render(frame, setup, bins, plan, opt);
+        const Compare c = colour_only ? compare_colour(frame, ref, dev) : compare(frame, ref, dev, dev_cover, strict);
         const bool ok = c.cover_bad == 0 && c.id_bad == 0 && c.depth_bad == 0 && c.color_bad == 0 && c.pixels > 0;
         all_ok &= ok;
         std::printf(
@@ -165,9 +211,38 @@ int main(int argc, char** argv) {
             static_cast<unsigned long long>(c.color_1lsb), static_cast<unsigned long long>(c.color_bad),
             static_cast<unsigned long long>(c.skipped));
         std::printf(
-            "    records %llu  build %.1f ms  upload %.1f ms  device %.2f ms  readback %.1f ms\n",
-            static_cast<unsigned long long>(dev.times.records), dev.times.build_ms, dev.times.upload_ms, dev.times.device_ms,
+            "    records %llu (vectors: %.1f partial + %.1f full per record)  build %.1f ms  upload %.1f ms  device %.2f ms  readback %.1f ms\n",
+            static_cast<unsigned long long>(dev.times.records),
+            dev.times.records ? double(dev.times.vec_partial) / double(dev.times.records) : 0.0,
+            dev.times.records ? double(dev.times.vec_full) / double(dev.times.records) : 0.0, dev.times.build_ms, dev.times.upload_ms, dev.times.device_ms,
             dev.times.readback_ms);
+        if (bench > 0) {
+            std::vector<double> t_dev, t_all;
+            DeviceTimes last;
+            size_t max_rec = 0;
+            for (const CorePlan& cp : plan) {
+                size_t r = 0;
+                for (auto& [tx, ty] : cp.tiles) r += bins.tile(tx, ty).size();
+                max_rec = std::max(max_rec, r);
+            }
+            for (int r = 0; r < bench; r++) {
+                const auto t0 = Clock::now();
+                const DeviceFrame d = renderer.render(frame, setup, bins, plan, opt);
+                t_all.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                t_dev.push_back(d.times.device_ms);
+                last = d.times;
+            }
+            std::sort(t_dev.begin(), t_dev.end());
+            std::sort(t_all.begin(), t_all.end());
+            std::printf(
+                "    bench x%d: device min %.3f / median %.3f ms, whole render() median %.2f ms, busiest core %zu records "
+                "(%.2f us per record at min)\n",
+                bench, t_dev.front(), t_dev[t_dev.size() / 2], t_all[t_all.size() / 2], max_rec,
+                max_rec ? t_dev.front() * 1000.0 / static_cast<double>(max_rec) : 0.0);
+            std::printf(
+                "    warm frame: build %.2f ms  upload %.2f ms  device %.2f ms  readback %.2f ms\n", last.build_ms, last.upload_ms,
+                last.device_ms, last.readback_ms);
+        }
         if (!png_dir.empty()) {
             write_png(png_dir + "/" + name + "_device.png", image_from_framebuffer(dev.fb, w, h));
             write_png(png_dir + "/" + name + "_reference.png", image_from_framebuffer(ref, w, h));

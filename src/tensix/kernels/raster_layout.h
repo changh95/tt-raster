@@ -10,6 +10,7 @@
 //   header:  word 0 = number of triangle records in the block
 //            word 1 = tile x, word 2 = tile y (informational)
 //   record:  32 words (128 B, a multiple of the 64 B DRAM read alignment, V9), see below.
+//            Words 26 and 27 hold a 2-bit class per SFPU vector (src/ttraster/tile.h, classify_vectors).
 //
 // Output: for every block the core produces kOutPlanes tiles (4 KB each, FP32 tile layout, faces
 // in the order TL, TR, BL, BR, each 16x16 row-major): packed RGBA8, depth, triangle id.
@@ -32,7 +33,9 @@ constexpr uint32_t kColor = 12;     // 4 channels x (c, gx, gy)    words 12..23,
 constexpr uint32_t kId = 24;        // 1 + source triangle index, as a float (exact below 2^24)
 constexpr uint32_t kFlags = 25;     // uint32 bit flags
 constexpr uint32_t kFlagFlat = 1u;  // colour gradients are zero (flat shaded)
-constexpr uint32_t kFlagFull = 2u;  // every pixel of the tile is inside: skip the edge tests
+constexpr uint32_t kFlagFull = 2u;  // every pixel of the tile is inside (informational: the classes say it too)
+constexpr uint32_t kFlatPacked = 28;  // flat colour as packed RGBA8 (host-computed), for the packed-colour variant
+constexpr uint32_t kVecClass = 26;  // 2 words, 2 bits per SFPU vector: 0 reject (skip), 1 partial (edge tests), 2 full
 
 // Header word offsets (inside record slot 0 of the block's first page).
 constexpr uint32_t kHdrRecords = 0;

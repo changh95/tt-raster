@@ -55,6 +55,51 @@ TileEdge make_tile_edge(const Edge& e, int tx, int ty) {
     return te;
 }
 
+namespace {
+
+// Classify the box of pixel centres [x_lo, x_hi] x [y_lo, y_hi] (corner pixels given in subpixel centres).
+TileCoverage classify_box(const SetupTriangle& t, int64_t x_lo, int64_t x_hi, int64_t y_lo, int64_t y_hi) {
+    // A pixel centre outside the vertex bounding box is outside the triangle. The three edge tests
+    // alone miss boxes near a vertex (each edge has a corner of the box on its inside).
+    if (x_hi < std::min({t.x[0], t.x[1], t.x[2]}) || x_lo > std::max({t.x[0], t.x[1], t.x[2]}) ||
+        y_hi < std::min({t.y[0], t.y[1], t.y[2]}) || y_lo > std::max({t.y[0], t.y[1], t.y[2]})) {
+        return TileCoverage::Reject;
+    }
+    const int64_t xs[2] = {x_lo, x_hi}, ys[2] = {y_lo, y_hi};
+    bool full = true;
+    for (const Edge& e : t.edge) {
+        int inside = 0;
+        for (int64_t px : xs) {
+            for (int64_t py : ys) {
+                inside += biased_edge(e, px, py) >= 0;
+            }
+        }
+        if (inside == 0) {
+            return TileCoverage::Reject;
+        }
+        full &= inside == 4;
+    }
+    return full ? TileCoverage::Full : TileCoverage::Partial;
+}
+
+}  // namespace
+
+TileCoverage classify_vector(const SetupTriangle& t, int tx, int ty, int v) {
+    const int face = v / 8, vv = v % 8;
+    const int64_t col0 = static_cast<int64_t>(tx) * kTileSize + 16 * (face & 1) + (vv & 1);  // first column of the parity
+    const int64_t row0 = static_cast<int64_t>(ty) * kTileSize + 16 * (face >> 1) + 4 * (vv >> 1);
+    return classify_box(t, centre(col0), centre(col0 + 14), centre(row0), centre(row0 + 3));
+}
+
+VectorClasses classify_vectors(const SetupTriangle& t, int tx, int ty, TileCoverage tile_class) {
+    VectorClasses c{{0, 0}};
+    for (int v = 0; v < kVectorsPerTile; v++) {
+        const TileCoverage k = tile_class == TileCoverage::Full ? TileCoverage::Full : classify_vector(t, tx, ty, v);
+        c.word[v / 16] |= static_cast<uint32_t>(k) << (2 * (v % 16));
+    }
+    return c;
+}
+
 TileParams make_tile_params(const SetupTriangle& t, int tx, int ty) {
     TileParams p{};
     p.coverage = classify_tile(t, tx, ty);

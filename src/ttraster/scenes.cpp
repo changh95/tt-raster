@@ -182,6 +182,30 @@ void scene_fullscreen(Frame& f, uint32_t w, uint32_t h) {
         false));
 }
 
+// Overlapping flat triangles at exactly the same depth under LESS_EQUAL: the later triangle wins
+// every tie. Two of them sit slightly behind, to check that LESS_EQUAL still rejects farther ones.
+void scene_coplanar(Frame& f, uint32_t w, uint32_t h) {
+    f.depth_func = DepthFunc::LessEqual;
+    Rng rng(0x636F706Cull);
+    const float W = static_cast<float>(w), H = static_cast<float>(h);
+    for (int k = 0; k < 10; k++) {
+        const float cx = rng.range(0.3f, 0.7f) * W;
+        const float cy = rng.range(0.3f, 0.7f) * H;
+        Triangle t;
+        t.flat = true;
+        const float r = rng.range(0.15f, 1.0f);
+        const float g = rng.range(0.15f, 1.0f);
+        const float b = rng.range(0.15f, 1.0f);
+        const float z = (k == 3 || k == 6) ? 0.6f : 0.5f;
+        for (int i = 0; i < 3; i++) {
+            const float dx = rng.range(-0.3f, 0.3f) * W;
+            const float dy = rng.range(-0.3f, 0.3f) * H;
+            t.v[i] = vtx(cx + dx, cy + dy, z, r, g, b);
+        }
+        f.triangles.push_back(t);
+    }
+}
+
 void scene_tiny(Frame& f, uint32_t w, uint32_t h) {
     Rng rng(0x74696E79ull);
     const float W = static_cast<float>(w), H = static_cast<float>(h);
@@ -234,6 +258,7 @@ const std::vector<SceneInfo>& scene_list() {
         {"grid", "jittered shared-vertex grid mesh covering the viewport, flat shaded", true},
         {"interpenetrating", "24 large flat triangles with random depths that cut through each other", false},
         {"fullscreen", "one right triangle covering the viewport, edges beyond the guard band", false},
+        {"coplanar_lequal", "overlapping coplanar flat triangles under LESS_EQUAL: the last drawn wins ties", false},
         {"tiny_10k", "10,000 triangles 1 to 6 pixels across", false},
         {"random_10k", "10,000 random triangles, 3 px to a third of the screen, partly off screen", false},
     };
@@ -247,6 +272,7 @@ bool make_scene(const std::string& name, uint32_t width, uint32_t height, Frame&
     else if (name == "grid") scene_grid(out, width, height);
     else if (name == "interpenetrating") scene_interpenetrating(out, width, height);
     else if (name == "fullscreen") scene_fullscreen(out, width, height);
+    else if (name == "coplanar_lequal") scene_coplanar(out, width, height);
     else if (name == "tiny_10k") scene_tiny(out, width, height);
     else if (name == "random_10k") scene_random(out, width, height);
     else return false;

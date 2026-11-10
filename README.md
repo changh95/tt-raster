@@ -8,12 +8,15 @@ A tile-based software rasterizer for Tenstorrent Blackhole Tensix cores, checked
 | `ttr_render` (render a scene, write PNG and golden manifest), `ttr_diff` (image diff with heatmap) | `tools/` | no |
 | Tests and golden images | `tests/` | no |
 | Phase 0 hardware spikes | `spikes/` | yes (tt-metal v0.81.1) |
+| Tensix renderer: host side, kernels, multi-chip driver | `src/tensix/` | yes |
+| `ttr_device` (render on a chip, compare with the reference), `ttr_multichip` (1/2/4/8 chips) | `tools/` | yes |
 
 ```
 scripts/build.sh                                  # host library, tools, tests
 scripts/test.sh                                   # all host tests, about 10 s
 TT_METAL_HOME=/path/to/tt-metal scripts/build.sh  # also the device spikes
 scripts/run.sh 0 build/spikes/a_lane_map/spike_a  # run a device program on node 0 only
+scripts/test_device.sh                            # Phase 2 acceptance: crops, full frame, 1/2/4/8 chips
 ```
 
 The host part needs a C++20 compiler, CMake, Ninja and zlib.

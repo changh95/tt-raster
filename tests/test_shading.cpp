@@ -201,5 +201,27 @@ int main() {
         CHECK(worst <= 1 && worst_z < 1e-6);
     }
 
+    // The coplanar scene is drawn under LESS_EQUAL: where triangles overlap at equal depth, the last
+    // one drawn is the visible one.
+    {
+        Frame f;
+        CHECK(make_scene("coplanar_lequal", 256, 160, f));
+        CHECK(f.depth_func == DepthFunc::LessEqual);
+        const Framebuffer fb = render_reference(f);
+        uint64_t overlaps = 0, last_wins = 0;
+        for (size_t i = 0; i < fb.cover.size(); i++) {
+            if (fb.cover[i] >= 2) {
+                overlaps++;
+                // The visible id is the highest-index covering triangle at depth 0.5, or any triangle
+                // at 0.5 drawn after the farther ones; checking the strongest consequence: it is never
+                // one of the two farther triangles (indices 3 and 6, ids 4 and 7) unless it is the only one.
+                last_wins += fb.id[i] != 4 && fb.id[i] != 7;
+            }
+        }
+        CHECK(overlaps > 1000);
+        CHECK_MSG(last_wins == overlaps, "%llu of %llu overlapped pixels show a farther triangle",
+                  static_cast<unsigned long long>(overlaps - last_wins), static_cast<unsigned long long>(overlaps));
+    }
+
     return ttr_test::finish();
 }

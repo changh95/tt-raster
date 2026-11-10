@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -28,6 +30,13 @@ struct CorePlan {
 struct DeviceOptions {
     // Debug: skip the depth test; the id plane becomes the per-pixel coverage count.
     bool cover_count = false;
+    // Also write back depth and triangle id (three planes instead of one). Off for production
+    // runs: colour is a third of the read-back traffic.
+    bool debug_planes = true;
+    // Extra compile-time defines for the kernels, for experiments (name -> value).
+    std::map<std::string, std::string> defines;
+    // Host threads used to encode the work lists; 0 = one per hardware thread.
+    size_t host_threads = 0;
 };
 
 struct DeviceTimes {
@@ -37,6 +46,7 @@ struct DeviceTimes {
     double readback_ms = 0;  // device DRAM to host, untilize into the framebuffer
     uint64_t records = 0;
     uint64_t blocks = 0;
+    uint64_t vec_partial = 0, vec_full = 0;  // SFPU vectors the kernel will process (rejected ones are skipped)
 };
 
 struct DeviceFrame {
@@ -52,16 +62,39 @@ public:
     // All worker cores of the device as logical coordinates, row-major.
     std::vector<tt::tt_metal::CoreCoord> worker_cores() const;
 
+    // Draw the planned tiles. With `target` (a Framebuffer the caller has sized to the padded target)
+    // the pixels of the planned tiles are written there and nothing is allocated per frame;
+    // otherwise a framebuffer pre-filled with clear values is returned in DeviceFrame::fb.
     DeviceFrame render(
         const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
-        const DeviceOptions& opt = {});
+        const DeviceOptions& opt = {}, Framebuffer* target = nullptr);
 
 private:
     std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_;
+    // Scratch reused from frame to frame: fresh multi-megabyte allocations cost page faults, which
+    // serialize badly when several chips are driven from one process.
+    std::vector<uint32_t> words_, raw_;
 };
 
 // Plans: every tile of the target, split over `cores` in contiguous row-major chunks.
 std::vector<CorePlan> plan_row_major(
     const std::vector<tt::tt_metal::CoreCoord>& cores, uint32_t tiles_x, uint32_t tiles_y);
+
+// Tiles in row-major order, as (tx, ty).
+std::vector<std::pair<int, int>> all_tiles(uint32_t tiles_x, uint32_t tiles_y);
+
+// Estimated cost of drawing a tile, in arbitrary units: a fixed part per tile plus one per triangle
+// record. The busiest core sets the frame time, so plans balance this, not the tile count.
+double tile_weight(const TileBins& bins, int tx, int ty);
+
+// Split `tiles` into `parts` contiguous chunks (order preserved) whose summed weights are as equal
+// as a contiguous split allows.
+std::vector<std::vector<std::pair<int, int>>> split_balanced(
+    const std::vector<std::pair<int, int>>& tiles, const TileBins& bins, size_t parts);
+
+// Balanced plan of `tiles` over `cores`.
+std::vector<CorePlan> plan_balanced(
+    const std::vector<tt::tt_metal::CoreCoord>& cores, const std::vector<std::pair<int, int>>& tiles,
+    const TileBins& bins);
 
 }  // namespace ttr

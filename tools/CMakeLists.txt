@@ -14,4 +14,7 @@ if(TT_RASTER_BUILD_DEVICE)
 
     add_executable(ttr_device ttr_device.cpp)
     target_link_libraries(ttr_device PRIVATE ttraster_tensix)
+
+    add_executable(ttr_multichip ttr_multichip.cpp)
+    target_link_libraries(ttr_multichip PRIVATE ttraster_tensix)
 endif()

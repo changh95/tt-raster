@@ -37,9 +37,9 @@
 namespace ttr {
 
 enum class TileCoverage : uint8_t {
-    Reject,   // no pixel centre of the tile is inside the triangle
-    Partial,  // some pixels may be inside: run the edge tests
-    Full,     // every pixel of the tile is inside: skip the edge tests
+    Reject = 0,   // no pixel centre of the tile is inside the triangle
+    Partial = 1,  // some pixels may be inside: run the edge tests
+    Full = 2,     // every pixel of the tile is inside: skip the edge tests
 };
 
 struct TileEdge {
@@ -57,6 +57,21 @@ inline float tile_offset(int i) { return static_cast<float>(kSubpixelScale * i -
 
 // Exact classification of tile (tx, ty) against a triangle using integer arithmetic.
 TileCoverage classify_tile(const SetupTriangle& t, int tx, int ty);
+
+// The SFPU processes a tile as 32 vectors of 32 lanes (lane map, docs/FINDINGS.md): vector v is face
+// v/8 (faces ordered TL, TR, BL, BR), and inside the face covers rows 4*((v%8)/2) .. +3 and the 8
+// columns of parity (v%2). classify_vector is exact: a Rejected vector has no pixel inside the
+// triangle, a Full one has every pixel inside, both decided from the four extreme pixel centres.
+inline constexpr int kVectorsPerTile = 32;
+TileCoverage classify_vector(const SetupTriangle& t, int tx, int ty, int v);
+// 2 bits per vector (0 reject, 1 partial, 2 full): vector v in bits 2*(v%16) of word v/16.
+struct VectorClasses {
+    uint32_t word[2];
+};
+VectorClasses classify_vectors(const SetupTriangle& t, int tx, int ty, TileCoverage tile_class);
+inline TileCoverage vector_class(const VectorClasses& c, int v) {
+    return static_cast<TileCoverage>((c.word[v / 16] >> (2 * (v % 16))) & 3u);
+}
 
 TileParams make_tile_params(const SetupTriangle& t, int tx, int ty);
 
