@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#include "ttraster/reference.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace ttr {
+
+Framebuffer render_reference(
+    const Frame& frame, const SetupResult& setup, const TileBins& bins, const ReferenceOptions& opt,
+    ReferenceStats* stats) {
+    Framebuffer fb;
+    fb.width = frame.padded_width();
+    fb.height = frame.padded_height();
+    const size_t n = static_cast<size_t>(fb.width) * fb.height;
+    fb.color.assign(n, pack_rgba8(frame.clear_color));
+    fb.depth.assign(n, frame.clear_depth);
+    fb.id.assign(n, 0);
+    fb.cover.assign(n, 0);
+    fb.ambiguous.assign(n, 0);
+
+    ReferenceStats local;
+    const bool less = frame.depth_func == DepthFunc::Less;
+
+    for (uint32_t ty = 0; ty < bins.tiles_y; ty++) {
+        for (uint32_t tx = 0; tx < bins.tiles_x; tx++) {
+            for (const BinEntry& entry : bins.tile(tx, ty)) {
+                const SetupTriangle& tri = setup.tris[entry.tri];
+                const TileParams p = make_tile_params(tri, static_cast<int>(tx), static_cast<int>(ty));
+                const bool skip_tests = opt.trust_full_tiles && entry.coverage == TileCoverage::Full;
+                local.tile_triangle_pairs++;
+                local.full_pairs += entry.coverage == TileCoverage::Full;
+
+                for (int j = 0; j < kTileSize; j++) {
+                    const float ddy = tile_offset(j);
+                    const size_t row = fb.index(tx * kTileSize, ty * kTileSize + j);
+                    for (int i = 0; i < kTileSize; i++) {
+                        const float ddx = tile_offset(i);
+                        local.pixels_evaluated++;
+                        if (!skip_tests && !(edge_inside(p.edge[0], ddx, ddy) && edge_inside(p.edge[1], ddx, ddy) &&
+                                             edge_inside(p.edge[2], ddx, ddy))) {
+                            continue;
+                        }
+                        const size_t idx = row + i;
+                        fb.cover[idx] = static_cast<uint8_t>(std::min(255, fb.cover[idx] + 1));
+
+                        const float z = std::fmaf(p.depth_gx, ddx, std::fmaf(p.depth_gy, ddy, p.depth_c));
+                        const float zo = fb.depth[idx];
+                        const float diff = std::fabs(z - zo);
+                        if (diff <= kDepthAmbiguity * std::max(std::fabs(z), std::fabs(zo))) {
+                            fb.ambiguous[idx] = 1;
+                        }
+                        if (less ? !(z < zo) : !(z <= zo)) {
+                            continue;
+                        }
+                        float rgba[4];
+                        for (int ch = 0; ch < 4; ch++) {
+                            rgba[ch] = std::fmaf(p.color_gx[ch], ddx, std::fmaf(p.color_gy[ch], ddy, p.color_c[ch]));
+                        }
+                        fb.depth[idx] = z;
+                        fb.color[idx] = pack_rgba8(rgba);
+                        fb.id[idx] = tri.source + 1;
+                        local.fragments_written++;
+                    }
+                }
+            }
+        }
+    }
+    if (stats != nullptr) {
+        *stats = local;
+    }
+    return fb;
+}
+
+Framebuffer render_reference(const Frame& frame, const ReferenceOptions& opt, ReferenceStats* stats) {
+    const SetupResult setup = setup_frame(frame);
+    const TileBins bins = bin_triangles(setup, frame.tiles_x(), frame.tiles_y());
+    return render_reference(frame, setup, bins, opt, stats);
+}
+
+}  // namespace ttr

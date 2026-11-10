@@ -79,7 +79,7 @@ Setup: one sender core multicasts 4 KB to a rectangle of worker cores, semaphore
 - Chip-to-chip bandwidth measured with the in-tree `bench_unicast` (one sender core to one receiver core, 4 KiB pages, through the fabric; built by reconfiguring the tt-metal build with `-DTT_METAL_BUILD_TESTS=ON` and building only that target): 10.5 GB/s between horizontal neighbours and also across three hops along a row, 14.8 GB/s to the vertical neighbour and also to the diagonal chip. So extra hops cost no bandwidth, and the vertical direction is faster than the horizontal one for a single stream. These are single-stream numbers; several cores or several links in parallel were not measured. Small transfers are latency-bound: 4 KiB takes 3.5 us and 64 KiB 9.2 us.
 - Consequence: chip-to-chip traffic inside the tray is about 3x the x1 host link per stream and comparable to the x8 host link, so passing intermediate results between chips costs less than a trip through the host.
 
-## Dest layout for Phase 2 (proposal, to be confirmed at the Phase 0 STOP)
+## Dest layout for Phase 2 (confirmed 2026-11-10)
 
 Budget: FP32 half-sync gives 4 tiles and keeps pack overlapped with the next tile's math; FP32 full-sync gives 8 tiles but serializes pack and math. Phase 2 stores color as one packed RGBA8 word per pixel, so color needs one tile instead of four FP32 planes. Per-triangle plane equations for depth and color are evaluated in SFPU registers, not stored.
 
@@ -106,4 +106,56 @@ Scalars use path A (L1 runtime immediates) in both layouts, so no slot is reserv
 ## Decisions
 
 - 2026-11-10: tt-metal is a fresh `v0.81.1` checkout next to this repository. The other tt-metal checkouts on the machine belong to other projects and are not touched.
+- 2026-11-10: Phase 0 STOP answered: scalar delivery path A (L1 runtime immediates, triangle-major) and the half-sync Dest layout above are approved. Phase 1 started the same day.
 - 2026-11-10: Track G (softpipe fork) is superseded by the llvmpipe and lavapipe fork in `docs/FULL_COVERAGE_PLAN.md`. Confirmation pending.
+
+## Phase 1: CPU reference, setup and test infrastructure
+
+Code is in `src/ttraster/` (a host library with no tt-metal dependency), tools in `tools/` (`ttr_render`, `ttr_diff`), tests in `tests/`, golden images in `tests/golden/`. Build and test with `scripts/build.sh` and `scripts/test.sh` (no device needed). All six test programs pass under clang 20 (tt-metal's toolchain) and gcc 11, and the golden hashes are identical under both compilers.
+
+### Pipeline and the numeric contract
+
+1. **Snap** vertices to 1/16 pixel (round to nearest, ties to even). Reject non-finite and out-of-range input, zero-area triangles (after snapping) and, optionally, one winding.
+2. **Edge functions** are integers: `E(P) = a*Px + b*Py + c` with `a = y0 - y1`, `b = x1 - x0`, `c = -a*x0 - b*y0`, positive inside. A pixel centre is at `16*i + 8` subpixels, so `E` is an integer there. The top-left rule is folded into `c`: an edge that is not top or left gets `c - 1`, so every edge uses the same `E >= 0` test (top-left means `a > 0` or `a == 0 and b > 0` in y-down coordinates).
+3. **Tile-relative evaluation.** Per (triangle, tile) the host computes `c_t`, the edge value at the tile centre, exactly in int64 and rounds it once to FP32. A pixel's offset from the tile centre is `16*i - 248` subpixels (exact). The device and the reference compute `E = fma(a, ddx, fma(b, ddy, c_t))`, two multiply-adds, and test `E >= 0`. Depth and each colour channel use the same shape: `v = fma(gx, ddx, fma(gy, ddy, v_t))` with `v_t` the plane value at the tile centre.
+4. **Exactness bound.** The coefficients must satisfy `|a|, |b| <= 2^15`. Then `c_t` is representable whenever an edge crosses the tile (`|c_t| <= 248 * (|a| + |b|) < 2^24`), every partial sum that matters is below 2^24, and the sign of `E`, including `E == 0`, equals the int64 result. Measured over 41 million pixels at the 2^15 bound and 20 million at each larger one (`tests/test_edge_exactness.cpp`):
+
+   | Coefficient bound | Pixels with E exactly 0 | Wrong signs, contract order | `(a*ddx + b*ddy) + c` | fused first step, then `+ c` | `(c + a*ddx) + b*ddy` |
+   | --- | --- | --- | --- | --- | --- |
+   | 2^15 | 175,801 | 0 | 0 | 0 | 0 |
+   | 2^16 | 83,014 | 391 | 391 | 391 | 391 |
+   | 2^17 | 86,009 | 6,384 | 5,857 | 5,857 | 6,379 |
+   | 2^18 | 89,678 | 12,337 | 11,654 | 11,654 | 12,362 |
+
+   So the bound is tight (it fails right above it, for every order), and within it the evaluation order does not matter. That settles the plan's open question: **no exact int32 path is needed**, provided every triangle that reaches the device has `|a|, |b| <= 2^15`. A multiply-add that is only partially fused (V10) gives the same signs, because inside the bound no intermediate needs rounding.
+5. **Guard band.** `2^15` subpixels is 2048 pixels, so the render target is limited to 2048 x 2048 and every triangle is clipped to a rectangle that is exactly 2048 pixels wide and high (the viewport plus a symmetric guard band: 64 px each side at 1920 wide, 480 px each side at 1088 high). Triangles inside need no clipping. Others go through Sutherland-Hodgman clipping in integer subpixels, and the polygon is fanned into triangles. A cut edge's new end point depends only on the edge's two end points, not on their order, so two triangles that share an edge clip it identically and stay watertight. Planes are fitted from the original unclipped snapped vertices and shared by the pieces, so colour and depth of a clipped triangle are exact (verified at the viewport corners of the screen-covering scene, which needs 49,000-subpixel edges: 0 LSB colour error).
+6. **Binning.** Tile bounding box from the pixel centres that can lie inside the vertex bounding box, then exact per-tile classification from the four extreme pixel centres: Reject (dropped, no work on the device), Partial, or Full (every pixel inside, so a device can skip the edge tests; verified by rendering with and without the shortcut). Bins keep API order.
+
+### Reference rasterizer and oracle
+
+- `render_reference` evaluates exactly as above and writes packed RGBA8, depth, the id of the visible triangle, a coverage count (triangles whose edge tests hit the pixel) and an *ambiguous* flag (a depth comparison within 1e-6 relative; Phase 2 can use it to excuse pixels where the device's 1 ulp difference may flip two nearly coincident surfaces).
+- Colour quantization is `clamp(floor(v * 255 + 0.5), 0, 255)`, NaN is 0. Smooth interpolation is exact to 0 LSB against barycentric coordinates in double; depth to 7.4e-8.
+- The **int64 oracle** decides coverage from the integer edge values with no tiles, no FP32 and no precomputed `c`. `oracle_cover_from_setup` (post-clip triangles) must equal the reference exactly and does, on every scene at 1920 x 1088. `oracle_cover_from_input` (no clipping at all) must also agree everywhere clipping cannot have touched; it does, and for the screen-covering triangle it agrees even inside the clip mask, because the cut edges lie outside the viewport.
+- **Watertightness (Phase 1 DoD).** The jittered grid mesh of 4,080 shared-vertex triangles at 1920 x 1088 covers every one of the 2,088,960 pixels exactly once and none twice. The 96-triangle fan has no pixel hit twice. The random-vertex stress test (4,000 triangles on a 256 x 160 target plus 600 on 1920 x 1088, half of them on the half-pixel grid so that many pixel centres lie exactly on edges, vertices spread over the whole guard band so edge coefficients reach the 2^15 limit) has 0 coverage mismatches.
+
+### Scenes and goldens
+
+Seven procedural scenes (`scene_list()`): one smooth triangle, a 96-triangle fan, a jittered grid mesh (watertight check), 24 interpenetrating flat triangles, one screen-covering triangle that needs guard-band clipping, 10,000 tiny triangles and 10,000 random triangles. Goldens at 1920 x 1088: one PNG per scene (2.1 MB in total) plus `tests/golden/manifest.txt` with FNV-1a hashes of the colour, depth, id and coverage planes (PNG only carries colour). Regenerate with `build/tests/test_golden --update`.
+
+Tile statistics for Phase 2 (tile pairs are what a device has to process; the screen has 2,040 tiles):
+
+| Scene | Triangles | Pieces after setup | (tile, triangle) pairs | Full-tile pairs |
+| --- | --- | --- | --- | --- |
+| one_triangle | 1 | 1 | 526 | 403 |
+| fan | 96 | 96 | 3,532 | 27 |
+| grid | 4,080 | 4,080 | 15,135 | 0 |
+| interpenetrating | 24 | 27 | 2,335 | 1,043 |
+| fullscreen | 1 | 2 | 2,111 | 1,969 |
+| tiny_10k | 10,000 | 8,176 | 8,681 | 0 |
+| random_10k | 10,000 | 8,912 | 80,668 | 14,598 |
+
+The 1,824 tiny triangles that vanish in setup are zero-area after snapping or fit between pixel centres. Fully covered tiles are 77% of the pairs in the one-triangle case and 93% in the fullscreen case, so the Phase 2.5 fast path matters for large triangles and is irrelevant for tiny ones.
+
+### Incident: scenes were not portable
+
+The first gcc build of the goldens failed for the three scenes that draw several random numbers inside one function call. C++ leaves argument evaluation order unspecified (clang goes left to right, gcc right to left), so the same seed gave different scenes. Every draw is now its own statement. Rule for new scenes and tests: never put two RNG draws in one expression.

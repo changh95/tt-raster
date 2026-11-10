@@ -105,3 +105,19 @@ Fabric `FABRIC_2D` over nodes 0-7 (mesh 2x4). One sender core to one receiver co
 | 0 to 4 | vertical neighbour | 4 MiB | 284 us | 14.77 |
 | 0 to 7 | diagonal: one vertical plus three horizontal hops | 4 MiB | 284 us | 14.78 |
 
+## CPU reference (Phase 1)
+
+One thread of the host CPU, Release build, 1920 x 1088, FP32 tile-relative evaluation as in docs/FINDINGS.md. The reference evaluates every pixel of every (tile, triangle) pair in a bin except Full tiles, so time follows the pair count and is not a performance target; it exists to be correct. `ttr_render all` prints these.
+
+| Scene | Pieces | Tile pairs | Setup | Binning | Render |
+| --- | --- | --- | --- | --- | --- |
+| one_triangle | 1 | 526 | 0.0 ms | 0.0 ms | 34 ms |
+| fan | 96 | 3,532 | 0.0 ms | 0.2 ms | 108 ms |
+| grid | 4,080 | 15,135 | 0.3 ms | 0.4 ms | 247 ms |
+| interpenetrating | 27 | 2,335 | 0.0 ms | 0.1 ms | 72 ms |
+| fullscreen | 2 | 2,111 | 0.0 ms | 0.1 ms | 84 ms |
+| tiny_10k | 8,176 | 8,681 | 0.7 ms | 0.3 ms | 80 ms |
+| random_10k | 8,912 | 80,668 | 1.0 ms | 2.0 ms | 1,203 ms |
+
+Host-side setup plus binning for 10,000 triangles is about 3 ms, so it will not be the bottleneck of the first Tensix frame.
+
