@@ -15,6 +15,10 @@ add_library(ttraster_core STATIC
 target_include_directories(ttraster_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ttraster_core PUBLIC ZLIB::ZLIB)
 target_compile_features(ttraster_core PUBLIC cxx_std_20)
-# The edge evaluation contract (tile.h) is written for unfused FP32 operations.
+# Fused operations are written explicitly (std::fmaf); never let the compiler contract anything else.
 target_compile_options(ttraster_core PUBLIC -ffp-contract=off)
 target_compile_options(ttraster_core PRIVATE -Wall -Wextra)
+
+if(TT_RASTER_BUILD_DEVICE)
+    add_subdirectory(tensix)
+endif()

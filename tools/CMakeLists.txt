@@ -11,4 +11,7 @@ target_link_libraries(ttr_diff PRIVATE ttraster_core)
 if(TT_RASTER_BUILD_DEVICE)
     add_executable(probe_device probe_device.cpp)
     target_link_libraries(probe_device PRIVATE TT::Metalium)
+
+    add_executable(ttr_device ttr_device.cpp)
+    target_link_libraries(ttr_device PRIVATE ttraster_tensix)
 endif()
