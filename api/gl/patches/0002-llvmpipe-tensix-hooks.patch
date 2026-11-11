@@ -1,5 +1,20 @@
+diff --git a/src/gallium/drivers/llvmpipe/lp_rast.h b/src/gallium/drivers/llvmpipe/lp_rast.h
+index 0d021fa..97d2a49 100644
+--- a/src/gallium/drivers/llvmpipe/lp_rast.h
++++ b/src/gallium/drivers/llvmpipe/lp_rast.h
+@@ -50,7 +50,9 @@ struct cmd_bin;
+ 
+ #define FIXED_TYPE_WIDTH 64
+ /** For sub-pixel positioning */
+-#define FIXED_ORDER 8
++/* tt-raster: 4 bits, which is what the Tensix rasterizer snaps to (the Vulkan and OpenGL minimum), so that a frame drawn partly by
++ * the offload and partly by llvmpipe has one rasterization precision. */
++#define FIXED_ORDER 4
+ #define FIXED_ONE (1<<FIXED_ORDER)
+ #define FIXED_SHIFT (FIXED_TYPE_WIDTH - 1)
+ /** Maximum length of an edge in a primitive in pixels.
 diff --git a/src/gallium/drivers/llvmpipe/lp_screen.c b/src/gallium/drivers/llvmpipe/lp_screen.c
-index c7ae705..4d739f5 100644
+index c7ae705..c2fd8bd 100644
 --- a/src/gallium/drivers/llvmpipe/lp_screen.c
 +++ b/src/gallium/drivers/llvmpipe/lp_screen.c
 @@ -57,6 +57,7 @@
@@ -16,7 +31,7 @@ index c7ae705..4d739f5 100644
     caps->max_shader_patch_varyings = 32;
 -   caps->rasterizer_subpixel_bits = 8;
 +   /* The Tensix offload snaps vertices to a 1/16 pixel grid; a driver that offloads reports what its coarsest path does. */
-+   caps->rasterizer_subpixel_bits = lp_tensix_enabled() ? 4 : 8;
++   caps->rasterizer_subpixel_bits = FIXED_ORDER;
     caps->pci_group =
     caps->pci_bus =
     caps->pci_device =
