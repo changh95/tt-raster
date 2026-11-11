@@ -4,7 +4,10 @@
  * PPM and times the frames. It is the smallest program that exercises what the Tensix path will have to accelerate first (vertex
  * buffers, a render pass with clear, a graphics pipeline with depth test, no textures), and the reference for comparing drivers.
  *
- *   vk_offscreen [--size WxH] [--tris N] [--frames N] [--out FILE.ppm] [--layers L]
+ *   vk_offscreen [--size WxH] [--tris N] [--frames N] [--out FILE.ppm] [--layers L] [--strip]
+ *
+ *   --strip      draw one quad as a 4-vertex triangle strip with four strongly different vertex colours (what the Vulkan CTS
+ *                output_location tests render), instead of the grid
  *
  *   --layers L   draw, after the triangles, L full-screen quads (depth test off) with a fragment shader of 64 dependent
  *                fract(x * a + b) steps (131 instructions): the shader-heavy case of docs/EVALUATION_GL_VULKAN.md
@@ -95,7 +98,7 @@ static VkShaderModule make_shader(const uint32_t *code, size_t bytes)
 int main(int argc, char **argv)
 {
    uint32_t w = 1920, h = 1080;
-   int tris = 1000, frames = 1, layers = 0;
+   int tris = 1000, frames = 1, layers = 0, strip = 0;
    const char *out = NULL;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%ux%u", &w, &h);
@@ -103,6 +106,7 @@ int main(int argc, char **argv)
       else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
       else if (!strcmp(argv[i], "--layers") && i + 1 < argc) layers = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--strip")) strip = 1;
    }
 
    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vk_offscreen", .apiVersion = VK_API_VERSION_1_1};
@@ -182,6 +186,7 @@ int main(int argc, char **argv)
                                        .pInputAssemblyState = &ia, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &msaa,
                                        .pDepthStencilState = &ds, .pColorBlendState = &cb, .layout = layout, .renderPass = rp, .subpass = 0};
    VkPipeline pipe;
+   if (strip) ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
    CHECK(vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipe));
    /* The shader-heavy pipeline: full-screen quads with the ALU chain, depth test off, position and a varying only. */
    VkShaderModule avs = make_shader(alu_vert, sizeof alu_vert), afs = make_shader(alu_frag, sizeof alu_frag);
@@ -229,6 +234,11 @@ int main(int argc, char **argv)
             }
       }
 
+   if (strip) {
+      /* four vertices of a strip: (-1,-1) (1,-1) (-1,1) (1,1) with red, green, blue, yellow */
+      static const float sv[4][6] = {{-1, -1, 0.5f, 1, 0, 0}, {1, -1, 0.5f, 0, 1, 0}, {-1, 1, 0.5f, 0, 0, 1}, {1, 1, 0.5f, 1, 1, 0}};
+      memcpy(v, sv, sizeof sv);
+   }
    VkBuffer rb;
    VkDeviceMemory rmem;
    uint8_t *rpx;
@@ -250,7 +260,8 @@ int main(int argc, char **argv)
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
    VkDeviceSize off = 0;
    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
-   if (tris > 0) vkCmdDraw(cmd, 3 * ntri, 1, 0, 0);
+   if (strip) vkCmdDraw(cmd, 4, 1, 0, 0);
+   else if (tris > 0) vkCmdDraw(cmd, 3 * ntri, 1, 0, 0);
    if (layers > 0) {
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, apipe);
       vkCmdBindVertexBuffers(cmd, 0, 1, &qb, &off);

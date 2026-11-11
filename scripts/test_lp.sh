@@ -93,6 +93,7 @@ for be in "${backends[@]}"; do
     cmp_gl uniform "$be" --fs uniform --continue --frames 3
     MAX_BAD=0.005 cmp_vk triangles "$be" --size 320x240 --tris 3000   # 3000 triangles of about 25 pixels: edge pixels are a larger share
     cmp_vk shader "$be" --size 320x240 --tris 0 --layers 2
+    cmp_vk strip "$be" --size 60x60 --strip     # a triangle strip with four strongly different colours (CTS output_location: 5 % of the values differ by one level, where the exact value is x.5)
     cmp_present swapchain "$be" --tris 2000 --frames 4
 done
 if [[ -n "${TT_METAL_HOME:-}" ]]; then
