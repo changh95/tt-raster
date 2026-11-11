@@ -49,19 +49,21 @@ index 65fadc4..350e625 100644
  
  #if defined(GALLIUM_ZINK)
 diff --git a/src/gallium/drivers/softpipe/meson.build b/src/gallium/drivers/softpipe/meson.build
-index 6b180ef..3cf5f55 100644
+index 6b180ef..84316a4 100644
 --- a/src/gallium/drivers/softpipe/meson.build
 +++ b/src/gallium/drivers/softpipe/meson.build
-@@ -56,6 +56,8 @@ files_softpipe = files(
+@@ -56,6 +56,10 @@ files_softpipe = files(
    'sp_texture.h',
    'sp_tile_cache.c',
    'sp_tile_cache.h',
 +  'sp_tensix.c',
 +  'sp_tensix.h',
++  'sp_tensix_shader.c',
++  'sp_tensix_shader.h',
  )
  
  libsoftpipe = static_library(
-@@ -64,7 +66,7 @@ libsoftpipe = static_library(
+@@ -64,7 +68,7 @@ libsoftpipe = static_library(
    include_directories : [inc_gallium_aux, inc_gallium, inc_include, inc_src],
    c_args : [c_msvc_compat_args],
    gnu_symbol_visibility : 'hidden',

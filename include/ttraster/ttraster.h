@@ -12,6 +12,7 @@
 #define TTRASTER_H
 
 #include <stdint.h>
+#include "ttraster_isa.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -131,6 +132,34 @@ typedef struct {
  * depth function, depth writes on, no blending. */
 int ttr_frame_triangles(
     ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull, const ttr_state* state);
+/* ---- Fragment shaders ------------------------------------------------------------------------------------------
+ *
+ * A fragment shader is a straight-line program (instruction set: ttraster_isa.h) with its constant table (uniforms and
+ * literals). ttr_frame_shader() adds one to the open frame and returns its id (identical programs of one frame share an id; ids
+ * restart at 1 with every ttr_frame_begin); 0 means refused (invalid program, or the frame's programs no longer fit the device's
+ * program table), with ttr_last_error() saying why. Triangles with a shader take their colour from it: the varyings (num_inputs
+ * floats per vertex, vertex-major per triangle: the n floats of vertex 0, then vertex 1, then vertex 2) are interpolated linearly
+ * or, with `perspective` (every vertex needs rhw > 0), perspective-correctly, and the shader's colour goes through the same depth
+ * and blend state as a fixed-function colour. A frame with shader triangles has an RGBA8 target: colour is quantized with every
+ * write and blending reads the quantized colour (docs/FINDINGS.md). */
+typedef struct {
+    const uint32_t* code;   /* n_instr instructions of TTR_INSTR_WORDS words */
+    uint32_t n_instr;
+    const float* consts;
+    uint32_t n_consts;
+    uint32_t num_inputs;    /* varying components, in registers 0 .. num_inputs - 1 */
+    uint32_t num_regs;      /* registers used (at least num_inputs, at most TTR_MAX_REGS) */
+    uint32_t out_reg;       /* the colour R, G, B, A is in out_reg .. out_reg + 3 */
+    int32_t fragcoord_reg;  /* >= 0: x, y (window pixel coordinates of the pixel centre), z and 1/w of the pixel in 4 registers from here */
+} ttr_shader_desc;
+
+uint32_t ttr_frame_shader(ttr_context* ctx, const ttr_shader_desc* desc);
+/* verts: 3 per triangle (position, depth and rhw; the colour is not used). attrs: n_triangles * 3 * num_inputs floats.
+ * cull and state as in ttr_frame_triangles. */
+int ttr_frame_triangles_shaded(
+    ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, uint32_t shader, const float* attrs, int perspective,
+    int cull, const ttr_state* state);
+
 /* Render the frame. rgba: width x height x 4 bytes (row pitch `stride_bytes`, 0 = width * 4); depth: width x height
  * floats or NULL. flip_y != 0 writes the bottom row of the render target first (OpenGL window orientation). */
 int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y);

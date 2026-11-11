@@ -12,9 +12,20 @@
 #include "check.h"
 #include "ttraster/reference.h"
 #include "ttraster/setup.h"
+#include "ttraster/ttraster_isa.h"   // the C view of the instruction set, used by the Mesa translator
 
 using namespace ttr;
 using namespace ttr::shader;
+
+// The C header (include/ttraster/ttraster_isa.h) and the C++ one the kernels and the interpreter use must agree.
+static_assert(TTR_OP_NOP == kOpNop && TTR_OP_MOV == kOpMov && TTR_OP_ADD == kOpAdd && TTR_OP_MUL == kOpMul && TTR_OP_MAD == kOpMad &&
+              TTR_OP_MIN == kOpMin && TTR_OP_MAX == kOpMax && TTR_OP_FRC == kOpFrc && TTR_OP_FLR == kOpFlr && TTR_OP_RCP == kOpRcp &&
+              TTR_OP_RSQ == kOpRsq && TTR_OP_SQRT == kOpSqrt && TTR_OP_EX2 == kOpEx2 && TTR_OP_LG2 == kOpLg2 && TTR_OP_SIN == kOpSin &&
+              TTR_OP_COS == kOpCos && TTR_OP_SLT == kOpSlt && TTR_OP_SGE == kOpSge && TTR_OP_SEQ == kOpSeq && TTR_OP_SNE == kOpSne &&
+              TTR_OP_CMP == kOpCmp && TTR_OP_SEL == kOpSel && TTR_OP_KILL == kOpKill && TTR_OP_COUNT == kOpCount);
+static_assert(TTR_FLAG_SAT == kFlagSat && TTR_SRC_INDEX_MASK == kSrcIndexMask && TTR_SRC_CONST == kSrcConst && TTR_SRC_NEG == kSrcNeg &&
+              TTR_SRC_ABS == kSrcAbs && TTR_MAX_REGS == kMaxRegs && TTR_MAX_CONSTS == kMaxConsts &&
+              TTR_MAX_INSTRUCTIONS == kMaxInstructions && TTR_MAX_INPUTS == kMaxInputs && TTR_INSTR_WORDS == kInstrWords);
 
 namespace {
 

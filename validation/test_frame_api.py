@@ -128,6 +128,80 @@ def main():
     img, z = two_batches(State(ALWAYS, 0, 0))
     check(abs(int(img[8, 30][0]) - 255) <= 0 and int(img[8, 30][1]) == 0, "depth test off: the later triangle is drawn over")
     check(abs(float(z[8, 30]) - 0.6) < 1e-6, "depth test off does not write depth")
+    # Fragment shaders: a program over two varyings, built by hand (include/ttraster/ttraster_isa.h).
+    class ShaderDesc(C.Structure):
+        _fields_ = [("code", C.c_void_p), ("n_instr", C.c_uint32), ("consts", C.c_void_p), ("n_consts", C.c_uint32),
+                    ("num_inputs", C.c_uint32), ("num_regs", C.c_uint32), ("out_reg", C.c_uint32), ("fragcoord_reg", C.c_int32)]
+
+    lib.ttr_frame_shader.argtypes = [C.c_void_p, C.POINTER(ShaderDesc)]
+    lib.ttr_frame_shader.restype = C.c_uint32
+    lib.ttr_frame_triangles_shaded.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p, C.c_int, C.c_int, C.c_void_p]
+    OP_MOV, OP_MUL, OP_ADD = 1, 3, 2
+    CONST = 1 << 12
+
+    def instr(op, dst, a=0, b=0, c=0):
+        return [op | (dst << 16), a, b, c]
+
+    def program(scale=0.5, n_inputs=2, junk=False):
+        # r2 = u, r3 = v, r4 = u * scale, r5 = 1: colour (u, v, u * scale, 1)
+        code = instr(OP_MOV, 2, 0) + instr(OP_MOV, 3, 1) + instr(OP_MUL, 4, 0, CONST | 0) + instr(OP_MOV, 5, CONST | 1)
+        if junk:
+            code = instr(OP_ADD, 4, 5, 0) + code   # reads r5, which is written only later
+        consts = np.array([scale, 1.0], dtype=np.float32)
+        code = np.array(code, dtype=np.uint32)
+        d = ShaderDesc(code.ctypes.data, len(code) // 4, consts.ctypes.data, 2, n_inputs, 6, 2, -1)
+        return d, code, consts
+
+    def shaded_frame(desc_list, tris, shader_ids, attrs, persp=0, state=None, fixed_first=None):
+        cc = (C.c_float * 4)(0, 0, 0, 1)
+        assert lib.ttr_frame_begin(ctx, W, H, cc, 1.0, LESS) == 0
+        ids = []
+        for d in desc_list:
+            ids.append(lib.ttr_frame_shader(ctx, C.byref(d[0])))
+        if fixed_first:
+            arr = (Vertex * (3 * len(fixed_first)))(*[v for t in fixed_first for v in t])
+            assert lib.ttr_frame_triangles(ctx, arr, len(fixed_first), LINEAR, 0, None) == 0
+        arr = (Vertex * (3 * len(tris)))(*[v for t in tris for v in t])
+        a = np.asarray(attrs, dtype=np.float32)
+        assert lib.ttr_frame_triangles_shaded(ctx, arr, len(tris), ids[shader_ids], a.ctypes.data, persp, 0, C.byref(state) if state else None) == 0, lib.ttr_last_error()
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        assert lib.ttr_frame_end(ctx, rgba.ctypes.data, 0, None, 0) == 0
+        return rgba, ids
+
+    lib.ttr_last_error.restype = C.c_char_p
+    d1 = program()
+    rect_tris = [(vert(8, 4), vert(40, 4), vert(40, 20)), (vert(8, 4), vert(40, 20), vert(8, 20))]
+    uv = {0: (0.0, 0.0), 1: (1.0, 0.0), 2: (1.0, 1.0), 3: (0.0, 1.0)}
+    attrs = [*uv[0], *uv[1], *uv[2], *uv[0], *uv[2], *uv[3]]
+    img, ids = shaded_frame([d1, program(0.5), program(0.25)], rect_tris, 0, attrs)
+    check(ids[0] == 1 and ids[1] == 1 and ids[2] == 2, "identical programs of a frame share an id")
+    px = img[12, 24].astype(int)   # u = (24.5 - 8) / 32, v = (12.5 - 4) / 16
+    exp = np.array([(24.5 - 8) / 32, (12.5 - 4) / 16, 0.5 * (24.5 - 8) / 32, 1.0]) * 255
+    check(int(np.abs(px - exp).max()) <= 1, f"a shaded rectangle shows the shader's colour from the varyings ({tuple(px)} against {tuple(np.round(exp, 1))})")
+    check(tuple(img[30, 30]) == (0, 0, 0, 255), "pixels outside the shaded rectangle keep the clear colour")
+    # A nearer shaded triangle over a fixed-function one (API order, depth test).
+    far = [(vert(0, 0, z=0.9, c=(0, 0, 1, 1)), vert(64, 0, z=0.9, c=(0, 0, 1, 1)), vert(64, 48, z=0.9, c=(0, 0, 1, 1)))]
+    img, _ = shaded_frame([d1], rect_tris, 0, attrs, fixed_first=far)
+    check(tuple(img[12, 24][:3]) != (0, 0, 255) and tuple(img[8, 60]) == (0, 0, 255, 255), "shaded and fixed-function triangles share a frame")
+    # Perspective-correct varyings differ from linear ones when w varies.
+    wtris = [(vert(8, 4, w=1), vert(60, 4, w=4), vert(8, 40, w=1))]
+    wattr = [0, 0, 1, 0, 0, 1]
+    lin, _ = shaded_frame([d1], wtris, 0, wattr, persp=0)
+    per, _ = shaded_frame([d1], wtris, 0, wattr, persp=1)
+    check(int(np.abs(lin.astype(int) - per.astype(int)).max()) > 20, "shader varyings are perspective-correct on request")
+    # Refusals.
+    bad = program(junk=True)
+    check(lib.ttr_frame_begin(ctx, W, H, (C.c_float * 4)(0, 0, 0, 1), 1.0, LESS) == 0 and lib.ttr_frame_shader(ctx, C.byref(bad[0])) == 0
+          and b"read before" in lib.ttr_last_error(), "a program reading an unwritten register is refused")
+    ids = []
+    for k in range(40):   # distinct constant tables of 1000 floats until the program table is full
+        consts = np.full(1000, float(k), dtype=np.float32)
+        consts[1] = 1.0
+        code = np.array(instr(OP_MOV, 2, 0) + instr(OP_MOV, 3, 1) + instr(OP_MUL, 4, 0, CONST | 0) + instr(OP_MOV, 5, CONST | 1), dtype=np.uint32)
+        d = ShaderDesc(code.ctypes.data, 4, consts.ctypes.data, 1000, 2, 6, 2, -1)
+        ids.append(lib.ttr_frame_shader(ctx, C.byref(d)))
+    check(0 < ids.index(0) < 20 and all(i == 0 for i in ids[ids.index(0):]), f"programs beyond the program table are refused ({ids.index(0)} fit)")
+    lib.ttr_frame_end(ctx, np.zeros((H, W, 4), dtype=np.uint8).ctypes.data, 0, None, 0)   # close the frame
     # Errors and misuse.
     cc = (C.c_float * 4)(0, 0, 0, 1)
     check(lib.ttr_frame_begin(ctx, 4096, 16, cc, 1.0, LESS) != 0, "a target above 2048 pixels is refused")

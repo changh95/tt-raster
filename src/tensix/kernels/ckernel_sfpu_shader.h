@@ -246,16 +246,21 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
             case kOpLg2: d = sh_lg2(a); break;
             case kOpSin: d = sh_sin_folded(sh_reduce(a)); break;
             case kOpCos: d = sh_sin_folded(sh_reduce(a) + 1.57079633f); break;
-            case kOpSlt: d = 0.0f; v_if (a < b) { d = 1.0f; } v_endif; break;
-            case kOpSge: d = 0.0f; v_if (a >= b) { d = 1.0f; } v_endif; break;
-            case kOpSeq: d = 0.0f; v_if (a == b) { d = 1.0f; } v_endif; break;
-            case kOpSne: d = 0.0f; v_if (a != b) { d = 1.0f; } v_endif; break;
-            case kOpCmp: d = c; v_if (a < 0.0f) { d = b; } v_endif; break;
-            case kOpSel: d = c; v_if (a != 0.0f) { d = b; } v_endif; break;
-            case kOpKill:
-                v_if (a < 0.0f) { sfpi::dst_reg[kRegBase + kKillReg] = -1.0f; }
+            // The SFPU tests the sign bit (and the raw bits for != 0), so a real -0 (a product of a negative number and zero,
+            // the negate modifier on +0) would compare as negative or non-zero. Adding +0 turns -0 into +0 (round to nearest)
+            // and leaves everything else alone: the compares then agree with IEEE (-0 == +0).
+            case kOpSlt: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x < y) { d = 1.0f; } v_endif; break; }
+            case kOpSge: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x >= y) { d = 1.0f; } v_endif; break; }
+            case kOpSeq: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x == y) { d = 1.0f; } v_endif; break; }
+            case kOpSne: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x != y) { d = 1.0f; } v_endif; break; }
+            case kOpCmp: { sfpi::vFloat x = a + 0.0f; d = c; v_if (x < 0.0f) { d = b; } v_endif; break; }
+            case kOpSel: { sfpi::vFloat x = a + 0.0f; d = c; v_if (x != 0.0f) { d = b; } v_endif; break; }
+            case kOpKill: {
+                sfpi::vFloat x = a + 0.0f;
+                v_if (x < 0.0f) { sfpi::dst_reg[kRegBase + kKillReg] = -1.0f; }
                 v_endif;
                 continue;
+            }
             default: break;
         }
         if (instr_flags(w0) & kFlagSat) { d = sh_sat(d); }

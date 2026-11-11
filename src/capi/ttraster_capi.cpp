@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#include "tensix/kernels/raster_layout.h"
 #include "ttraster/ttraster.h"
 
 #include <cstring>
@@ -250,6 +251,7 @@ struct ttr_context {
     ttr::Frame frame;
     bool open = false;
     std::string report;
+    size_t table_words = 0;   // size of the device's program table for the frame's shaders (raster_layout.h)
 };
 
 ttr_context* ttr_context_create(const char* backend, uint32_t n_chips) {
@@ -295,14 +297,21 @@ int ttr_frame_begin(
     ctx->frame.cull = ttr::CullMode::None;
     ctx->frame.triangles.clear();   // keeps the capacity
     ctx->frame.viewports.clear();
+    ctx->frame.shaders.clear();
+    ctx->frame.attrs.clear();
+    ctx->table_words = 0;
     ctx->open = true;
     return 0;
 }
 
-int ttr_frame_triangles(
-    ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull, const ttr_state* state) {
+namespace {
+
+// Append triangles to the open frame. shader == 0: fixed function (vertex colours); otherwise `attrs` holds the varyings.
+int append_triangles(
+    ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull, const ttr_state* state,
+    uint32_t shader, const float* attrs) {
     if (!ctx->open) {
-        g_error = "ttr_frame_triangles outside a frame";
+        g_error = "triangles outside a frame";
         return -1;
     }
     // Culling is per frame in the rasterizer: draws with different cull modes cannot share a frame, so the
@@ -313,13 +322,25 @@ int ttr_frame_triangles(
         g_error = "all triangles of a frame must use the same cull mode";
         return -1;
     }
+    uint32_t n_in = 0;
+    if (shader != 0) {
+        if (shader > ctx->frame.shaders.size()) {
+            g_error = "unknown shader id";
+            return -1;
+        }
+        n_in = ctx->frame.shaders[shader - 1].num_inputs;
+        if (n_in != 0 && attrs == nullptr) {
+            g_error = "shader triangles need their varyings";
+            return -1;
+        }
+    }
     ctx->frame.cull = mode;
     const size_t base = ctx->frame.triangles.size();
     ctx->frame.triangles.resize(base + n_triangles);
     for (uint32_t t = 0; t < n_triangles; t++) {
         ttr::Triangle& tri = ctx->frame.triangles[base + t];
         tri.viewport = 0;
-        tri.flat = shading == TTR_SHADE_FLAT;
+        tri.flat = shading == TTR_SHADE_FLAT && shader == 0;
         tri.perspective = shading == TTR_SHADE_PERSPECTIVE;
         if (state) {
             tri.own_state = true;
@@ -337,8 +358,77 @@ int ttr_frame_triangles(
             tri.v[k].rhw = v.rhw;
             std::memcpy(tri.v[k].color, v.color, sizeof v.color);
         }
+        if (shader != 0) {
+            tri.shader = static_cast<uint16_t>(shader);
+            tri.attr_offset = static_cast<uint32_t>(ctx->frame.attrs.size());
+            ctx->frame.attrs.insert(ctx->frame.attrs.end(), attrs + static_cast<size_t>(t) * 3 * n_in, attrs + static_cast<size_t>(t + 1) * 3 * n_in);
+        }
     }
     return 0;
+}
+
+bool same_program(const ttr::ShaderProgram& a, const ttr::ShaderProgram& b) {
+    if (a.num_inputs != b.num_inputs || a.num_regs != b.num_regs || a.out_reg != b.out_reg || a.fragcoord_reg != b.fragcoord_reg ||
+        a.code.size() != b.code.size() || a.consts.size() != b.consts.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.code.size(); i++) {
+        if (std::memcmp(a.code[i].w, b.code[i].w, sizeof a.code[i].w) != 0) return false;
+    }
+    return a.consts.empty() || std::memcmp(a.consts.data(), b.consts.data(), a.consts.size() * sizeof(float)) == 0;
+}
+
+}  // namespace
+
+int ttr_frame_triangles(
+    ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull, const ttr_state* state) {
+    return append_triangles(ctx, verts, n_triangles, shading, cull, state, 0, nullptr);
+}
+
+int ttr_frame_triangles_shaded(
+    ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, uint32_t shader, const float* attrs, int perspective,
+    int cull, const ttr_state* state) {
+    return append_triangles(ctx, verts, n_triangles, perspective ? TTR_SHADE_PERSPECTIVE : TTR_SHADE_LINEAR, cull, state, shader, attrs);
+}
+
+uint32_t ttr_frame_shader(ttr_context* ctx, const ttr_shader_desc* desc) {
+    try {
+        if (!ctx->open) {
+            g_error = "ttr_frame_shader outside a frame";
+            return 0;
+        }
+        ttr::ShaderProgram p;
+        p.code.resize(desc->n_instr);
+        for (uint32_t i = 0; i < desc->n_instr; i++) {
+            std::memcpy(p.code[i].w, desc->code + static_cast<size_t>(i) * TTR_INSTR_WORDS, sizeof p.code[i].w);
+        }
+        p.consts.assign(desc->consts, desc->consts + desc->n_consts);
+        p.num_inputs = desc->num_inputs;
+        p.num_regs = desc->num_regs;
+        p.out_reg = desc->out_reg;
+        p.fragcoord_reg = desc->fragcoord_reg;
+        const std::string err = ttr::validate_shader(p);
+        if (!err.empty()) {
+            g_error = "invalid shader: " + err;
+            return 0;
+        }
+        for (size_t k = 0; k < ctx->frame.shaders.size(); k++) {
+            if (same_program(ctx->frame.shaders[k], p)) return static_cast<uint32_t>(k + 1);
+        }
+        // The device's program table (raster_layout.h): a header word, a directory entry per program, code and constants.
+        const size_t words = ctx->table_words == 0 ? ttr::layout::kTabDirectory : ctx->table_words;
+        const size_t add = ttr::layout::kTabEntryWords + p.code.size() * TTR_INSTR_WORDS + p.consts.size();
+        if (words + add > static_cast<size_t>(ttr::layout::kMaxTablePages) * ttr::layout::kTileWords || ctx->frame.shaders.size() >= 65535) {
+            g_error = "the shader programs of the frame do not fit the program table";
+            return 0;
+        }
+        ctx->table_words = words + add;
+        ctx->frame.shaders.push_back(std::move(p));
+        return static_cast<uint32_t>(ctx->frame.shaders.size());
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return 0;
+    }
 }
 
 int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y) {

@@ -41,7 +41,7 @@ if git -C "$src" apply --reverse --check "$patch_file" 2>/dev/null; then
 else
     git -C "$src" apply "$patch_file"
 fi
-cp "$root/mesa/softpipe_tensix/sp_tensix.c" "$root/mesa/softpipe_tensix/sp_tensix.h" "$src/src/gallium/drivers/softpipe/"
+cp "$root/mesa/softpipe_tensix/"sp_tensix*.[ch] "$root/include/ttraster/ttraster_isa.h" "$src/src/gallium/drivers/softpipe/"
 
 if [[ ! -d "$build" ]]; then
     meson setup "$build" "$src" --prefix="$prefix" -Dbuildtype=release -Dgallium-drivers=softpipe -Dvulkan-drivers= \

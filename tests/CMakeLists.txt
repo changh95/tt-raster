@@ -5,6 +5,7 @@
 function(ttr_test name label)
     add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE ttraster_core)
+    target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_compile_definitions(${name} PRIVATE TT_RASTER_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden/")
     add_test(NAME ${name} COMMAND ${name})
     set_tests_properties(${name} PROPERTIES LABELS ${label})

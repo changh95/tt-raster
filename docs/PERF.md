@@ -249,3 +249,26 @@ A process-wide CPU census explains why the first version of the pipeline gained 
 | 1920 x 1080 | 31 FPS | 126 FPS | 4.1 |
 
 Per-frame breakdown of the fast path at 1920 x 1080 (`TTR_GL_DEBUG=1`): 4.8 ms in the rasterizer (setup 0.2, binning 0.2, record encoding 0.3, upload 0.6, device 0.8, read-back 1.1 of which 0.7 is the transfer, plus the copy of colour and depth out of the rasterizer), 0.75 ms writing the colour into Mesa's buffer; the remaining 2.4 ms of the 7.9 ms frame are Mesa (vertex processing in the draw module) and the swap into the X server. At 300 x 300 the rasterizer takes 2.0 ms for 750 records of which about 1.7 ms is chip latency, which is why small windows do not gain. What helped: writing the colour surface directly as words instead of through softpipe's float tile cache (6 to 10 ms per 1080p frame to 0.75 ms), and deferring the depth write (2.7 ms at 1080p) until something reads the depth buffer. Blending and per-draw state cost more on the device: a record with its own depth/blend state takes the kernel's general path (about 11.5 us per record on the `state` scene against 3.5 us for default-state records on `random_10k`; the scenes differ, so this is an upper bound for the extra work). Not done: overlapping frames with Mesa's work (the pipelined `ttr_submit` path exists for the scene API, not for this one), and zero-copy read-back (the rasterizer copies colour and depth into the caller's buffers).
+
+## Fragment shaders (G.6)
+
+### Interpreter cost (`tools/ttr_shader_bench`, node 5, 1920 x 1088, one full-screen quad, 120 cores, median of 20 warm runs)
+
+The program is a chain of K instructions of one kind on one register; the device time rises linearly with K. Time per instruction and per pixel vector (32 lanes) on the busiest core (17 tiles of 2 triangles x 32 vectors):
+
+| instruction | K = 8 | K = 32 | K = 128 | device ms at K = 0 / 32 / 128 |
+| --- | --- | --- | --- | --- |
+| Mad | 36.8 ns | 39.0 ns | 39.0 ns | 1.16 / 2.52 / 6.59 |
+| Mul | 45.6 | 41.8 | 40.1 | 1.07 / 2.52 / 6.65 |
+| Slt | 37.2 | 35.0 | 37.6 | 1.09 / 2.30 / 6.32 |
+| Rcp | 54.6 | 43.8 | 40.6 | 1.05 / 2.57 / 6.69 |
+| Ex2 | 42.6 | 49.1 | 48.1 | 1.00 / 2.71 / 7.71 |
+| Sin | 60.7 | 55.1 | 53.2 | 0.99 / 2.91 / 8.40 |
+
+About 40 ns (50 cycles) for any instruction: fetching and decoding the instruction word and its three operands on the RISC-V core, and issuing the SFPU operations through runtime-indexed `dst_reg`, cost far more than the arithmetic (the whole `sin` is only 14 ns more than a `mad`). A 1080p frame with a 32-instruction shader over the whole screen costs 2.5 ms on the device, a 128-instruction one 6.6 ms. The 1.0 ms at K = 0 is the fixed cost of a frame (clear, packed colour, read-back path). Decoding is the place to optimize (pre-decoded operand fields, superinstructions such as Mad with constant operands, dot products as one instruction).
+
+### Scene `shader` and OpenGL
+
+The `shader` scene (background from `gl_FragCoord`, perspective checkerboard, Phong sphere, discard stripes, translucent layer; 6,524 records at 1920 x 1088): device 4.6 ms minimum, 5.1 ms median, whole `render()` 12.7 ms; the busiest core draws 257 records at 18 us each (a fixed-function record is 3.5 us).
+
+A Phong-lit sphere (GLSL fragment shader of 44 translated instructions, `gl_scene --fs phong`, the default scene of triangles) at 1024 x 1024 through Mesa: stock softpipe 73 ms per frame, one chip 9.7 ms per frame (differences of two runs of different length, so start-up cancels): 4.6 ms in the rasterizer call (device 2.2 ms, read-back 0.7 ms, 763 records), 0.3 ms writing the result into softpipe's buffers, the rest is Mesa's vertex stage and the `glReadPixels` of the test program.

@@ -18,6 +18,7 @@
  */
 
 #include "sp_tensix.h"
+#include "sp_tensix_shader.h"
 
 #include <dlfcn.h>
 #include <math.h>
@@ -27,8 +28,10 @@
 #include <time.h>
 
 #include "sp_context.h"
+#include "sp_setup.h"
 #include "sp_state.h"
 #include "sp_tile_cache.h"
+#include "tgsi/tgsi_dump.h"
 #include "tgsi/tgsi_parse.h"
 #include "util/format/u_format.h"
 #include "util/u_memory.h"
@@ -48,11 +51,23 @@ typedef struct {
 } ttr_state;
 enum { TTR_SHADE_LINEAR = 0, TTR_SHADE_FLAT = 1, TTR_SHADE_PERSPECTIVE = 2 };
 
+typedef struct {
+   const uint32_t *code;
+   uint32_t n_instr;
+   const float *consts;
+   uint32_t n_consts;
+   uint32_t num_inputs, num_regs, out_reg;
+   int32_t fragcoord_reg;
+} ttr_shader_desc;
+
 struct ttr_api {
    void *(*context_create)(const char *backend, uint32_t n_chips);
    void (*context_destroy)(void *ctx);
    int (*frame_begin)(void *ctx, uint32_t w, uint32_t h, const float clear_color[4], float clear_depth, int depth_func);
    int (*frame_triangles)(void *ctx, const ttr_vertex *verts, uint32_t n, int shading, int cull, const ttr_state *state);
+   uint32_t (*frame_shader)(void *ctx, const ttr_shader_desc *desc);
+   int (*frame_triangles_shaded)(void *ctx, const ttr_vertex *verts, uint32_t n, uint32_t shader, const float *attrs,
+                                 int perspective, int cull, const ttr_state *state);
    int (*frame_end)(void *ctx, uint8_t *rgba, uint32_t stride, float *depth, int flip_y);
    const char *(*last_error)(void);
    const char *(*context_report)(void *ctx);
@@ -70,13 +85,33 @@ struct sp_tensix {
    struct ttr_api api;
    void *ctx;
    bool debug;
+   bool debug_tgsi;                        /* TTR_GL_DEBUG=2: print the TGSI of every fragment shader the first time it is seen */
+   const struct tgsi_token *dumped_tokens;
 
    enum frame_state state;
    float clear_color[4];
    float clear_depth;
    uint32_t width, height;  /* of the open frame */
 
+   /* Translated fragment shaders, by TGSI token pointer (checked against a hash of the tokens: a deleted shader's address
+    * can be reused). */
+   struct {
+      const struct tgsi_token *tokens;
+      uint64_t hash;
+      unsigned ntokens;
+      struct ttr_prog *prog;   /* NULL: refused */
+      const char *why;
+   } shaders[32];
+   unsigned n_shaders, next_shader;
+
    /* The draw in progress. */
+   bool shaded;             /* the fragment shader is a translated program (otherwise a colour pass-through) */
+   const struct ttr_prog *prog;
+   uint32_t shader_id;      /* its id in the open frame */
+   int input_slot[32];      /* per program input component: the vertex slot of the fragment input, and its interpolation mode */
+   int input_interp[32];
+   float *attrs;            /* varyings of the batch: num_inputs floats per vertex */
+   size_t attrs_cap;
    bool tri_active;
    int color_slot;          /* vertex slot of the colour varying */
    bool flat;
@@ -134,6 +169,8 @@ load_api(struct sp_tensix *t, const char *path)
    LOAD(context_destroy, "ttr_context_destroy")
    LOAD(frame_begin, "ttr_frame_begin")
    LOAD(frame_triangles, "ttr_frame_triangles")
+   LOAD(frame_shader, "ttr_frame_shader")
+   LOAD(frame_triangles_shaded, "ttr_frame_triangles_shaded")
    LOAD(frame_end, "ttr_frame_end")
    LOAD(last_error, "ttr_last_error")
    LOAD(context_report, "ttr_context_report")
@@ -153,6 +190,7 @@ sp_tensix_create(struct softpipe_context *sp)
       return NULL;
    t->sp = sp;
    t->debug = getenv("TTR_GL_DEBUG") != NULL;
+   t->debug_tgsi = t->debug && atoi(getenv("TTR_GL_DEBUG")) >= 2;
    if (!load_api(t, lib && *lib ? lib : "libttraster.so")) {
       FREE(t);
       return NULL;
@@ -179,6 +217,9 @@ sp_tensix_destroy(struct sp_tensix *t)
               t->frames_fast, t->draws_fast, t->draws_slow, t->frames_fallback);
    t->api.context_destroy(t->ctx);
    FREE(t->verts);
+   FREE(t->attrs);
+   for (unsigned i = 0; i < t->n_shaders; i++)
+      ttr_prog_free(t->shaders[i].prog);
    FREE(t->rgba);
    FREE(t->depth);
    dlclose(t->lib);
@@ -262,6 +303,59 @@ passthrough_input(const struct tgsi_token *tokens)
    return ok && count == 1 ? input : -1;
 }
 
+/* The translated program of a fragment shader variant (cached; a refusal is cached too, with its reason). */
+static const struct ttr_prog *
+get_program(struct sp_tensix *t, const struct sp_fragment_shader_variant *variant, const char **why)
+{
+   const struct tgsi_token *tok = variant->tokens;
+   const unsigned nt = tgsi_num_tokens(tok);
+   uint64_t h = 1469598103934665603ull;
+   for (unsigned i = 0; i < nt * sizeof(struct tgsi_token); i++)
+      h = (h ^ ((const uint8_t *)tok)[i]) * 1099511628211ull;
+   for (unsigned i = 0; i < t->n_shaders; i++) {
+      if (t->shaders[i].tokens == tok && t->shaders[i].hash == h && t->shaders[i].ntokens == nt) {
+         *why = t->shaders[i].why;
+         return t->shaders[i].prog;
+      }
+   }
+   const char *reason = NULL;
+   struct ttr_prog *prog = ttr_prog_translate(tok, &reason);
+   if (t->debug) {
+      if (prog) {
+         fprintf(stderr, "tensix: fragment shader translated: %u instructions, %u inputs, %u constants, %u registers\n", prog->n_instr,
+                 prog->num_inputs, prog->n_consts, prog->num_regs);
+         if (t->debug_tgsi) {
+            for (unsigned i = 0; i < prog->n_instr; i++) {
+               const uint32_t *w = &prog->code[4 * i];
+               fprintf(stderr, "    %3u: op %2u%s r%u", i, w[0] & 0xff, (w[0] >> 8) & 1 ? ".sat" : "", w[0] >> 16);
+               for (int k = 1; k < 4; k++) {
+                  if (w[k] == 0 && k > 1)
+                     continue;
+                  fprintf(stderr, "  %s%s%s%u", (w[k] & (1u << 13)) ? "-" : "", (w[k] & (1u << 14)) ? "|" : "", (w[k] & (1u << 12)) ? "c" : "r",
+                          w[k] & 0xfff);
+               }
+               fputc('\n', stderr);
+            }
+            fprintf(stderr, "    consts:");
+            for (unsigned i = 0; i < prog->n_imm; i++)
+               fprintf(stderr, " %g", prog->consts[i]);
+            fprintf(stderr, "  | out r%u fragcoord r%d\n", prog->out_reg, prog->fragcoord_reg);
+         }
+      }
+      else
+         fprintf(stderr, "tensix: fragment shader not translated: %s\n", reason);
+   }
+   const unsigned slot = t->n_shaders < 32 ? t->n_shaders++ : (t->next_shader++ % 32);
+   ttr_prog_free(t->shaders[slot].prog);
+   t->shaders[slot].tokens = tok;
+   t->shaders[slot].hash = h;
+   t->shaders[slot].ntokens = nt;
+   t->shaders[slot].prog = prog;
+   t->shaders[slot].why = reason;
+   *why = reason;
+   return prog;
+}
+
 /* Why the current draw cannot use the fast path, or NULL. Sets t->color_slot / t->flat when it can. */
 static const char *
 draw_refused(struct sp_tensix *t, const struct pipe_draw_info *info)
@@ -325,11 +419,42 @@ draw_refused(struct sp_tensix *t, const struct pipe_draw_info *info)
    /* softpipe derives the vertex layout and the setup info lazily, when the draw module asks for it. */
    softpipe_get_vbuf_vertex_info(sp);
    const struct tgsi_shader_info *fi = &sp->fs_variant->info;
-   if (fi->uses_kill || fi->writes_z || fi->writes_stencil || fi->num_outputs != 1)
-      return "fragment shader kills or writes depth";
-   const int k = passthrough_input(sp->fs_variant->tokens);
-   if (k < 0 || (unsigned)k >= fi->num_inputs)
-      return "fragment shader is not a colour pass-through";
+   if (t->debug_tgsi && t->dumped_tokens != sp->fs_variant->tokens) {
+      t->dumped_tokens = sp->fs_variant->tokens;
+      tgsi_dump(sp->fs_variant->tokens, 0);
+   }
+   if (fi->writes_z || fi->writes_stencil || fi->num_outputs != 1)
+      return "fragment shader writes depth or stencil, or several outputs";
+   t->shaded = false;
+   t->prog = NULL;
+   const int k = fi->uses_kill ? -1 : passthrough_input(sp->fs_variant->tokens);
+   if (k < 0) {
+      /* Arithmetic fragment shader: translated to a program of the rasterizer. */
+      const char *why = NULL;
+      const struct ttr_prog *prog = get_program(t, sp->fs_variant, &why);
+      if (!prog)
+         return why;
+      bool any_persp = false, any_linear = false;
+      for (unsigned i = 0; i < prog->num_inputs; i++) {
+         const unsigned j = prog->map[i].input;
+         if (j >= fi->num_inputs)
+            return "fragment shader input out of range";
+         const enum sp_interp_mode mode = sp->setup_info.attrib[j].interp;
+         t->input_slot[i] = sp->setup_info.attrib[j].src_index;
+         t->input_interp[i] = mode;
+         any_persp |= mode == SP_INTERP_PERSPECTIVE;
+         any_linear |= mode == SP_INTERP_LINEAR;
+         if (mode != SP_INTERP_PERSPECTIVE && mode != SP_INTERP_LINEAR && mode != SP_INTERP_CONSTANT)
+            return "fragment input interpolation mode";
+      }
+      if (any_persp && any_linear)
+         return "mixed perspective and screen-linear varyings";
+      t->shaded = true;
+      t->prog = prog;
+      t->flat = false;
+      t->perspective = any_persp;
+      return NULL;
+   }
    if (t->debug) {
       for (unsigned i = 0; i < fi->num_inputs; i++)
          fprintf(stderr, "tensix: fs input %u: semantic %d index %d interpolate %d -> setup interp %d src slot %d%s\n", i,
@@ -571,6 +696,42 @@ sp_tensix_clear(struct sp_tensix *t, unsigned buffers, const struct pipe_scissor
    t->height = t->sp->framebuffer.height;
 }
 
+/* The draw goes to softpipe: render what the frame holds so far, the rest of the frame is softpipe's. */
+static void
+refuse_draw(struct sp_tensix *t, const char *why)
+{
+   if (!t->logged_unsupported || t->debug) {
+      fprintf(stderr, "tensix: draw handled by softpipe: %s\n", why);
+      t->logged_unsupported = true;
+   }
+   if (t->state == FRAME_OPEN) {
+      t->frames_fallback++;
+      sp_tensix_flush(t);
+   }
+   materialize_depth(t);
+   t->state = FRAME_NONE;
+   t->draws_slow++;
+}
+
+/* Hand the translated shader of the draw (with the uniforms it reads, now) to the open frame. NULL on success. */
+static const char *
+register_shader(struct sp_tensix *t)
+{
+   const struct ttr_prog *p = t->prog;
+   float consts[1024];
+   const struct tgsi_exec_consts_info *cb = &t->sp->mapped_constants[MESA_SHADER_FRAGMENT][0];
+   if (!ttr_prog_constants(p, (const float *)cb->ptr, cb->size, t->sp->framebuffer.height, consts))
+      return "uniform outside the constant buffer";
+   const ttr_shader_desc desc = {p->code, p->n_instr, consts, p->n_consts, p->num_inputs, p->num_regs, p->out_reg, p->fragcoord_reg};
+   t->shader_id = t->api.frame_shader(t->ctx, &desc);
+   if (!t->shader_id) {
+      if (t->debug)
+         fprintf(stderr, "tensix: shader refused: %s\n", t->api.last_error());
+      return "fragment shader program does not fit the frame";
+   }
+   return NULL;
+}
+
 void
 sp_tensix_begin_draw(struct sp_tensix *t, const struct pipe_draw_info *info)
 {
@@ -584,17 +745,7 @@ sp_tensix_begin_draw(struct sp_tensix *t, const struct pipe_draw_info *info)
    }
    const char *why = draw_refused(t, info);
    if (why) {
-      if (!t->logged_unsupported || t->debug) {
-         fprintf(stderr, "tensix: draw handled by softpipe: %s\n", why);
-         t->logged_unsupported = true;
-      }
-      if (t->state == FRAME_OPEN) {
-         t->frames_fallback++;
-               sp_tensix_flush(t);   /* render what is pending, then the rest of the frame is softpipe's */
-      }
-      materialize_depth(t);
-      t->state = FRAME_NONE;
-      t->draws_slow++;
+      refuse_draw(t, why);
       return;
    }
    if (t->state == FRAME_CLEARED) {
@@ -605,6 +756,10 @@ sp_tensix_begin_draw(struct sp_tensix *t, const struct pipe_draw_info *info)
          return;
       }
       t->state = FRAME_OPEN;
+   }
+   if (t->shaded && (why = register_shader(t)) != NULL) {
+      refuse_draw(t, why);
+      return;
    }
    t->nverts = 0;
    t->tri_active = true;
@@ -620,7 +775,11 @@ sp_tensix_tri_active(const struct sp_tensix *t)
 static void
 submit_batch(struct sp_tensix *t)
 {
-   if (t->nverts &&
+   if (t->nverts && t->shaded) {
+      if (t->api.frame_triangles_shaded(t->ctx, t->verts, (uint32_t)(t->nverts / 3), t->shader_id, t->attrs, t->perspective, 0,
+                                        t->own_state ? &t->draw_state : NULL) != 0)
+         fprintf(stderr, "tensix: frame_triangles_shaded failed: %s\n", t->api.last_error());
+   } else if (t->nverts &&
        t->api.frame_triangles(t->ctx, t->verts, (uint32_t)(t->nverts / 3),
                               t->flat ? TTR_SHADE_FLAT : t->perspective ? TTR_SHADE_PERSPECTIVE : TTR_SHADE_LINEAR, 0,
                               t->own_state ? &t->draw_state : NULL) != 0) {
@@ -649,14 +808,32 @@ sp_tensix_tri(struct sp_tensix *t, const float (*v0)[4], const float (*v1)[4], c
       t->cap = t->cap ? t->cap * 2 : 3 * 1024;
       t->verts = REALLOC(t->verts, 0, t->cap * sizeof(ttr_vertex));
    }
+   if (t->shaded) {
+      const size_t need = (t->nverts + 3) * (size_t)t->prog->num_inputs;
+      if (need > t->attrs_cap) {
+         t->attrs_cap = MAX2(need * 2, 3 * 1024 * 8);
+         t->attrs = REALLOC(t->attrs, 0, t->attrs_cap * sizeof(float));
+      }
+   }
    for (int k = 0; k < 3; k++) {
-      ttr_vertex *o = &t->verts[t->nverts++];
+      ttr_vertex *o = &t->verts[t->nverts];
       const float *p = in[k][0];   /* slot 0: window position, w holds 1/w */
       o->x = p[0];
       o->y = p[1];
       o->z = p[2];
       o->rhw = p[3];
-      memcpy(o->color, t->flat ? vprovoke[t->color_slot] : in[k][t->color_slot], 4 * sizeof(float));
+      if (t->shaded) {
+         /* the varyings of this vertex: constant ones take the provoking vertex's value */
+         float *a = &t->attrs[t->nverts * (size_t)t->prog->num_inputs];
+         for (unsigned i = 0; i < t->prog->num_inputs; i++) {
+            const float (*src)[4] = t->input_interp[i] == SP_INTERP_CONSTANT ? vprovoke : in[k];
+            a[i] = src[t->input_slot[i]][t->prog->map[i].comp];
+         }
+         memset(o->color, 0, sizeof o->color);
+      } else {
+         memcpy(o->color, t->flat ? vprovoke[t->color_slot] : in[k][t->color_slot], 4 * sizeof(float));
+      }
+      t->nverts++;
    }
    return true;
 }

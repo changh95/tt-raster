@@ -57,6 +57,12 @@ struct OpTest {
     // Magnitude that sets the unit u (default max(|ref|, 1)); Mad: the multiply-add of the SFPU keeps the product to about
     // 2^-23 of its own size, so a cancelling sum is wrong relative to |a * b|, not to the result.
     std::function<double(const double[3], double)> mag = nullptr;
+    // The first operand goes through the negate modifier: -(+0) is a real -0 in the register (plane values never are: 0 * dx +
+    // (0 * dy - 0) is +0), which a compare must still treat as equal to 0.
+    bool neg_a = false;
+    // Kill: the pixel is white unless the fragment is killed (kill if -a < 0 here: a > 0), clear colour black; the error is
+    // the number of pixels that are not as expected.
+    bool is_kill = false;
 };
 
 float f32(double x) { return static_cast<float>(x); }
@@ -65,13 +71,21 @@ std::vector<OpTest> make_tests() {
     auto any = [](Rng& r, double v[3]) { for (int k = 0; k < 3; k++) v[k] = r.log_signed(-3, 3); };
     auto first = [](Rng& r, double v[3]) { v[0] = r.log_signed(-3, 3); v[1] = v[2] = 0; };
     auto pos = [](Rng& r, double v[3]) { v[0] = r.log_pos(-4, 4); v[1] = v[2] = 0; };
-    auto cmpgen = [](Rng& r, double v[3]) {
-        v[0] = r.log_signed(-2, 2);
-        v[1] = r.uniform() < 0.3 ? v[0] : r.log_signed(-2, 2);   // equal operands now and then
+    // Zeros of both signs and equal operands are part of the inputs: -0 must compare equal to +0 (IEEE), which a test of the
+    // sign bit would get wrong.
+    auto maybe_zero = [](Rng& r, double x) { const double u = r.uniform(); return u < 0.12 ? 0.0 : u < 0.24 ? -0.0 : x; };
+    auto cmpgen = [maybe_zero](Rng& r, double v[3]) {
+        v[0] = maybe_zero(r, r.log_signed(-2, 2));
+        v[1] = r.uniform() < 0.25 ? v[0] : maybe_zero(r, r.log_signed(-2, 2));   // equal operands now and then
         v[2] = r.log_signed(-2, 2);
     };
-    auto sel = [](Rng& r, double v[3]) {
-        v[0] = r.uniform() < 0.3 ? 0.0 : r.log_signed(-2, 2);
+    auto cmpsel = [maybe_zero](Rng& r, double v[3]) {   // Cmp tests a < 0
+        v[0] = maybe_zero(r, r.log_signed(-2, 2));
+        v[1] = r.log_signed(-2, 2);
+        v[2] = r.log_signed(-2, 2);
+    };
+    auto sel = [maybe_zero](Rng& r, double v[3]) {
+        v[0] = maybe_zero(r, r.log_signed(-2, 2));
         v[1] = r.log_signed(-2, 2);
         v[2] = r.log_signed(-2, 2);
     };
@@ -97,21 +111,34 @@ std::vector<OpTest> make_tests() {
          [](const double* v) { return std::sin(static_cast<double>(f32(v[0]))); }},
         {"Cos", kOpCos, 4.0, [](Rng& r, double v[3]) { v[0] = r.range(-50, 50); v[1] = v[2] = 0; },
          [](const double* v) { return std::cos(static_cast<double>(f32(v[0]))); }},
+        {"Slt-0", kOpSlt, 0.0, cmpgen, [](const double* v) { return -f32(v[0]) < f32(v[1]) ? 1.0 : 0.0; }, nullptr, true},
+        {"Sge-0", kOpSge, 0.0, cmpgen, [](const double* v) { return -f32(v[0]) >= f32(v[1]) ? 1.0 : 0.0; }, nullptr, true},
+        {"Seq-0", kOpSeq, 0.0, cmpgen, [](const double* v) { return -f32(v[0]) == f32(v[1]) ? 1.0 : 0.0; }, nullptr, true},
+        {"Sne-0", kOpSne, 0.0, cmpgen, [](const double* v) { return -f32(v[0]) != f32(v[1]) ? 1.0 : 0.0; }, nullptr, true},
+        {"Cmp-0", kOpCmp, 0.0, cmpsel, [](const double* v) { return -f32(v[0]) < 0.0f ? v[1] : v[2]; }, nullptr, true},
+        {"Sel-0", kOpSel, 0.0, sel, [](const double* v) { return -f32(v[0]) != 0.0f ? v[1] : v[2]; }, nullptr, true},
+        {"Kill-0", kOpKill, 0.0, cmpsel, [](const double* v) { return -f32(v[0]) < 0.0f ? 1.0 : 0.0; }, nullptr, true, true},
         {"Slt", kOpSlt, 0.0, cmpgen, [](const double* v) { return f32(v[0]) < f32(v[1]) ? 1.0 : 0.0; }},
         {"Sge", kOpSge, 0.0, cmpgen, [](const double* v) { return f32(v[0]) >= f32(v[1]) ? 1.0 : 0.0; }},
         {"Seq", kOpSeq, 0.0, cmpgen, [](const double* v) { return f32(v[0]) == f32(v[1]) ? 1.0 : 0.0; }},
         {"Sne", kOpSne, 0.0, cmpgen, [](const double* v) { return f32(v[0]) != f32(v[1]) ? 1.0 : 0.0; }},
-        {"Cmp", kOpCmp, 0.0, any, [](const double* v) { return f32(v[0]) < 0.0f ? v[1] : v[2]; }},
+        {"Cmp", kOpCmp, 0.0, cmpsel, [](const double* v) { return f32(v[0]) < 0.0f ? v[1] : v[2]; }},
         {"Sel", kOpSel, 0.0, sel, [](const double* v) { return f32(v[0]) != 0.0f ? v[1] : v[2]; }},
     };
 }
 
-ShaderProgram make_program(uint32_t op) {
+ShaderProgram make_program(uint32_t op, bool neg_a, bool is_kill) {
     ShaderBuilder sb(5);   // a, b, c, ref, scale
     const uint32_t out = sb.alloc4();
     const uint32_t ns = op_sources(op);
     const ShaderBuilder::Src z{0};
-    const uint32_t d = sb.emit(op, ns > 0 ? sb.in(0) : z, ns > 1 ? sb.in(1) : z, ns > 2 ? sb.in(2) : z);
+    const ShaderBuilder::Src a0 = neg_a ? -sb.in(0) : sb.in(0);
+    if (is_kill) {
+        sb.kill(a0);
+        for (uint32_t k = 0; k < 4; k++) sb.emit_to(kOpMov, out + k, sb.constant(1.0f));
+        return sb.finish(out);
+    }
+    const uint32_t d = sb.emit(op, ns > 0 ? a0 : z, ns > 1 ? sb.in(1) : z, ns > 2 ? sb.in(2) : z);
     const uint32_t e = sb.emit(kOpAdd, sb.reg(d), -sb.in(3));
     const uint32_t f = sb.emit(kOpMul, sb.reg(e), sb.in(4));
     const uint32_t o = sb.emit(kOpAdd, sb.reg(f), sb.constant(0.5f), z, false);
@@ -148,7 +175,8 @@ int main(int argc, char** argv) {
         f.width = W;
         f.height = (H + 31) / 32 * 32;
         f.clear_color[0] = f.clear_color[1] = f.clear_color[2] = 0.0f;
-        f.shaders.push_back(make_program(t.op));
+        f.clear_color[3] = 1.0f;
+        f.shaders.push_back(make_program(t.op, t.neg_a, t.is_kill));
         Rng rng{0x5eed0000ull + t.op};
         std::vector<double> refs(n_tests), scales(n_tests);
         std::vector<float> inputs(3 * static_cast<size_t>(n_tests));
@@ -195,6 +223,15 @@ int main(int argc, char** argv) {
             const size_t idx = dev.fb.index(i % W, i / W);
             const int byte = static_cast<int>(dev.fb.color[idx] & 255u), cpu_byte = static_cast<int>(cpu.color[idx] & 255u);
             max_level_diff = std::max(max_level_diff, std::abs(byte - cpu_byte));
+            if (t.is_kill) {
+                const bool killed = byte == 0;   // clear colour black, the shader writes white
+                const bool expected = refs[i] != 0.0;
+                if (killed != expected) {
+                    max_err += 1.0;
+                    worst_i = i;
+                }
+                continue;
+            }
             if (byte == 0 || byte == 255) {
                 out_of_range++;
                 continue;
