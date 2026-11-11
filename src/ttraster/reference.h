@@ -30,6 +30,7 @@ struct Framebuffer {
     std::vector<uint32_t> id;           // 1 + source triangle index of the visible fragment, 0 = clear
     std::vector<uint8_t> cover;         // number of triangles whose edge tests covered the pixel (saturates at 255)
     std::vector<uint8_t> ambiguous;     // 1 if a depth comparison at this pixel was within kDepthAmbiguity
+    std::vector<float> plane[4];        // unquantized colour channels of the visible fragment (only when requested)
 
     size_t index(uint32_t x, uint32_t y) const { return static_cast<size_t>(y) * width + x; }
 };
@@ -38,6 +39,9 @@ struct ReferenceOptions {
     // Skip the edge tests for tiles classified Full. Turning this off evaluates every pixel and
     // must give identical output; the tests use it to check the classification.
     bool trust_full_tiles = true;
+    // Also keep the unquantized interpolated R, G, B, A of the visible fragment in Framebuffer::plane
+    // (values are not clamped), for outputs such as normals that do not fit 8 bits.
+    bool float_planes = false;
 };
 
 struct ReferenceStats {

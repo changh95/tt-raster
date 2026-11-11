@@ -26,8 +26,16 @@ struct Vertex {
     float color[4];   // RGBA in [0, 1]
 };
 
+// A rectangle of the render target that some triangles are confined to (one camera of a tiled
+// camera atlas). Triangles are clipped to it, so nothing bleeds into a neighbour. The rectangle
+// must not extend past the padded target and is at most kMaxTargetSize pixels wide and high.
+struct Viewport {
+    int32_t x = 0, y = 0, width = 0, height = 0;
+};
+
 struct Triangle {
     Vertex v[3];
+    uint32_t viewport = 0;  // index into Frame::viewports (ignored when that list is empty)
     // Flat shading takes the colour of v[0], the provoking vertex. Smooth shading interpolates
     // linearly in screen space.
     bool flat = false;
@@ -47,6 +55,10 @@ struct Frame {
     DepthFunc depth_func = DepthFunc::Less;
     CullMode cull = CullMode::None;
     std::vector<Triangle> triangles;  // API order: later triangles win depth ties under LessEqual
+    // Empty: the whole padded target is one viewport (at most kMaxTargetSize wide and high, the
+    // original single-image mode). Otherwise every triangle is confined to its viewport and the
+    // target may be larger than kMaxTargetSize.
+    std::vector<Viewport> viewports;
 
     // The render target is the viewport padded up to whole tiles. Pixels in the padding are
     // rasterized like any other and are cropped away on read-back.

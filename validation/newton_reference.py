@@ -56,6 +56,7 @@ def main():
     model.bvh_refit_shapes(state)
 
     sensor = newton.sensors.SensorTiledCamera(model)
+    sensor.default_render_config.max_distance = S.CAMERA["far"]  # Isaac Lab sets the far clip per camera
     sensor.utils.create_default_light(enable_shadows=False)
     rays = sensor.utils.compute_camera_rays_pinhole(
         N, N, focal_length=S.CAMERA["focal_length"], horizontal_aperture=S.CAMERA["horizontal_aperture"],

@@ -19,6 +19,11 @@ Framebuffer render_reference(
     fb.id.assign(n, 0);
     fb.cover.assign(n, 0);
     fb.ambiguous.assign(n, 0);
+    if (opt.float_planes) {
+        for (int c = 0; c < 4; c++) {
+            fb.plane[c].assign(n, frame.clear_color[c]);
+        }
+    }
 
     ReferenceStats local;
     const bool less = frame.depth_func == DepthFunc::Less;
@@ -59,6 +64,11 @@ Framebuffer render_reference(
                             rgba[ch] = std::fmaf(p.color_gx[ch], ddx, std::fmaf(p.color_gy[ch], ddy, p.color_c[ch]));
                         }
                         fb.depth[idx] = z;
+                        if (opt.float_planes) {
+                            for (int ch = 0; ch < 4; ch++) {
+                                fb.plane[ch][idx] = rgba[ch];
+                            }
+                        }
                         fb.color[idx] = pack_rgba8(rgba);
                         fb.id[idx] = tri.source + 1;
                         local.fragments_written++;

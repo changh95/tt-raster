@@ -69,16 +69,16 @@ Plane fit_plane(const SnappedTriangle& s, double a0, double a1, double a2) {
 
 // Tile bounding box of the pixels whose centre can lie inside the vertex bounding box.
 // Returns false if no pixel centre does.
-bool tile_bbox(const int32_t x[3], const int32_t y[3], uint32_t pw, uint32_t ph, SetupTriangle& t) {
+bool tile_bbox(const int32_t x[3], const int32_t y[3], int64_t lo_x, int64_t lo_y, int64_t hi_x, int64_t hi_y, SetupTriangle& t) {
     const int64_t min_x = std::min({x[0], x[1], x[2]}), max_x = std::max({x[0], x[1], x[2]});
     const int64_t min_y = std::min({y[0], y[1], y[2]}), max_y = std::max({y[0], y[1], y[2]});
     // Pixel i has its centre at 16*i + 8 in subpixel units.
     int64_t px0 = ceil_div(min_x - 8, 16), px1 = floor_div(max_x - 8, 16);
     int64_t py0 = ceil_div(min_y - 8, 16), py1 = floor_div(max_y - 8, 16);
-    px0 = std::max<int64_t>(px0, 0);
-    py0 = std::max<int64_t>(py0, 0);
-    px1 = std::min<int64_t>(px1, static_cast<int64_t>(pw) - 1);
-    py1 = std::min<int64_t>(py1, static_cast<int64_t>(ph) - 1);
+    px0 = std::max<int64_t>(px0, lo_x);
+    py0 = std::max<int64_t>(py0, lo_y);
+    px1 = std::min<int64_t>(px1, hi_x);
+    py1 = std::min<int64_t>(py1, hi_y);
     if (px0 > px1 || py0 > py1) {
         return false;
     }
@@ -170,10 +170,21 @@ std::vector<Pt> clip_polygon(std::vector<Pt> poly, const ClipRect& r) {
 
 SetupResult setup_frame(const Frame& frame) {
     const uint32_t pw = frame.padded_width(), ph = frame.padded_height();
-    if (pw > static_cast<uint32_t>(kMaxTargetSize) || ph > static_cast<uint32_t>(kMaxTargetSize)) {
-        throw std::invalid_argument("render target larger than kMaxTargetSize");
+    const bool has_viewports = !frame.viewports.empty();
+    ClipRect frame_guard{};
+    if (!has_viewports) {
+        if (pw > static_cast<uint32_t>(kMaxTargetSize) || ph > static_cast<uint32_t>(kMaxTargetSize)) {
+            throw std::invalid_argument("render target larger than kMaxTargetSize");
+        }
+        frame_guard = guard_rect(pw, ph);
     }
-    const ClipRect guard = guard_rect(pw, ph);
+    for (const Viewport& vp : frame.viewports) {
+        if (vp.x < 0 || vp.y < 0 || vp.width <= 0 || vp.height <= 0 || vp.width > kMaxTargetSize ||
+            vp.height > kMaxTargetSize || static_cast<uint32_t>(vp.x + vp.width) > pw ||
+            static_cast<uint32_t>(vp.y + vp.height) > ph) {
+            throw std::invalid_argument("viewport outside the render target or larger than kMaxTargetSize");
+        }
+    }
 
     SetupResult res;
     res.stats.input = frame.triangles.size();
@@ -207,6 +218,22 @@ SetupResult setup_frame(const Frame& frame) {
             std::swap(g[1], g[2]);
         }
 
+        // Clip rectangle and pixel range of this triangle's viewport (or of the whole target).
+        ClipRect guard = frame_guard;
+        int64_t lo_x = 0, lo_y = 0, hi_x = static_cast<int64_t>(pw) - 1, hi_y = static_cast<int64_t>(ph) - 1;
+        if (has_viewports) {
+            if (tri.viewport >= frame.viewports.size()) {
+                throw std::invalid_argument("triangle viewport index out of range");
+            }
+            const Viewport& vp = frame.viewports[tri.viewport];
+            guard = ClipRect{
+                static_cast<int64_t>(vp.x) * kSubpixelScale, static_cast<int64_t>(vp.y) * kSubpixelScale,
+                static_cast<int64_t>(vp.x + vp.width) * kSubpixelScale, static_cast<int64_t>(vp.y + vp.height) * kSubpixelScale};
+            lo_x = vp.x;
+            lo_y = vp.y;
+            hi_x = vp.x + vp.width - 1;
+            hi_y = vp.y + vp.height - 1;
+        }
         bool outside_guard = false;
         for (const Pt& p : g) {
             outside_guard |= p[0] < guard.x0 || p[0] > guard.x1 || p[1] < guard.y0 || p[1] > guard.y1;
@@ -236,7 +263,7 @@ SetupResult setup_frame(const Frame& frame) {
             if (cross2(t.x[0], t.y[0], t.x[1], t.y[1], t.x[2], t.y[2]) <= 0) {
                 continue;  // sliver left over by rounding the clipped vertices
             }
-            if (!tile_bbox(t.x, t.y, pw, ph, t)) {
+            if (!tile_bbox(t.x, t.y, lo_x, lo_y, hi_x, hi_y, t)) {
                 continue;
             }
             make_edges(t.x, t.y, t.edge);
