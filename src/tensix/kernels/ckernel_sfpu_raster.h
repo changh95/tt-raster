@@ -96,7 +96,7 @@ __attribute__((always_inline)) inline sfpi::vUInt raster_quantize(sfpi::vFloat v
 // fma(gx, dx, fma(gy, dy, c)) per channel.
 template <bool FLAT>
 __attribute__((always_inline)) inline void write_colour(const TriScalars& s, sfpi::vFloat dx, sfpi::vFloat dy) {
-#ifdef RASTER_EXP_NO_COLOUR  // timing experiment only: no colour writes
+#if defined(RASTER_EXP_NO_COLOUR) || !(RASTER_PLANE_MASK & 1)  // no colour plane requested (or timing experiment)
     (void)s; (void)dx; (void)dy;
 #elif defined(RASTER_PACKED_COLOUR)
     if constexpr (FLAT) {

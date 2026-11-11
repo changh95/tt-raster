@@ -18,12 +18,14 @@ thread_local std::string g_error;
 struct ttr_scene {
     ttr::scene::Scene scene;
     std::unique_ptr<ttr::scene::Backend> backend;
+    std::string report;
     explicit ttr_scene(uint32_t worlds) : scene(worlds) {}
 };
 
 extern "C" {
 
 const char* ttr_last_error(void) { return g_error.c_str(); }
+const char* ttr_backend_report(ttr_scene* s) { return s->report.c_str(); }
 
 ttr_scene* ttr_scene_create(uint32_t num_worlds, const char* backend, uint32_t n_chips) {
     try {
@@ -137,6 +139,7 @@ int ttr_render(
         img.normal = out->normal;
         ttr::scene::RenderStats st;
         s->scene.render(cam, poses, light, img, *s->backend, &st);
+        s->report = st.backend_report;
         if (stats) {
             stats->vertex_ms = st.vertex_ms;
             stats->raster_ms = st.raster_ms;

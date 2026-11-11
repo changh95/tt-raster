@@ -1,2 +1,4 @@
 build/
 generated/
+__pycache__/
+*.pyc

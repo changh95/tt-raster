@@ -10,7 +10,9 @@
 // handshake tt-metal's triangle_solve_tile uses.
 //
 // Runtime args: number of blocks, clear depth, clear R, G, B, A (floats as raw words), clear colour packed.
-// Defines (set by the host): RASTER_OUT_PLANES (1 colour only, 3 colour, depth, id), RASTER_LESS_EQUAL (depth function), RASTER_PACKED_COLOUR (Phase 2.4 variant: colour is packed to
+// Defines (set by the host): RASTER_PLANE_MASK (bit 0 colour, 1 depth, 2 triangle id, 3 G, 4 B planes to write
+// back; without colour nothing is quantized and no colour is computed), RASTER_FLOAT_PLANES (colour,
+// G and B are unquantized floats), RASTER_LESS_EQUAL (depth function), RASTER_PACKED_COLOUR (Phase 2.4 variant: colour is packed to
 // RGBA8 per pixel as triangles are drawn instead of once per tile), RASTER_COVER_COUNT (debug: every
 // covering triangle adds 1 to the id plane and the depth test is skipped, so the plane is the
 // coverage count of the reference).
@@ -51,8 +53,19 @@ void kernel_main() {
     constexpr auto cb_color = tt::CBIndex::c_16;
     constexpr auto cb_depth = tt::CBIndex::c_17;
     constexpr auto cb_id = tt::CBIndex::c_18;
+    constexpr auto cb_g = tt::CBIndex::c_19;
+    constexpr auto cb_b = tt::CBIndex::c_20;
 
-    compute_kernel_hw_startup(cb_tri, cb_color);
+    // The packer is configured from one output buffer; it must be one that exists, i.e. the first
+    // requested plane's (all planes share one format).
+#if RASTER_PLANE_MASK & 1
+    constexpr auto cb_first = cb_color;
+#elif RASTER_PLANE_MASK & 2
+    constexpr auto cb_first = cb_depth;
+#else
+    constexpr auto cb_first = cb_id;
+#endif
+    compute_kernel_hw_startup(cb_tri, cb_first);
 
     for (uint32_t blk = 0; blk < n_blocks; blk++) {
         tile_regs_acquire();
@@ -90,19 +103,37 @@ void kernel_main() {
             cb_pop_front(cb_tri, 1);
         }
 
+#if !defined(RASTER_FLOAT_PLANES) && (RASTER_PLANE_MASK & 1)
         MATH(SFPU_UNARY_CALL_NO_TEMPLATE_ARGS(DST_SYNC_MODE, DST_ACCUM_MODE, raster_finalize_tile, 0, VectorMode::RC_custom));
+#endif
         tile_regs_commit();
         tile_regs_wait();
+        // Planes present in RASTER_PLANE_MASK, in this order: colour (Dest slot 1: packed RGBA8, or R as a
+        // float), depth (0), triangle id (7), G (2), B (3); each goes to its own circular buffer c_16 + bit.
+#if RASTER_PLANE_MASK & 1
         cb_reserve_back(cb_color, 1);
-        pack_tile(1, cb_color);   // slot 1 (R plane) now holds the packed RGBA8 words
+        pack_tile(1, cb_color);
         cb_push_back(cb_color, 1);
-#if RASTER_OUT_PLANES > 1
+#endif
+#if RASTER_PLANE_MASK & 2
         cb_reserve_back(cb_depth, 1);
-        cb_reserve_back(cb_id, 1);
         pack_tile(0, cb_depth);
-        pack_tile(7, cb_id);
         cb_push_back(cb_depth, 1);
+#endif
+#if RASTER_PLANE_MASK & 4
+        cb_reserve_back(cb_id, 1);
+        pack_tile(7, cb_id);
         cb_push_back(cb_id, 1);
+#endif
+#if RASTER_PLANE_MASK & 8
+        cb_reserve_back(cb_g, 1);
+        pack_tile(2, cb_g);
+        cb_push_back(cb_g, 1);
+#endif
+#if RASTER_PLANE_MASK & 16
+        cb_reserve_back(cb_b, 1);
+        pack_tile(3, cb_b);
+        cb_push_back(cb_b, 1);
 #endif
         tile_regs_release();
     }

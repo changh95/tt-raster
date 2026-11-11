@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "ttraster/frame.h"
@@ -80,17 +81,27 @@ struct Images {
     }
 };
 
+// Planes a pass needs back from the rasterizer.
+enum Plane : uint32_t {
+    kPlaneColor = 1,     // packed RGBA8 colour (or, with kPlaneFloat, the unquantized R, G, B channels)
+    kPlaneDepth = 2,
+    kPlaneId = 4,        // 1 + index of the visible triangle, 0 = background
+    kPlaneFloat = 8,     // colour channels as unquantized floats in Framebuffer::plane[0..2]
+};
+
 // Something that rasterizes a Frame. The CPU reference is one; the Tensix renderer is another.
-// `float_planes`: also return the unquantized colour channels in Framebuffer::plane (needed for normals).
+// `planes`: which planes of the returned framebuffer must be valid (others may be left empty).
 class Backend {
 public:
     virtual ~Backend() = default;
-    virtual const Framebuffer& render(const Frame& frame, bool float_planes) = 0;
+    virtual const Framebuffer& render(const Frame& frame, uint32_t planes) = 0;
+    // One line of phase timings of the most recent render() call, for logs and benchmarks.
+    virtual std::string report() const { return {}; }
 };
 
 class ReferenceBackend : public Backend {
 public:
-    const Framebuffer& render(const Frame& frame, bool float_planes) override;
+    const Framebuffer& render(const Frame& frame, uint32_t planes) override;
 
 private:
     Framebuffer fb_;
@@ -102,6 +113,7 @@ struct RenderStats {
     double assemble_ms = 0;   // output images from framebuffers
     uint64_t triangles = 0;   // triangles submitted to the rasterizer (per pass)
     uint32_t passes = 0;
+    std::string backend_report;   // Backend::report() after the last pass
 };
 
 class Scene {

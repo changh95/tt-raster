@@ -40,3 +40,20 @@ Device time is the minimum over repeated warm frames, colour plane only (`docs/P
 
 Regenerate: `scripts/run.sh 0 build/tools/ttr_device all --mode grid --colour-only --png DIR`, then `build/tools/ttr_compare DIR/<scene>_reference.png DIR/<scene>_device.png docs/images/<scene>.png`.
 
+## Track I: rendering for Isaac Lab, compared with Newton Warp
+
+`libttraster` (`include/ttraster/ttraster.h`, Python binding in `python/ttraster`) renders one camera per environment, all environments in one rasterizer run, and returns depth, shape ids, albedo, shaded RGB and normals with the conventions of Isaac Lab and Newton's Warp renderer. `validation/` renders the same cartpole-like scene with Newton's own ray tracer (on the CPU, through Warp) and with libttraster on a Tensix chip and compares them.
+
+Top to bottom, for four environments (96 x 96, the Isaac Lab cartpole camera): Newton RGB, libttraster RGB, Newton depth, libttraster depth, Newton normals, libttraster normals, absolute depth error (red; almost nothing to see):
+
+![Newton Warp (CPU) against libttraster (Tensix)](docs/images/isaac_cartpole_compare.png)
+
+| Metric against Newton Warp | Value |
+| --- | --- |
+| Pixels with the same shape id | 99.6% |
+| Depth, median relative error | 1.7e-4 |
+| Normals, mean angle error | 0.05 degrees |
+| RGB PSNR over pixels both renderers hit | 49 dB |
+
+Speed: 1,024 environments of 96 x 96 take 57 ms per frame for depth on one chip (17,800 images/s), of which the Tensix kernels are 1.5 ms; the rest is host work and PCIe (`docs/PERF.md`). The Isaac Lab `BaseRenderer` shim, per-pixel lighting and the training run are not done; `docs/FINDINGS.md` has the interface contract, the measurements and what is missing.
+

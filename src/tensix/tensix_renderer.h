@@ -33,11 +33,22 @@ struct DeviceOptions {
     // Also write back depth and triangle id (three planes instead of one). Off for production
     // runs: colour is a third of the read-back traffic.
     bool debug_planes = true;
+    // Five planes without quantization: R, depth, id, G, B as floats (Framebuffer::plane[0..2]),
+    // for outputs that need more than 8 bits, such as normals. Implies debug_planes.
+    bool float_planes = false;
+    // Which planes to read back (bits: 1 colour, 2 depth, 4 triangle id, 8 G, 16 B; see the compute
+    // kernel). 0 = derive from debug_planes / float_planes. Planes not requested are not computed or
+    // transferred: a depth-and-id request skips colour entirely.
+    uint32_t plane_mask = 0;
     // Extra compile-time defines for the kernels, for experiments (name -> value).
     std::map<std::string, std::string> defines;
     // Host threads used to encode the work lists; 0 = one per hardware thread.
     size_t host_threads = 0;
 };
+
+inline uint32_t effective_plane_mask(const DeviceOptions& o) {
+    return o.plane_mask != 0 ? o.plane_mask : (o.float_planes ? 0x1Fu : (o.debug_planes ? 0x07u : 0x01u));
+}
 
 struct DeviceTimes {
     double build_ms = 0;     // host: encode records, build the work lists

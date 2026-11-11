@@ -227,3 +227,42 @@ Sources read: `isaaclab/renderers/{base_renderer,output_contract,camera_render_s
 
 `venv-newton` (outside the repository): numpy, `warp-lang` 1.19, Newton 1.9 from source, Pillow. Warp has a CPU backend and Newton's `SensorTiledCamera` renders on it, so the quality comparison (depth error, segmentation agreement, RGB PSNR) can be done without a GPU. `validation/newton_reference.py` renders the shared test scene (`validation/scene_spec.py`: ground plane, rail box, cart box and pole capsule, the Isaac Lab cartpole camera) in W worlds on the CPU: 8 worlds of 96 x 96 take about 11 ms per frame on one CPU (the CPU number says nothing about the GPU speed that Isaac Lab sees).
 
+### I.2 to I.5: what was built and measured (no GPU, no Isaac Lab runtime)
+
+**Built.** `libttraster` (`include/ttraster/ttraster.h`, `src/capi`, `src/scene`) with a ctypes binding (`python/ttraster`):
+
+- Frame **viewports**: every triangle is clipped to its camera's rectangle of a shared render target (an atlas of tile-aligned camera slots), so many cameras are one rasterizer run and nothing bleeds between them. 40 cameras in one frame are bit-identical to 40 separate renders (`tests/test_viewports.cpp`); the target may exceed 2048 px because the exactness bound applies per viewport.
+- **Scene layer**: meshes (box, sphere, capsule, ground, arbitrary), instances per world with poses, one pinhole camera per world with Isaac Lab and Newton conventions (aperture and focal length, -z forward), near and far clipping in camera space with order-independent cut points, per-vertex shading with Newton's lighting model, atlas packing, and output assembly: ray distance (`depth`), `forward_depth`, shape id, `albedo` (RGBA8), `rgb` (RGBA8 shaded), `normals` (float, from the unquantized colour planes of a third pass).
+- **Backends**: the CPU reference, and Tensix on one or several chips. The Tensix kernels gained selectable output planes (colour, depth, triangle id, and float R, G, B), so a depth request transfers and computes no colour at all.
+- Parallel host stages (vertex stage, triangle setup in order-preserving chunks, frame build, output assembly, read-back untiling).
+
+**Not built.** The `BaseRenderer` subclass and config for Isaac Lab (it cannot be run or even imported here: it needs PyTorch and CUDA), per-pixel lighting (v1 shades per vertex), perspective-correct interpolation of normals and colours (screen-linear in v1), device-side vertex transform and the upload-once geometry path of I.3, asynchronous capture, and the Cartpole training run of I.5.
+
+**Quality against Newton Warp** (`validation/compare_scene.py`: the same abstract scene, 8 worlds of 96 x 96, Newton's ray tracer on the CPU as reference, libttraster on a Tensix chip; the CPU backend gives the same numbers to seven digits):
+
+| Metric | Value |
+| --- | --- |
+| Pixels with the same shape id | 99.64% |
+| Shape IoU: ground / rail / cart / pole | 0.990 / 1.000 / 0.988 / 0.987 |
+| Depth (ray distance), median relative error, 99th percentile | 1.7e-4, 4.4e-4 |
+| Depth, mean absolute error over common hits | 2.9 mm |
+| Normals, mean angle error | 0.052 degrees |
+| Albedo PSNR over common hits | 43.1 dB |
+| RGB PSNR over common hits / whole image | 49.3 dB / 42.6 dB |
+
+The whole-image figures are lower because of silhouette pixels (one renderer hits the object where the other hits the background): the ray tracer samples each pixel centre exactly, the rasterizer's coverage rule on a tessellated pole differs at the edge. The 3.9 m maximum depth error is one such pixel at the horizon. Pole tessellation (rings x segments, triangles per environment): 2 x 8 (108): pole IoU 0.974, RGB PSNR 44.5 dB, normals 0.092 degrees; 3 x 12 (196): 0.974, 45.9 dB, 0.068; 4 x 16 (316): 0.987, 49.3 dB, 0.052; 8 x 24 (844): 0.987, 50.0 dB, 0.038. At 96 x 96 a coarse mesh is already close, in line with the plan's advice to use decimated meshes.
+
+**Speed** (`validation/bench_scene.py`: 1,024 environments of 96 x 96, 316 triangles each, poses change every frame, median of 5 frames, frame = everything from poses to output arrays in host memory):
+
+| Outputs | CPU reference (64 threads for the host stages) | Tensix, 1 chip (x8 link) | Tensix, 4 chips (nodes 4 to 7) |
+| --- | --- | --- | --- |
+| depth | 827 ms | 57.5 ms (17,800 images/s) | 63.8 ms |
+| rgb + depth | | 64.1 ms | 75.3 ms |
+| depth, shape, rgb, normals (2 passes) | | 128.4 ms | 128.8 ms |
+
+For scale only: Newton's Warp ray tracer on this host's CPU needs about 1.3 ms per environment (10 ms for 8), which says nothing about its GPU speed; the comparison that matters, against Newton on a GPU, was not possible here. Where a frame goes (depth, 1 chip): vertex stage 3 ms, setup 5, binning 1.5, record encoding 2.6, upload 3, **device 1.5**, read-back 7.6, output assembly 6, and about 25 ms outside the instrumented phases (building the frame, allocating output arrays in Python). The kernels are not the bottleneck: the Tensix draws 324,000 triangles into 9.4 million pixels in 1.5 ms. Frame time is host work and PCIe. Four chips do not help because three of the four are x1 links (about 3 GB/s) and the host stages are serial per frame; on this host only one chip per tray has an x8 link. What would help, in order: keep the output on the device and in tile layout (I.6 stretch), send transforms instead of triangles (device vertex stage, I.3), and overlap frames (asynchronous capture).
+
+### Incident: chip 0 stuck after a hang (2026-11-11)
+
+A depth-only request (plane mask without the colour plane) hung chip 0. Cause: the compute kernel configured the packer from circular buffer `c_16`, which does not exist when the colour plane is not requested. The kernel now uses the first requested plane's buffer. The run was stopped by the script timeout, and afterwards opening chip 0 fails during initialization ("Memory barrier timed out ... 10 of 130 cores synced"); chips 1 to 7 are unaffected and the repository's tests and benchmarks were continued on node 1 and nodes 4 to 7. Chip 0 needs a reset to recover; none was attempted, as the plan requires asking first. (Subsets of chips that are not a connected part of the tray mesh, such as nodes 1 to 4 or 1 to 7, fail in fabric control-plane setup with `TT_FATAL control_plane.cpp:1806`; nodes 4 to 7 and 5 to 6 work.)
+

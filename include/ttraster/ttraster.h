@@ -41,6 +41,9 @@ typedef struct {
     uint32_t passes;
 } ttr_stats;
 
+/* Phase timings of the last ttr_render() call as text; valid until the next call. */
+const char* ttr_backend_report(ttr_scene* scene);
+
 /* backend: "reference" (CPU, always available) or "tensix" (needs a build with tt-metal);
  * n_chips is the number of chips for "tensix" (ignored otherwise). */
 ttr_scene* ttr_scene_create(uint32_t num_worlds, const char* backend, uint32_t n_chips);

@@ -162,9 +162,19 @@ DeviceFrame TensixRenderer::render(
         out.fb.width = pw;
         out.fb.height = ph;
         const size_t n_px = static_cast<size_t>(pw) * ph;
-        out.fb.color.assign(n_px, pack_rgba8(frame.clear_color));
-        if (opt.debug_planes) {  // production (colour-only) frames do not carry the debug planes
+        const uint32_t m = effective_plane_mask(opt);
+        if ((m & 1) && !opt.float_planes) {
+            out.fb.color.assign(n_px, pack_rgba8(frame.clear_color));
+        }
+        if (opt.float_planes) {
+            for (int c = 0; c < 3; c++) {
+                out.fb.plane[c].assign(n_px, frame.clear_color[c]);
+            }
+        }
+        if (m & 2) {
             out.fb.depth.assign(n_px, frame.clear_depth);
+        }
+        if (m & 4) {
             out.fb.id.assign(n_px, 0);
             out.fb.cover.assign(n_px, 0);
             out.fb.ambiguous.assign(n_px, 0);
@@ -249,7 +259,8 @@ DeviceFrame TensixRenderer::render(
     t0 = Clock::now();
     auto& cq = mesh_->mesh_command_queue();
     const uint32_t total_pages = static_cast<uint32_t>(words.size() / (kPageBytes / 4));
-    const uint32_t planes = opt.debug_planes ? kOutPlanes : 1u;
+    const uint32_t mask = effective_plane_mask(opt);
+    const uint32_t planes = static_cast<uint32_t>(__builtin_popcount(mask));
     distributed::DeviceLocalBufferConfig cfg{.page_size = kPageBytes, .buffer_type = BufferType::DRAM};
     auto in_buf = distributed::MeshBuffer::create(
         distributed::ReplicatedBufferConfig{.size = static_cast<uint64_t>(total_pages) * kPageBytes}, cfg, mesh_.get());
@@ -271,10 +282,10 @@ DeviceFrame TensixRenderer::render(
             CircularBufferConfig(pages * kPageBytes, {{idx, tt::DataFormat::Float32}}).set_page_size(idx, kPageBytes));
     };
     make_cb(tt::CBIndex::c_0, 4);
-    make_cb(tt::CBIndex::c_16, 2);
-    if (planes > 1) {
-        make_cb(tt::CBIndex::c_17, 2);
-        make_cb(tt::CBIndex::c_18, 2);
+    for (uint32_t bit = 0; bit < 5; bit++) {   // one output buffer per requested plane: c_16 + bit
+        if (mask & (1u << bit)) {
+            make_cb(static_cast<tt::CBIndex>(static_cast<uint32_t>(tt::CBIndex::c_16) + bit), 2);
+        }
     }
 
     // TT_RASTER_KERNEL_DIR overrides the kernel directory (A/B runs of older kernel versions).
@@ -288,7 +299,10 @@ DeviceFrame TensixRenderer::render(
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = reader_args});
     std::map<std::string, std::string> defines = opt.defines;
-    defines["RASTER_OUT_PLANES"] = std::to_string(planes);
+    defines["RASTER_PLANE_MASK"] = std::to_string(mask);
+    if (opt.float_planes) {
+        defines["RASTER_FLOAT_PLANES"] = "1";
+    }
     auto writer = CreateKernel(
         program, kdir + "writer.cpp", core_set,
         DataMovementConfig{
@@ -337,34 +351,68 @@ DeviceFrame TensixRenderer::render(
     // Untile: a tile holds four 16x16 faces (TL, TR, BL, BR), each row-major, so every face row is a
     // 16-word copy into the frame. Colour is a plain copy; depth is a plain copy; the id plane is
     // stored as floats and converted.
-    uint32_t block = 0;
-    for (size_t c = 0; c < plan.size(); c++) {
-        for (const auto& [tx, ty] : plan[c].tiles) {
-            for (uint32_t p = 0; p < planes; p++) {
-                const uint32_t* tile = &raw[(static_cast<size_t>(block) * planes + p) * kTileWords];
-                for (uint32_t face = 0; face < 4; face++) {
-                    for (uint32_t r = 0; r < 16; r++) {
-                        const uint32_t* src = tile + face * 256 + r * 16;
-                        const size_t idx = fb.index(tx * 32 + (face & 1) * 16, ty * 32 + (face >> 1) * 16 + r);
-                        if (p == kPlaneColor) {
-                            std::memcpy(&fb.color[idx], src, 64);
-                        } else if (p == kPlaneDepth) {
-                            std::memcpy(&fb.depth[idx], src, 64);
-                        } else {
-                            for (uint32_t i = 0; i < 16; i++) {
-                                float id;
-                                std::memcpy(&id, &src[i], 4);
-                                if (opt.cover_count) {
-                                    fb.cover[idx + i] = static_cast<uint8_t>(std::min(255.0f, id));
-                                } else {
-                                    fb.id[idx + i] = static_cast<uint32_t>(id);
-                                }
+    struct Job {
+        uint32_t block;
+        int tx, ty;
+    };
+    std::vector<Job> jobs;
+    jobs.reserve(blocks_total);
+    {
+        uint32_t block = 0;
+        for (size_t c = 0; c < plan.size(); c++) {
+            for (const auto& [tx, ty] : plan[c].tiles) {
+                jobs.push_back({block++, tx, ty});
+            }
+        }
+    }
+    auto decode = [&](const Job& job) {
+        const uint32_t block = job.block;
+        const int tx = job.tx, ty = job.ty;
+        uint32_t rank = 0;
+        for (uint32_t bit = 0; bit < 5; bit++) {
+            if (!(mask & (1u << bit))) {
+                continue;
+            }
+            const uint32_t* tile = &raw[(static_cast<size_t>(block) * planes + rank++) * kTileWords];
+            for (uint32_t face = 0; face < 4; face++) {
+                for (uint32_t r = 0; r < 16; r++) {
+                    const uint32_t* src = tile + face * 256 + r * 16;
+                    const size_t idx = fb.index(tx * 32 + (face & 1) * 16, ty * 32 + (face >> 1) * 16 + r);
+                    if (bit == 0) {
+                        std::memcpy(opt.float_planes ? static_cast<void*>(&fb.plane[0][idx]) : static_cast<void*>(&fb.color[idx]), src, 64);
+                    } else if (bit == 3 || bit == 4) {
+                        std::memcpy(&fb.plane[bit - 2][idx], src, 64);   // G -> plane[1], B -> plane[2]
+                    } else if (bit == 1) {
+                        std::memcpy(&fb.depth[idx], src, 64);
+                    } else {
+                        for (uint32_t i = 0; i < 16; i++) {
+                            float id;
+                            std::memcpy(&id, &src[i], 4);
+                            if (opt.cover_count) {
+                                fb.cover[idx + i] = static_cast<uint8_t>(std::min(255.0f, id));
+                            } else {
+                                fb.id[idx + i] = static_cast<uint32_t>(id);
                             }
                         }
                     }
                 }
             }
-            block++;
+        }
+    };
+    {   // Blocks are independent tiles of the frame: untile them on the host threads of this chip.
+        const size_t hw = opt.host_threads != 0 ? opt.host_threads : std::thread::hardware_concurrency();
+        const size_t nt = std::max<size_t>(1, std::min<size_t>(jobs.size() / 64 + 1, hw));
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        for (size_t t = 0; t < nt; t++) {
+            pool.emplace_back([&] {
+                for (size_t i = next++; i < jobs.size(); i = next++) {
+                    decode(jobs[i]);
+                }
+            });
+        }
+        for (auto& th : pool) {
+            th.join();
         }
     }
     out.times.readback_ms = ms_since(t0);

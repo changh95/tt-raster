@@ -61,6 +61,8 @@ def _load():
     lib.ttr_scene_create.argtypes = [C.c_uint32, C.c_char_p, C.c_uint32]
     lib.ttr_scene_destroy.argtypes = [C.c_void_p]
     lib.ttr_last_error.restype = C.c_char_p
+    lib.ttr_backend_report.restype = C.c_char_p
+    lib.ttr_backend_report.argtypes = [C.c_void_p]
     for name, args in (("ttr_add_box", [C.c_float] * 3), ("ttr_add_sphere", [C.c_float, C.c_int, C.c_int]),
                        ("ttr_add_capsule", [C.c_float, C.c_float, C.c_int, C.c_int]), ("ttr_add_ground", [C.c_float])):
         f = getattr(lib, name)
@@ -139,6 +141,9 @@ class Scene:
     def set_instance_poses(self, poses):
         p = _f32(poses, 7 * self.num_instances)
         _check(_l().ttr_set_instance_poses(self._h, p.ctypes.data))
+
+    def backend_report(self):
+        return _l().ttr_backend_report(self._h).decode()
 
     def render(self, camera, camera_poses, outputs=("depth",), light_direction=None):
         """Returns ({name: array [worlds, H, W, C]}, stats dict)."""

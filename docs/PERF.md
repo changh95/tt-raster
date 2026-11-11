@@ -206,3 +206,15 @@ Slowest chip's phases on `random_10k` (build, upload, device, read-back, ms): 1 
 
 Reading: device and read-back shrink with the chip count (read-back runs on eight independent PCIe links), but record encoding and the fixed device launch put a floor of about 6 ms on a frame, so beyond two or three chips only heavy scenes gain. Before persistent buffers and a shared framebuffer the 8-chip frame took 34 ms (page-fault contention, see FINDINGS).
 
+## Tiled-camera rendering for Isaac Lab (Track I)
+
+`validation/bench_scene.py`, 1,024 environments of 96 x 96, 316 triangles per environment (pole capsule 4 x 16), poses change every frame, median of 5 frames after a warm-up, outputs copied to host memory. Chips: one x8 chip (node 5) or nodes 4 to 7.
+
+| Outputs | Passes | 1 chip: frame | 1 chip: device kernels | 1 chip: read-back | 4 chips: frame |
+| --- | --- | --- | --- | --- | --- |
+| depth | 1 | 57.5 ms | 1.5 ms | 7.6 ms | 63.8 ms |
+| rgb + depth | 1 | 64.1 ms | 2.0 ms | 11.1 ms | 75.3 ms |
+| depth, shape, rgb, normals | 2 | 128.4 ms | 2.1 ms | 15.2 ms | 128.8 ms |
+
+CPU reference backend, same scene, depth: 827 ms for 1,024 environments (256: 219 ms). Before the host stages were parallelized the 8-chip depth frame took 126 ms; setup (single thread) 25 ms and output assembly 27 ms were the largest parts. Quality against Newton Warp is in FINDINGS.md.
+

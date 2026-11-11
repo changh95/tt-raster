@@ -15,6 +15,23 @@ namespace ttr::scene {
 using Clock = std::chrono::steady_clock;
 namespace {
 
+// Run fn(i) for i in [0, n) on up to `threads` threads (0 = all hardware threads).
+template <typename Fn>
+void parallel_for(uint32_t n, size_t threads, Fn fn) {
+    const size_t hw = threads != 0 ? threads : std::max<size_t>(1, std::thread::hardware_concurrency());
+    const size_t nt = std::min<size_t>(hw, n);
+    if (nt <= 1) {
+        for (uint32_t i = 0; i < n; i++) fn(i);
+        return;
+    }
+    std::atomic<uint32_t> next{0};
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < nt; t++) {
+        pool.emplace_back([&] { for (uint32_t i = next++; i < n; i = next++) fn(i); });
+    }
+    for (auto& th : pool) th.join();
+}
+
 constexpr float kPi = 3.14159265358979323846f;
 
 struct V3 {
@@ -138,9 +155,9 @@ Mesh make_ground(float e) {
     return m;
 }
 
-const Framebuffer& ReferenceBackend::render(const Frame& frame, bool float_planes) {
+const Framebuffer& ReferenceBackend::render(const Frame& frame, uint32_t planes) {
     ReferenceOptions opt;
-    opt.float_planes = float_planes;
+    opt.float_planes = (planes & kPlaneFloat) != 0;
     fb_ = render_reference(frame, opt);
     return fb_;
 }
@@ -320,15 +337,7 @@ void Scene::render(
             }
         }
     };
-    {
-        const size_t hw = threads != 0 ? threads : std::max<size_t>(1, std::thread::hardware_concurrency());
-        std::atomic<uint32_t> next{0};
-        std::vector<std::thread> pool;
-        for (size_t t = 0; t < std::min<size_t>(hw, worlds_); t++) {
-            pool.emplace_back([&] { for (uint32_t w = next++; w < worlds_; w = next++) do_world(w); });
-        }
-        for (auto& th : pool) th.join();
-    }
+    parallel_for(worlds_, threads, do_world);
     local.vertex_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
     // ---- Passes ------------------------------------------------------------------------------------
@@ -336,13 +345,19 @@ void Scene::render(
     // with each. Pass 1 is the first one requested.
     enum Payload { kPAlbedo, kPLit, kPNormal };
     std::vector<uint32_t> shape_of;   // per triangle of the frame: shape id (same for all passes)
+    // Triangles of the frame in world order; shape ids per triangle are the same for every pass.
+    std::vector<size_t> first_tri(worlds_ + 1, 0);
+    for (uint32_t w = 0; w < worlds_; w++) first_tri[w + 1] = first_tri[w] + per_world[w].size();
+    shape_of.resize(first_tri[worlds_]);
+    for (uint32_t w = 0; w < worlds_; w++)
+        for (size_t k = 0; k < per_world[w].size(); k++) shape_of[first_tri[w] + k] = per_world[w][k].shape;
     auto build = [&](Payload payload) {
         Frame f = base;
-        f.triangles.clear();
-        const bool fill_shape = shape_of.empty();
-        for (uint32_t w = 0; w < worlds_; w++) {
+        f.triangles.resize(first_tri[worlds_]);
+        parallel_for(worlds_, threads, [&](uint32_t w) {
+            size_t o = first_tri[w];
             for (const ScreenTri& st : per_world[w]) {
-                Triangle t;
+                Triangle& t = f.triangles[o++];
                 t.viewport = w;
                 t.flat = payload == kPAlbedo;
                 for (int c = 0; c < 3; c++) {
@@ -353,16 +368,14 @@ void Scene::render(
                     }
                     v.color[3] = 1.0f;
                 }
-                f.triangles.push_back(t);
-                if (fill_shape) shape_of.push_back(st.shape);
             }
-        }
+        });
         return f;
     };
 
-    auto timed_render = [&](const Frame& f, bool float_planes) -> const Framebuffer& {
+    auto timed_render = [&](const Frame& f, uint32_t planes) -> const Framebuffer& {
         const auto r0 = Clock::now();
-        const Framebuffer& fb = backend.render(f, float_planes);
+        const Framebuffer& fb = backend.render(f, planes);
         local.raster_ms += std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
         local.passes++;
         local.triangles = f.triangles.size();
@@ -380,7 +393,7 @@ void Scene::render(
         if (have_geometry || !(mask & (kDepth | kForwardDepth | kShape))) return;
         have_geometry = true;
         const auto a0 = Clock::now();
-        for (uint32_t w = 0; w < worlds_; w++) {
+        parallel_for(worlds_, threads, [&](uint32_t w) {
             for (uint32_t y = 0; y < cam.height; y++) {
                 for (uint32_t x = 0; x < cam.width; x++) {
                     const size_t i = slot_index(fb, w, x, y), o = w * img + static_cast<size_t>(y) * cam.width + x;
@@ -401,12 +414,12 @@ void Scene::render(
                     if (out.shape) out.shape[o] = shape_of[id - 1];
                 }
             }
-        }
+        });
         local.assemble_ms += std::chrono::duration<double, std::milli>(Clock::now() - a0).count();
     };
     auto colour_from = [&](const Framebuffer& fb, uint8_t* dst) {
         const auto a0 = Clock::now();
-        for (uint32_t w = 0; w < worlds_; w++)
+        parallel_for(worlds_, threads, [&](uint32_t w) {
             for (uint32_t y = 0; y < cam.height; y++)
                 for (uint32_t x = 0; x < cam.width; x++) {
                     const uint32_t c = fb.color[slot_index(fb, w, x, y)];
@@ -414,26 +427,30 @@ void Scene::render(
                     p[0] = static_cast<uint8_t>(c); p[1] = static_cast<uint8_t>(c >> 8);
                     p[2] = static_cast<uint8_t>(c >> 16); p[3] = static_cast<uint8_t>(c >> 24);
                 }
+        });
         local.assemble_ms += std::chrono::duration<double, std::milli>(Clock::now() - a0).count();
     };
 
+    const bool want_geometry = (mask & (kDepth | kForwardDepth | kShape)) != 0;
     if (mask & kAlbedo) {
         const Frame f = build(kPAlbedo);
-        const Framebuffer& fb = timed_render(f, false);
+        const Framebuffer& fb = timed_render(f, kPlaneColor | (want_geometry && !have_geometry ? kPlaneDepth | kPlaneId : 0u));
         colour_from(fb, out.albedo);
         geometry_from(fb);
     }
     if (mask & kRgb) {
         const Frame f = build(kPLit);
-        const Framebuffer& fb = timed_render(f, false);
+        const Framebuffer& fb = timed_render(f, kPlaneColor | (want_geometry && !have_geometry ? kPlaneDepth | kPlaneId : 0u));
         colour_from(fb, out.rgb);
         geometry_from(fb);
     }
     if (mask & kNormal) {
         const Frame f = build(kPNormal);
-        const Framebuffer& fb = timed_render(f, true);
+        // Normals need the unquantized channels and the id (to know where something was hit); depth only
+        // if no earlier pass supplied it.
+        const Framebuffer& fb = timed_render(f, kPlaneColor | kPlaneFloat | kPlaneId | (want_geometry && !have_geometry ? kPlaneDepth : 0u));
         const auto a0 = Clock::now();
-        for (uint32_t w = 0; w < worlds_; w++)
+        parallel_for(worlds_, threads, [&](uint32_t w) {
             for (uint32_t y = 0; y < cam.height; y++)
                 for (uint32_t x = 0; x < cam.width; x++) {
                     const size_t i = slot_index(fb, w, x, y), o = (w * img + static_cast<size_t>(y) * cam.width + x) * 3;
@@ -441,13 +458,15 @@ void Scene::render(
                     const V3 n = normalize(V3{fb.plane[0][i], fb.plane[1][i], fb.plane[2][i]});
                     out.normal[o] = static_cast<float>(n.x); out.normal[o + 1] = static_cast<float>(n.y); out.normal[o + 2] = static_cast<float>(n.z);
                 }
+        });
         local.assemble_ms += std::chrono::duration<double, std::milli>(Clock::now() - a0).count();
         geometry_from(fb);
     }
     if (!have_geometry && (mask & (kDepth | kForwardDepth | kShape))) {
         const Frame f = build(kPAlbedo);
-        geometry_from(timed_render(f, false));
+        geometry_from(timed_render(f, kPlaneDepth | kPlaneId));
     }
+    local.backend_report = backend.report();
     if (stats) *stats = local;
 }
 

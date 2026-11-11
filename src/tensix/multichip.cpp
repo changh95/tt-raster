@@ -56,12 +56,16 @@ MultiChipFrame MultiChipRenderer::render(
     // concurrently. Size it once; later frames overwrite it.
     const uint32_t pw = frame.padded_width(), ph = frame.padded_height();
     const size_t n_px = static_cast<size_t>(pw) * ph;
-    if (fb_.width != pw || fb_.height != ph || fb_.color.size() != n_px || (opt.debug_planes && fb_.depth.size() != n_px)) {
+    const uint32_t m = effective_plane_mask(opt);
+    const bool want_color = (m & 1) && !opt.float_planes, want_depth = m & 2, want_id = m & 4, want_float = opt.float_planes;
+    if (fb_.width != pw || fb_.height != ph || (want_color && fb_.color.size() != n_px) || (want_depth && fb_.depth.size() != n_px) ||
+        (want_id && fb_.id.size() != n_px) || (want_float && fb_.plane[0].size() != n_px)) {
         fb_.width = pw;
         fb_.height = ph;
-        fb_.color.assign(n_px, 0);
-        if (opt.debug_planes) {
-            fb_.depth.assign(n_px, 0.0f);
+        if (want_color) fb_.color.assign(n_px, 0);
+        if (want_float) for (int c = 0; c < 3; c++) fb_.plane[c].assign(n_px, 0.0f);
+        if (want_depth) fb_.depth.assign(n_px, 0.0f);
+        if (want_id) {
             fb_.id.assign(n_px, 0);
             fb_.cover.assign(n_px, 0);
             fb_.ambiguous.assign(n_px, 0);

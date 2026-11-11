@@ -3,8 +3,10 @@
 #include "ttraster/setup.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
 
 namespace ttr {
 
@@ -187,17 +189,18 @@ SetupResult setup_frame(const Frame& frame) {
     }
 
     SetupResult res;
+
     res.stats.input = frame.triangles.size();
-    for (uint32_t src = 0; src < frame.triangles.size(); src++) {
+    auto process = [&](uint32_t src, std::vector<SetupTriangle>& tris, SetupStats& stats) {
         const Triangle& tri = frame.triangles[src];
         SnappedTriangle s;
         switch (snap_triangle(tri, frame.cull, s)) {
             case SetupStatus::Ok: break;
-            case SetupStatus::NonFinite: res.stats.non_finite++; continue;
-            case SetupStatus::OutOfRange: res.stats.out_of_range++; continue;
-            case SetupStatus::Degenerate: res.stats.degenerate++; continue;
-            case SetupStatus::Culled: res.stats.culled++; continue;
-            case SetupStatus::OffScreen: res.stats.off_screen++; continue;
+            case SetupStatus::NonFinite: stats.non_finite++; return;
+            case SetupStatus::OutOfRange: stats.out_of_range++; return;
+            case SetupStatus::Degenerate: stats.degenerate++; return;
+            case SetupStatus::Culled: stats.culled++; return;
+            case SetupStatus::OffScreen: stats.off_screen++; return;
         }
 
         // Planes come from the original (unclipped) snapped vertices and are shared by all pieces.
@@ -271,16 +274,51 @@ SetupResult setup_frame(const Frame& frame) {
             for (int ch = 0; ch < 4; ch++) {
                 t.color[ch] = color[ch];
             }
-            res.tris.push_back(t);
+            tris.push_back(t);
             made++;
         }
         if (made == 0) {
-            res.stats.off_screen++;
-            continue;
+            stats.off_screen++;
+            return;
         }
-        res.stats.accepted++;
-        res.stats.pieces += made;
-        res.stats.clipped_sources += outside_guard ? 1 : 0;
+        stats.accepted++;
+        stats.pieces += made;
+        stats.clipped_sources += outside_guard ? 1 : 0;
+        };
+
+    // Triangles are independent: set them up in chunks on several threads and concatenate the chunks in
+    // order, so the result is identical to the sequential run (API order is preserved).
+    const size_t n = frame.triangles.size();
+    constexpr size_t kChunk = 4096;
+    const size_t n_chunks = (n + kChunk - 1) / kChunk;
+    const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    if (n < 4 * kChunk || hw == 1) {
+        for (uint32_t src = 0; src < n; src++) process(src, res.tris, res.stats);
+        return res;
+    }
+    std::vector<std::vector<SetupTriangle>> parts(n_chunks);
+    std::vector<SetupStats> part_stats(n_chunks);
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < std::min(hw, n_chunks); t++) {
+        pool.emplace_back([&] {
+            for (size_t c = next++; c < n_chunks; c = next++) {
+                for (size_t src = c * kChunk; src < std::min(n, (c + 1) * kChunk); src++) {
+                    process(static_cast<uint32_t>(src), parts[c], part_stats[c]);
+                }
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+    size_t total = 0;
+    for (const auto& p : parts) total += p.size();
+    res.tris.reserve(total);
+    for (size_t c = 0; c < n_chunks; c++) {
+        res.tris.insert(res.tris.end(), parts[c].begin(), parts[c].end());
+        const SetupStats& st = part_stats[c];
+        res.stats.accepted += st.accepted; res.stats.pieces += st.pieces; res.stats.clipped_sources += st.clipped_sources;
+        res.stats.non_finite += st.non_finite; res.stats.out_of_range += st.out_of_range; res.stats.degenerate += st.degenerate;
+        res.stats.culled += st.culled; res.stats.off_screen += st.off_screen;
     }
     return res;
 }
