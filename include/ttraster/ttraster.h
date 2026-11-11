@@ -163,6 +163,14 @@ int ttr_frame_triangles_shaded(
 /* Render the frame. rgba: width x height x 4 bytes (row pitch `stride_bytes`, 0 = width * 4); depth: width x height
  * floats or NULL. flip_y != 0 writes the bottom row of the render target first (OpenGL window orientation). */
 int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y);
+/* ttr_frame_end() with a destination format for the colour: `color_flags` is a combination of TTR_OUT_* (0 = RGBA bytes, as
+ * above). The rows are converted while they are copied, on the host thread pool, so a caller whose surface has another
+ * layout (a BGRA window) needs no second pass. depth may be NULL, and then the depth plane is not read back at all. */
+enum { TTR_OUT_SWAP_RB = 1 /* the word is B, G, R, A in memory order */, TTR_OUT_OPAQUE = 2 /* alpha forced to 255 */ };
+int ttr_frame_end_ex(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, uint32_t color_flags, float* depth, int flip_y);
+/* The depth plane of the frame ended last (renders the frame again; the triangles stay in the context until the next
+ * ttr_frame_begin). For a caller that ended the frame without depth and now needs it after all. 0 on success. */
+int ttr_frame_depth(ttr_context* ctx, float* depth, int flip_y);
 /* Phase timings of the last frame as text; valid until the next call. */
 const char* ttr_context_report(ttr_context* ctx);
 

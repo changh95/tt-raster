@@ -57,7 +57,7 @@ the quantized colour), which is also what softpipe does.
 - `../scripts/build_mesa.sh`, `../scripts/run_gl.sh`, `../scripts/test_gl.sh`.
 
 The rasterizer is reached through `libttraster.so` (`include/ttraster/ttraster.h`, "Raster API": `ttr_context_create`,
-`ttr_frame_begin`, `ttr_frame_triangles`, `ttr_frame_shader`, `ttr_frame_triangles_shaded`, `ttr_frame_end`), loaded with `dlopen` so Mesa's build does not depend on
+`ttr_frame_begin`, `ttr_frame_triangles`, `ttr_frame_shader`, `ttr_frame_triangles_shaded`, `ttr_frame_end_ex`, `ttr_frame_depth`), loaded with `dlopen` so Mesa's build does not depend on
 tt-metal. Perspective-correct colours are interpolated by the rasterizer itself (colour * 1/w and 1/w are interpolated,
 the device multiplies by a Newton-refined reciprocal; see docs/FINDINGS.md).
 
@@ -92,10 +92,10 @@ follow-up draws after a read-back) with stock softpipe, the fast path on the CPU
   pixels by one level. A shader with a loop of run-time bounds is refused and draws the stock result exactly.
 - Refused draws (other blend factors, a loop of run-time bounds) give the stock result exactly or within the same edge noise.
 
-Speed (glxgears, Xvfb, one x8 chip, stock softpipe is single-threaded on this host): 300 x 300 575 FPS stock and
-310 FPS on Tensix (a frame costs about 2 ms of fixed chip latency), 1024 x 1024 79 and 173 FPS, 1920 x 1080 31 and 126 FPS
-(`docs/PERF.md`). Where the crossover lies (glxgears, FPS stock / Tensix): 300 x 300 560 / 330, 500 x 500 275 / 245, 700 x 700 151 / 236,
-1000 x 1000 76 / 181. A window below about 300,000 pixels therefore stays on softpipe by default when started through
+Speed (glxgears, Xvfb, one x8 chip, stock softpipe is single-threaded on this host): 300 x 300 571 FPS stock and
+333 FPS on Tensix (a frame costs about 2 ms of fixed chip latency), 1024 x 1024 79 and 217 FPS, 1920 x 1080 31 and 160 FPS
+(`docs/PERF.md`). Where the crossover lies (glxgears, FPS stock / Tensix): 300 x 300 571 / 333, 400 x 400 384 / 303, 500 x 500 273 / 265,
+700 x 700 153 / 239, 1024 x 1024 79 / 217. A window below about 300,000 pixels therefore stays on softpipe by default when started through
 `scripts/run_gl.sh` (`TTR_GL_MIN_PIXELS=300000`; the library itself defaults to 0, always the chip; set it to 0 to force the chip in
 `run_gl.sh`).
 

@@ -52,6 +52,7 @@ typedef struct {
    int depth_func, depth_write, blend;
 } ttr_state;
 enum { TTR_SHADE_LINEAR = 0, TTR_SHADE_FLAT = 1, TTR_SHADE_PERSPECTIVE = 2 };
+enum { TTR_OUT_SWAP_RB = 1, TTR_OUT_OPAQUE = 2 };
 
 typedef struct {
    const uint32_t *code;
@@ -70,7 +71,8 @@ struct ttr_api {
    uint32_t (*frame_shader)(void *ctx, const ttr_shader_desc *desc);
    int (*frame_triangles_shaded)(void *ctx, const ttr_vertex *verts, uint32_t n, uint32_t shader, const float *attrs,
                                  int perspective, int cull, const ttr_state *state);
-   int (*frame_end)(void *ctx, uint8_t *rgba, uint32_t stride, float *depth, int flip_y);
+   int (*frame_end_ex)(void *ctx, uint8_t *rgba, uint32_t stride, uint32_t color_flags, float *depth, int flip_y);
+   int (*frame_depth)(void *ctx, float *depth, int flip_y);
    const char *(*last_error)(void);
    const char *(*context_report)(void *ctx);
 };
@@ -123,14 +125,17 @@ struct sp_tensix {
    ttr_vertex *verts;
    size_t nverts, cap;
 
-   /* Scratch for the rendered frame. */
-   uint8_t *rgba;
+   /* The rendered depth, when something asked for it. */
    float *depth;
-   size_t scratch_px;
+   size_t depth_px;
 
-   bool depth_pending;      /* the rendered frame's depth is in `depth`, not yet written into the depth buffer */
+   /* The depth buffer of the last rendered frame is not in softpipe's depth surface yet. Normally nothing reads it before
+    * the next full clear drops it, so a frame is ended without its depth plane (no read-back, no copy) and the plane is
+    * rendered afterwards only when it is wanted (`depth_cached`: it is already in `depth`). */
+   bool depth_pending;
+   bool depth_cached;
    unsigned frames_fast, draws_fast, draws_slow, frames_fallback;
-   double ms_render, ms_write, ms_depth;   /* accumulated time in ttr_frame_end, in writing the result, of which depth */
+   double ms_render, ms_write, ms_depth;   /* accumulated time ending frames, in writing depth surfaces (ms_write; ms_depth is the same) */
    unsigned depth_writes;
    bool logged_unsupported;
 };
@@ -173,7 +178,8 @@ load_api(struct sp_tensix *t, const char *path)
    LOAD(frame_triangles, "ttr_frame_triangles")
    LOAD(frame_shader, "ttr_frame_shader")
    LOAD(frame_triangles_shaded, "ttr_frame_triangles_shaded")
-   LOAD(frame_end, "ttr_frame_end")
+   LOAD(frame_end_ex, "ttr_frame_end_ex")
+   LOAD(frame_depth, "ttr_frame_depth")
    LOAD(last_error, "ttr_last_error")
    LOAD(context_report, "ttr_context_report")
 #undef LOAD
@@ -223,7 +229,6 @@ sp_tensix_destroy(struct sp_tensix *t)
    FREE(t->attrs);
    for (unsigned i = 0; i < t->n_shaders; i++)
       ttr_prog_free(t->shaders[i].prog);
-   FREE(t->rgba);
    FREE(t->depth);
    dlclose(t->lib);
    FREE(t);
@@ -524,36 +529,6 @@ color_shifts(enum pipe_format f, unsigned *r_shift, unsigned *b_shift, bool *has
    }
 }
 
-/* The rendered colours straight into the surface memory (the rendering owns every pixel). */
-static void
-write_color(struct sp_tensix *t)
-{
-   struct softpipe_tile_cache *tc = t->sp->cbuf_cache[0];
-   const uint32_t w = t->width, h = t->height;
-   unsigned rs, bs;
-   bool has_alpha;
-   if (!tc->num_maps || !color_shifts(t->sp->framebuffer.cbufs[0].format, &rs, &bs, &has_alpha))
-      return;
-   discard_cache(tc);
-   uint8_t *dst = tc->transfer_map[0];
-   const unsigned stride = tc->transfer[0]->stride;
-   const uint32_t amask = has_alpha ? 0u : 0xff000000u;
-   for (uint32_t y = 0; y < h; y++) {
-      const uint32_t *src = (const uint32_t *)(t->rgba + (size_t)y * w * 4);   /* R in the low byte */
-      uint32_t *out = (uint32_t *)(dst + (size_t)y * stride);
-      if (rs == 0) {
-         for (uint32_t x = 0; x < w; x++)
-            out[x] = src[x] | amask;
-      } else {
-         for (uint32_t x = 0; x < w; x++) {
-            const uint32_t c = src[x];
-            out[x] = ((c & 0xffu) << 16) | (c & 0xff00u) | ((c >> 16) & 0xffu) | (c & 0xff000000u) | amask;
-         }
-      }
-   }
-   t->sp->dirty_render_cache = true;
-}
-
 /* The rendered depth into the depth buffer (stencil bits are kept for combined formats). */
 static void
 write_depth(struct sp_tensix *t)
@@ -609,6 +584,30 @@ write_depth(struct sp_tensix *t)
    sp->dirty_render_cache = true;
 }
 
+/* Make sure `depth` holds the depth of the last rendered frame (render the frame again if it was ended without). */
+static bool
+fetch_depth(struct sp_tensix *t)
+{
+   if (t->depth_cached)
+      return true;
+   const size_t px = (size_t)t->width * t->height;
+   if (t->depth_px < px) {
+      FREE(t->depth);
+      t->depth = MALLOC(px * sizeof(float));
+      t->depth_px = t->depth ? px : 0;
+      if (!t->depth_px) {
+         fprintf(stderr, "tensix: out of memory\n");
+         return false;
+      }
+   }
+   if (t->api.frame_depth(t->ctx, t->depth, 0) != 0) {
+      fprintf(stderr, "tensix: depth of the frame failed: %s\n", t->api.last_error());
+      return false;
+   }
+   t->depth_cached = true;
+   return true;
+}
+
 /* Write a deferred depth buffer now (someone is about to read or draw into it). */
 static void
 materialize_depth(struct sp_tensix *t)
@@ -617,51 +616,69 @@ materialize_depth(struct sp_tensix *t)
       return;
    t->depth_pending = false;
    const double t0 = now_ms();
-   write_depth(t);
+   if (fetch_depth(t))
+      write_depth(t);
    t->ms_depth += now_ms() - t0;
    t->depth_writes++;
    t->ms_write += now_ms() - t0;
 }
 
-void
-sp_tensix_flush(struct sp_tensix *t)
+/* End the frame in progress: the rendered colours go straight into the colour surface, converted to its layout on the way.
+ * with_depth: read the depth plane back now (the caller is about to use it); otherwise it is rendered later if needed. */
+static void
+flush_frame(struct sp_tensix *t, bool with_depth)
 {
-   if (!t)
-      return;
    if (t->state != FRAME_OPEN)
       return;
    t->state = FRAME_NONE;
-   const size_t px = (size_t)t->width * t->height;
-   if (t->scratch_px < px) {
-      FREE(t->rgba);
-      FREE(t->depth);
-      t->rgba = MALLOC(px * 4);
-      t->depth = MALLOC(px * sizeof(float));
-      t->scratch_px = t->rgba && t->depth ? px : 0;
-      if (!t->scratch_px) {
-         fprintf(stderr, "tensix: out of memory\n");
-         return;
+   struct softpipe_tile_cache *tc = t->sp->cbuf_cache[0];
+   unsigned rs, bs;
+   bool has_alpha;
+   if (!tc->num_maps || !color_shifts(t->sp->framebuffer.cbufs[0].format, &rs, &bs, &has_alpha)) {
+      fprintf(stderr, "tensix: the colour surface is not writable; frame dropped\n");
+      return;
+   }
+   if (with_depth) {
+      const size_t px = (size_t)t->width * t->height;
+      if (t->depth_px < px) {
+         FREE(t->depth);
+         t->depth = MALLOC(px * sizeof(float));
+         t->depth_px = t->depth ? px : 0;
+         if (!t->depth_px) {
+            fprintf(stderr, "tensix: out of memory\n");
+            return;
+         }
       }
    }
+   discard_cache(tc);   /* nothing in the cache is wanted: the rendering owns every pixel */
    t->depth_pending = false;
+   t->depth_cached = false;
    const double t0 = now_ms();
-   if (t->api.frame_end(t->ctx, t->rgba, 0, t->depth, 0) != 0) {
+   const uint32_t flags = (rs != 0 ? TTR_OUT_SWAP_RB : 0) | (has_alpha ? 0 : TTR_OUT_OPAQUE);
+   if (t->api.frame_end_ex(t->ctx, tc->transfer_map[0], tc->transfer[0]->stride, flags, with_depth ? t->depth : NULL, 0) != 0) {
       fprintf(stderr, "tensix: frame failed: %s\n", t->api.last_error());
       return;
    }
-   const double t1 = now_ms();
+   t->sp->dirty_render_cache = true;
    t->frames_fast++;
-   write_color(t);
    /* The depth buffer is only needed if something reads it before the next full clear overwrites it. In the usual
     * loop (draw, swap, clear) nothing does, so the write is deferred until a draw, a framebuffer change, a partial
     * clear or a CPU access to the depth resource asks for it. */
    t->depth_pending = true;
-   t->ms_render += t1 - t0;
-   t->ms_write += now_ms() - t1;
+   t->depth_cached = with_depth;
+   t->ms_render += now_ms() - t0;
    if (t->debug && t->frames_fast % 300 == 0)
-      fprintf(stderr, "tensix: %u frames (%u depth writes): %.2f ms per frame in the rasterizer (%s), %.2f ms writing the result into softpipe's buffers (%.2f of it depth)\n",
+      fprintf(stderr, "tensix: %u frames (%u depth writes): %.2f ms per frame in the rasterizer and the copy into softpipe's colour surface (%s), %.2f ms per frame writing depth (%u times)\n",
               t->frames_fast, t->depth_writes, t->ms_render / t->frames_fast, t->api.context_report(t->ctx),
-              t->ms_write / t->frames_fast, t->ms_depth / t->frames_fast);
+              t->ms_write / t->frames_fast, t->depth_writes);
+}
+
+/* softpipe's flush (glFlush, a swap, a read-back): render what the frame holds. */
+void
+sp_tensix_flush(struct sp_tensix *t)
+{
+   if (t)
+      flush_frame(t, false);
 }
 
 void
@@ -676,7 +693,7 @@ sp_tensix_framebuffer_changing(struct sp_tensix *t)
 {
    if (!t)
       return;
-   sp_tensix_flush(t);
+   flush_frame(t, true);
    materialize_depth(t);
    t->state = FRAME_NONE;
 }
@@ -690,7 +707,7 @@ sp_tensix_clear(struct sp_tensix *t, unsigned buffers, const struct pipe_scissor
    const bool full = !scissor && (buffers & PIPE_CLEAR_COLOR0) && (buffers & PIPE_CLEAR_DEPTH);
    if (!full || !framebuffer_ok(t->sp)) {
       /* A partial clear or a clear of other buffers touches pixels the pending frame owns. */
-         sp_tensix_flush(t);
+      flush_frame(t, true);
       materialize_depth(t);
       t->state = FRAME_NONE;
       return;
@@ -716,7 +733,7 @@ refuse_draw(struct sp_tensix *t, const char *why)
    }
    if (t->state == FRAME_OPEN) {
       t->frames_fallback++;
-      sp_tensix_flush(t);
+      flush_frame(t, true);
    }
    materialize_depth(t);
    t->state = FRAME_NONE;
@@ -810,7 +827,7 @@ sp_tensix_tri(struct sp_tensix *t, const float (*v0)[4], const float (*v1)[4], c
       submit_batch(t);
       t->tri_active = false;
       t->frames_fallback++;
-         sp_tensix_flush(t);
+      flush_frame(t, true);
       t->state = FRAME_NONE;
       return false;
    }

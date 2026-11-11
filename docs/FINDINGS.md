@@ -286,7 +286,7 @@ What exists and how it was checked; the user-facing description is `mesa/README.
 
 **Where GLSL stands.** Vertex shaders of any complexity run on the host in Mesa's draw module. Fragment shaders were at first only a colour pass-through; G.6 (below) translates arithmetic fragment shaders to the chip. Mesa here is 26.3.0 built with only softpipe, GLX and GL 3.3 compatibility; no Vulkan, no conformance claim.
 
-**Measured.** See `docs/PERF.md` ("OpenGL"): glxgears at 1920 x 1080 runs at 126 FPS on a Tensix chip against 31 FPS for stock softpipe; at 300 x 300 stock softpipe is faster (575 against 310 FPS) because a chip frame costs about 2 ms of fixed latency.
+**Measured.** See `docs/PERF.md` ("OpenGL"): glxgears at 1920 x 1080 runs at 160 FPS on a Tensix chip against 31 FPS for stock softpipe; at 300 x 300 stock softpipe is faster (571 against 333 FPS) because a chip frame costs about 2 ms of fixed latency.
 
 ### G.6 Fragment shaders (in progress)
 

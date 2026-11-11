@@ -128,6 +128,43 @@ def main():
     img, z = two_batches(State(ALWAYS, 0, 0))
     check(abs(int(img[8, 30][0]) - 255) <= 0 and int(img[8, 30][1]) == 0, "depth test off: the later triangle is drawn over")
     check(abs(float(z[8, 30]) - 0.6) < 1e-6, "depth test off does not write depth")
+    # Output formats (ttr_frame_end_ex: row pitch, R/B swap, forced alpha, flip) and a depth plane read after the frame ended without it
+    # (ttr_frame_depth renders the frame again).
+    lib.ttr_frame_end_ex.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p, C.c_int]
+    lib.ttr_frame_depth.argtypes = [C.c_void_p, C.c_void_p, C.c_int]
+    SWAP_RB, OPAQUE = 1, 2
+    scene = quad + near + [(vert(4, 4, z=0.4, c=cols[0], w=1), vert(60, 8, z=0.4, c=cols[1], w=1), vert(30, 44, z=0.4, c=(0.1, 0.2, 0.3, 0.5), w=2))]
+    ref_img, ref_z = frame(scene, shading=PERSP, clear=(0.1, 0.2, 0.3, 0.5))
+
+    def end_ex(flags, flip, with_depth, pitch_px=W + 16):
+        cc = (C.c_float * 4)(0.1, 0.2, 0.3, 0.5)
+        assert lib.ttr_frame_begin(ctx, W, H, cc, 1.0, LESS) == 0
+        arr = (Vertex * (3 * len(scene)))(*[v for tri3 in scene for v in tri3])
+        assert lib.ttr_frame_triangles(ctx, arr, len(scene), PERSP, 0, None) == 0
+        buf = np.full((H, pitch_px, 4), 7, dtype=np.uint8)
+        z = np.zeros((H, W), dtype=np.float32) if with_depth else None
+        assert lib.ttr_frame_end_ex(ctx, buf.ctypes.data, pitch_px * 4, flags, z.ctypes.data if with_depth else None, flip) == 0
+        return buf, z
+
+    buf, z = end_ex(0, 0, True)
+    check(np.array_equal(buf[:, :W], ref_img) and np.all(buf[:, W:] == 7) and np.array_equal(z, ref_z), "ttr_frame_end_ex with a row pitch: rows land at the pitch, the padding is untouched")
+    buf, _ = end_ex(SWAP_RB, 0, False)
+    check(np.array_equal(buf[:, :W], ref_img[..., [2, 1, 0, 3]]), "TTR_OUT_SWAP_RB swaps red and blue")
+    buf, _ = end_ex(OPAQUE, 0, False)
+    check(np.array_equal(buf[:, :W, :3], ref_img[..., :3]) and np.all(buf[:, :W, 3] == 255) and np.any(ref_img[..., 3] != 255), "TTR_OUT_OPAQUE forces alpha to 255")
+    buf, _ = end_ex(SWAP_RB | OPAQUE, 1, False)
+    expect = ref_img[::-1][..., [2, 1, 0, 3]].copy()
+    expect[..., 3] = 255
+    check(np.array_equal(buf[:, :W], expect), "both together, with flip_y")
+    end_ex(0, 0, False)
+    zz = np.zeros((H, W), dtype=np.float32)
+    check(lib.ttr_frame_depth(ctx, zz.ctypes.data, 0) == 0 and np.array_equal(zz, ref_z), "ttr_frame_depth returns the depth of a frame that was ended without it")
+    zf = np.zeros((H, W), dtype=np.float32)
+    check(lib.ttr_frame_depth(ctx, zf.ctypes.data, 1) == 0 and np.array_equal(zf, ref_z[::-1]), "... again, flipped")
+    lib.ttr_frame_begin(ctx, W, H, (C.c_float * 4)(0, 0, 0, 1), 1.0, LESS)
+    check(lib.ttr_frame_depth(ctx, zz.ctypes.data, 0) != 0, "ttr_frame_depth during an open frame is refused")
+    img_scratch = np.zeros((H, W, 4), dtype=np.uint8)
+    lib.ttr_frame_end(ctx, img_scratch.ctypes.data, 0, None, 0)
     # Fragment shaders: a program over two varyings, built by hand (include/ttraster/ttraster_isa.h).
     class ShaderDesc(C.Structure):
         _fields_ = [("code", C.c_void_p), ("n_instr", C.c_uint32), ("consts", C.c_void_p), ("n_consts", C.c_uint32),
@@ -152,7 +189,7 @@ def main():
         d = ShaderDesc(code.ctypes.data, len(code) // 4, consts.ctypes.data, 2, n_inputs, 6, 2, -1)
         return d, code, consts
 
-    def shaded_frame(desc_list, tris, shader_ids, attrs, persp=0, state=None, fixed_first=None):
+    def shaded_frame(desc_list, tris, shader_ids, attrs, persp=0, state=None, fixed_first=None, depth_inline=None, depth_after=None):
         cc = (C.c_float * 4)(0, 0, 0, 1)
         assert lib.ttr_frame_begin(ctx, W, H, cc, 1.0, LESS) == 0
         ids = []
@@ -165,7 +202,9 @@ def main():
         a = np.asarray(attrs, dtype=np.float32)
         assert lib.ttr_frame_triangles_shaded(ctx, arr, len(tris), ids[shader_ids], a.ctypes.data, persp, 0, C.byref(state) if state else None) == 0, lib.ttr_last_error()
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
-        assert lib.ttr_frame_end(ctx, rgba.ctypes.data, 0, None, 0) == 0
+        assert lib.ttr_frame_end(ctx, rgba.ctypes.data, 0, depth_inline.ctypes.data if depth_inline is not None else None, 0) == 0
+        if depth_after is not None:
+            assert lib.ttr_frame_depth(ctx, depth_after.ctypes.data, 0) == 0, lib.ttr_last_error()
         return rgba, ids
 
     lib.ttr_last_error.restype = C.c_char_p
@@ -177,6 +216,11 @@ def main():
     check(ids[0] == 1 and ids[1] == 1 and ids[2] == 2, "identical programs of a frame share an id")
     px = img[12, 24].astype(int)   # u = (24.5 - 8) / 32, v = (12.5 - 4) / 16
     exp = np.array([(24.5 - 8) / 32, (12.5 - 4) / 16, 0.5 * (24.5 - 8) / 32, 1.0]) * 255
+    z_in, z_after = np.zeros((H, W), dtype=np.float32), np.zeros((H, W), dtype=np.float32)
+    shaded_frame([d1], rect_tris, 0, attrs, depth_inline=z_in)
+    shaded_frame([d1], rect_tris, 0, attrs, depth_after=z_after)
+    check(np.array_equal(z_in, z_after) and abs(float(z_in[12, 24]) - 0.5) < 1e-6 and z_in[30, 5] == 1.0,
+          "the depth of a shaded frame read afterwards (ttr_frame_depth) equals the depth read with the frame")
     check(int(np.abs(px - exp).max()) <= 1, f"a shaded rectangle shows the shader's colour from the varyings ({tuple(px)} against {tuple(np.round(exp, 1))})")
     check(tuple(img[30, 30]) == (0, 0, 0, 255), "pixels outside the shaded rectangle keep the clear colour")
     # A nearer shaded triangle over a fixed-function one (API order, depth test).

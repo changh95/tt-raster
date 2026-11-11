@@ -3,6 +3,9 @@
 #include "tensix/kernels/raster_layout.h"
 #include "ttraster/ttraster.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -10,6 +13,7 @@
 
 #include "scene/scene.h"
 #include "ttraster/frame.h"
+#include "ttraster/parallel.h"
 #ifdef TT_RASTER_WITH_TENSIX
 #include "tensix/scene_backend.h"
 #endif
@@ -250,6 +254,7 @@ struct ttr_context {
     std::unique_ptr<ttr::scene::Backend> backend;
     ttr::Frame frame;
     bool open = false;
+    bool ended = false;       // the last frame was rendered; its triangles are still in `frame` (ttr_frame_depth renders it again)
     std::string report;
     size_t table_words = 0;   // size of the device's program table for the frame's shaders (raster_layout.h)
 };
@@ -301,6 +306,7 @@ int ttr_frame_begin(
     ctx->frame.attrs.clear();
     ctx->table_words = 0;
     ctx->open = true;
+    ctx->ended = false;
     return 0;
 }
 
@@ -431,7 +437,47 @@ uint32_t ttr_frame_shader(ttr_context* ctx, const ttr_shader_desc* desc) {
     }
 }
 
-int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y) {
+namespace {
+
+// Copy rows of a rendered plane into the caller's buffer on the worker pool. `color` fixes up the packed RGBA8 words
+// (R in the low byte) for the destination format on the way; the depth plane is copied as it is.
+void copy_planes(
+    const ttr::Framebuffer& fb, uint32_t width, uint32_t height, uint8_t* rgba, uint32_t pitch, uint32_t color_flags, float* depth,
+    int flip_y) {
+    constexpr uint32_t kRowsPerItem = 32;
+    const size_t items = (height + kRowsPerItem - 1) / kRowsPerItem;
+    ttr::parallel_for(items, 0, [&](size_t item) {
+        const uint32_t y0 = static_cast<uint32_t>(item) * kRowsPerItem, y1 = std::min(height, y0 + kRowsPerItem);
+        for (uint32_t y = y0; y < y1; y++) {
+            const uint32_t src_y = flip_y ? height - 1 - y : y;
+            if (rgba) {
+                const uint32_t* src = &fb.color[fb.index(0, src_y)];
+                uint8_t* dst = rgba + static_cast<size_t>(y) * pitch;
+                if (color_flags == 0) {
+                    std::memcpy(dst, src, static_cast<size_t>(width) * 4);
+                } else {
+                    const uint32_t opaque = (color_flags & TTR_OUT_OPAQUE) ? 0xff000000u : 0u;
+                    uint32_t* out = reinterpret_cast<uint32_t*>(dst);
+                    if (color_flags & TTR_OUT_SWAP_RB) {
+                        for (uint32_t x = 0; x < width; x++) {
+                            const uint32_t c = src[x];
+                            out[x] = ((c & 0xffu) << 16) | (c & 0xff00u) | ((c >> 16) & 0xffu) | (c & 0xff000000u) | opaque;
+                        }
+                    } else {
+                        for (uint32_t x = 0; x < width; x++) out[x] = src[x] | opaque;
+                    }
+                }
+            }
+            if (depth) {
+                std::memcpy(depth + static_cast<size_t>(y) * width, &fb.depth[fb.index(0, src_y)], static_cast<size_t>(width) * 4);
+            }
+        }
+    });
+}
+
+}  // namespace
+
+int ttr_frame_end_ex(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, uint32_t color_flags, float* depth, int flip_y) {
     try {
         if (!ctx->open) {
             g_error = "ttr_frame_end outside a frame";
@@ -439,19 +485,39 @@ int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float*
         }
         ctx->open = false;
         const ttr::Frame& f = ctx->frame;
-        const ttr::Framebuffer& fb = ctx->backend->render(
-            f, ttr::scene::kPlaneColor | (depth ? ttr::scene::kPlaneDepth : 0u));
+        const uint32_t planes = (rgba || !depth ? ttr::scene::kPlaneColor : 0u) | (depth ? ttr::scene::kPlaneDepth : 0u);
+        const auto t0 = std::chrono::steady_clock::now();
+        const ttr::Framebuffer& fb = ctx->backend->render(f, planes);
+        const auto t1 = std::chrono::steady_clock::now();
         ctx->report = ctx->backend->report();
-        const uint32_t pitch = stride_bytes != 0 ? stride_bytes : f.width * 4;
-        for (uint32_t y = 0; y < f.height; y++) {
-            const uint32_t src_y = flip_y ? f.height - 1 - y : y;
-            if (rgba) {
-                std::memcpy(rgba + static_cast<size_t>(y) * pitch, &fb.color[fb.index(0, src_y)], static_cast<size_t>(f.width) * 4);
-            }
-            if (depth) {
-                std::memcpy(depth + static_cast<size_t>(y) * f.width, &fb.depth[fb.index(0, src_y)], static_cast<size_t>(f.width) * 4);
-            }
+        ctx->ended = true;
+        copy_planes(fb, f.width, f.height, rgba, stride_bytes != 0 ? stride_bytes : f.width * 4, color_flags, depth, flip_y);
+        const auto t2 = std::chrono::steady_clock::now();
+        char buf[96];
+        std::snprintf(buf, sizeof buf, " | render %.1f copy-out %.1f ms", std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                      std::chrono::duration<double, std::milli>(t2 - t1).count());
+        ctx->report += buf;
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y) {
+    return ttr_frame_end_ex(ctx, rgba, stride_bytes, 0, depth, flip_y);
+}
+
+int ttr_frame_depth(ttr_context* ctx, float* depth, int flip_y) {
+    try {
+        if (ctx->open || !ctx->ended || !depth) {
+            g_error = "ttr_frame_depth needs a rendered frame and a buffer";
+            return -1;
         }
+        const ttr::Frame& f = ctx->frame;
+        // Frames with fragment shaders always have the colour plane on the device.
+        const ttr::Framebuffer& fb = ctx->backend->render(f, ttr::scene::kPlaneDepth | (f.shaders.empty() ? 0u : ttr::scene::kPlaneColor));
+        copy_planes(fb, f.width, f.height, nullptr, 0, 0, depth, flip_y);
         return 0;
     } catch (const std::exception& e) {
         g_error = e.what();
