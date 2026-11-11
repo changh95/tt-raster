@@ -8,6 +8,7 @@
 #include <string>
 
 #include "ttraster/backend.h"
+#include "tensix/chip_lock.h"
 #include "tensix/multichip.h"
 
 namespace ttr {
@@ -28,6 +29,7 @@ public:
     MultiChipRenderer& chips() { return mc_; }
 
 private:
+    ChipLock lock_;   // before mc_: refuse (throw) before the devices are opened
     MultiChipRenderer mc_;
     // Per in-flight frame: kept between frames so a render loop reuses the (tens of MB) triangle and bin
     // storage, and so that two frames can be prepared at the same time.

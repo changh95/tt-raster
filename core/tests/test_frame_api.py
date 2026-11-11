@@ -304,6 +304,19 @@ def main():
     lib.ttr_frame_begin(ctx, W, H, cc, 1.0, LESS)
     lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 1, None)
     check(lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 2, None) != 0, "mixed cull modes in one frame are refused")
+    if args.backend == "tensix":
+        # The device is taken: a second renderer (here and in another process) is refused with a message, not aborted or left waiting.
+        second = lib.ttr_context_create(b"tensix", 1)
+        check(not second and b"in use" in (lib.ttr_last_error() or b""), "a second Tensix context in the process is refused")
+        probe = ("import ctypes as C,sys; l=C.CDLL(sys.argv[1]); l.ttr_last_error.restype=C.c_char_p; l.ttr_context_create.restype=C.c_void_p; "
+                 "c=l.ttr_context_create(b'tensix',1); print('opened' if c else l.ttr_last_error().decode())")
+        lib_path = os.environ.get("TTRASTER_LIB") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build", "core", "libttraster.so")
+        import subprocess
+        try:
+            r = subprocess.run([sys.executable, "-c", probe, lib_path], capture_output=True, text=True, timeout=60)
+            check("in use" in r.stdout, f"another process is refused while the device is held ({r.stdout.strip()[:70]})")
+        except subprocess.TimeoutExpired:
+            check(False, "another process is refused while the device is held (it waited instead)")
     lib.ttr_context_destroy(ctx)
     print(f"   backend: {args.backend}")
     if FAILS:
