@@ -201,7 +201,8 @@ def main():
         d = ShaderDesc(code.ctypes.data, 4, consts.ctypes.data, 1000, 2, 6, 2, -1)
         ids.append(lib.ttr_frame_shader(ctx, C.byref(d)))
     check(0 < ids.index(0) < 20 and all(i == 0 for i in ids[ids.index(0):]), f"programs beyond the program table are refused ({ids.index(0)} fit)")
-    lib.ttr_frame_end(ctx, np.zeros((H, W, 4), dtype=np.uint8).ctypes.data, 0, None, 0)   # close the frame
+    scratch = np.zeros((H, W, 4), dtype=np.uint8)   # kept in a variable: the call must not receive the address of a temporary
+    lib.ttr_frame_end(ctx, scratch.ctypes.data, 0, None, 0)   # close the frame
     # Errors and misuse.
     cc = (C.c_float * 4)(0, 0, 0, 1)
     check(lib.ttr_frame_begin(ctx, 4096, 16, cc, 1.0, LESS) != 0, "a target above 2048 pixels is refused")
