@@ -52,10 +52,12 @@ struct SetupTriangle {
     uint32_t piece = 0;    // fan piece within the source triangle (0 unless clipped)
     bool clipped = false;
     bool flat = false;
+    bool perspective = false;      // colour planes hold colour * rhw; `inv_w` is the plane of rhw
     int32_t x[3] = {}, y[3] = {};  // snapped, oriented so signed area is positive
     Edge edge[3] = {};             // edge i runs from vertex i to vertex (i+1)%3
     Plane depth;
     Plane color[4];
+    Plane inv_w;                   // rhw, only for perspective triangles
     int32_t tile_x0 = 0, tile_y0 = 0, tile_x1 = 0, tile_y1 = 0;  // inclusive, inside the target
 };
 

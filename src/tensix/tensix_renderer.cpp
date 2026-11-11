@@ -57,9 +57,15 @@ void encode_record(
         put_float(w, at + kColor + 3 * ch + 1, p.color_gx[ch]);
         put_float(w, at + kColor + 3 * ch + 2, p.color_gy[ch]);
     }
+    if (p.perspective) {
+        put_float(w, at + kWPlane + 0, p.w_c);
+        put_float(w, at + kWPlane + 1, p.w_gx);
+        put_float(w, at + kWPlane + 2, p.w_gy);
+    }
     put_float(w, at + kId, static_cast<float>(tri.source + 1));
     w[at + kFlatPacked] = pack_rgba8(p.color_c);  // meaningful for flat triangles (gradients are zero)
-    w[at + kFlags] = (tri.flat ? kFlagFlat : 0u) | (cov == TileCoverage::Full ? kFlagFull : 0u);
+    w[at + kFlags] = (tri.flat ? kFlagFlat : 0u) | (cov == TileCoverage::Full ? kFlagFull : 0u) |
+                     (p.perspective ? kFlagPersp : 0u);
     const VectorClasses vc = classify_vectors(tri, tx, ty, cov);
     w[at + kVecClass + 0] = vc.word[0];
     w[at + kVecClass + 1] = vc.word[1];

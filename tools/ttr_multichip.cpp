@@ -79,13 +79,25 @@ int main(int argc, char** argv) {
             const MultiChipFrame f = mc.render(frame, setup, bins, opt);
             if (n == chip_counts.front()) single = f.fb->color;
             // Crop to the viewport for the comparisons.
+            // Perspective colours divide by a Newton-refined reciprocal on the device: one level of difference from the
+            // reference's IEEE division is allowed for such scenes (the chips still have to agree with each other exactly).
+            bool perspective = false;
+            for (const Triangle& t : frame.triangles) perspective |= t.perspective && !t.flat;
+            auto off_by_more = [&](uint32_t a, uint32_t b) {
+                if (a == b) return false;
+                if (!perspective) return true;
+                for (int ch = 0; ch < 4; ch++) {
+                    if (std::abs(static_cast<int>((a >> (8 * ch)) & 255) - static_cast<int>((b >> (8 * ch)) & 255)) > 1) return true;
+                }
+                return false;
+            };
             uint64_t diff_single = 0, diff_ref = 0, amb = 0;
             for (uint32_t y = 0; y < h; y++) {
                 for (uint32_t x = 0; x < w; x++) {
                     const size_t i = f.fb->index(x, y);
                     diff_single += f.fb->color[i] != single[i];
                     if (ref.ambiguous[i]) { amb++; continue; }
-                    diff_ref += f.fb->color[i] != ref.color[i];
+                    diff_ref += off_by_more(f.fb->color[i], ref.color[i]);
                 }
             }
             const bool ok = diff_single == 0 && diff_ref == 0;

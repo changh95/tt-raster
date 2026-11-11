@@ -34,6 +34,8 @@ constexpr uint32_t kId = 24;        // 1 + source triangle index, as a float (ex
 constexpr uint32_t kFlags = 25;     // uint32 bit flags
 constexpr uint32_t kFlagFlat = 1u;  // colour gradients are zero (flat shaded)
 constexpr uint32_t kFlagFull = 2u;  // every pixel of the tile is inside (informational: the classes say it too)
+constexpr uint32_t kFlagPersp = 4u;  // colour planes hold colour * rhw; the plane in kWPlane is rhw (colour = plane / rhw)
+constexpr uint32_t kWPlane = 29;    // rhw plane (c, gx, gy), words 29..31, perspective triangles only
 constexpr uint32_t kFlatPacked = 28;  // flat colour as packed RGBA8 (host-computed), for the packed-colour variant
 constexpr uint32_t kVecClass = 26;  // 2 words, 2 bits per SFPU vector: 0 reject (skip), 1 partial (edge tests), 2 full
 

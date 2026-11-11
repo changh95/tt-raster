@@ -237,3 +237,15 @@ Where the pipelined frame goes (`TTR_TRACE=1` prints a timeline of stage boundar
 Empty tiles are no longer sent to the chip (`MultiChipRenderer`): a tile with no record shows only the clear values, so the host writes those (only when the tile does not hold them already) instead of encoding, drawing and reading back a blank tile. About a third of the tiles of this scene are sky. Measured afterwards, same scene (one run each, host load average about 20): x1 chip, depth, transfer 24.2 to 15.8 ms, synchronous 55.7 to 42.6 ms, pipelined 43.8 to 30.5 ms; x8 chip 24.4 ms synchronous and 19.1 ms pipelined; eight chips 23.4 ms synchronous and 17.7 ms pipelined (58,000 images/s); rgb + depth on the x8 chip 27.6 and 22.8 ms. Pixels are unchanged: the device acceptance run (every scene on 1, 2, 4 and 8 chips against the CPU reference) and the Newton comparisons pass.
 
 A process-wide CPU census explains why the first version of the pipeline gained little: a synchronous frame burned 443 ms of CPU time (12 cores busy on average, 65 ms of it system time) before the pool, mostly in creating and joining threads; with the pool the frame is shorter but uses more cores while it runs (750 ms of CPU, 23 cores), so the host stages are now CPU-bound when two frames overlap.
+
+## OpenGL: glxgears through Mesa (Track G)
+
+`scripts/run_gl.sh 5 [--backend off] glxgears -geometry WxH`, Xvfb, Mesa 26.3.0 softpipe on this host's CPU (single-threaded, the stock driver) against the same Mesa with the Tensix fast path on the x8 chip (node 5), three 5-second windows each, host load average about 6:
+
+| Window | Stock softpipe | Tensix fast path | Ratio |
+| --- | --- | --- | --- |
+| 300 x 300 | 575 FPS | 310 FPS | 0.54 |
+| 1024 x 1024 | 79 FPS | 173 FPS | 2.2 |
+| 1920 x 1080 | 31 FPS | 126 FPS | 4.1 |
+
+Per-frame breakdown of the fast path at 1920 x 1080 (`TTR_GL_DEBUG=1`): 4.8 ms in the rasterizer (setup 0.2, binning 0.2, record encoding 0.3, upload 0.6, device 0.8, read-back 1.1 of which 0.7 is the transfer, plus the copy of colour and depth out of the rasterizer), 0.75 ms writing the colour into Mesa's buffer; the remaining 2.4 ms of the 7.9 ms frame are Mesa (vertex processing in the draw module) and the swap into the X server. At 300 x 300 the rasterizer takes 2.0 ms for 750 records of which about 1.7 ms is chip latency, which is why small windows do not gain. What helped: writing the colour surface directly as words instead of through softpipe's float tile cache (6 to 10 ms per 1080p frame to 0.75 ms), and deferring the depth write (2.7 ms at 1080p) until something reads the depth buffer. Not done: overlapping frames with Mesa's work (the pipelined `ttr_submit` path exists for the scene API, not for this one), and zero-copy read-back (the rasterizer copies colour and depth into the caller's buffers).

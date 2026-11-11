@@ -8,6 +8,7 @@
 #include <string>
 
 #include "scene/scene.h"
+#include "ttraster/frame.h"
 #ifdef TT_RASTER_WITH_TENSIX
 #include "tensix/scene_backend.h"
 #endif
@@ -235,6 +236,123 @@ int ttr_collect(ttr_scene* s, int ticket, ttr_stats* stats) {
         const ttr::scene::RenderStats st = job.result.get();
         s->report = st.backend_report;
         fill_stats(st, stats);
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+// ---- Raster API ----------------------------------------------------------------------------------------
+
+struct ttr_context {
+    std::unique_ptr<ttr::scene::Backend> backend;
+    ttr::Frame frame;
+    bool open = false;
+    int depth_func = TTR_DEPTH_LESS;
+    std::string report;
+};
+
+ttr_context* ttr_context_create(const char* backend, uint32_t n_chips) {
+    try {
+        auto c = std::make_unique<ttr_context>();
+        const std::string b = backend ? backend : "reference";
+        if (b == "reference") {
+            c->backend = std::make_unique<ttr::scene::ReferenceBackend>();
+        } else if (b == "tensix") {
+#ifdef TT_RASTER_WITH_TENSIX
+            c->backend = ttr::make_tensix_backend(n_chips == 0 ? 1 : n_chips);
+#else
+            g_error = "this libttraster was built without Tensix support";
+            return nullptr;
+#endif
+        } else {
+            g_error = "unknown backend '" + b + "'";
+            return nullptr;
+        }
+        return c.release();
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return nullptr;
+    }
+}
+
+void ttr_context_destroy(ttr_context* ctx) { delete ctx; }
+const char* ttr_context_report(ttr_context* ctx) { return ctx->report.c_str(); }
+
+int ttr_frame_begin(
+    ttr_context* ctx, uint32_t width, uint32_t height, const float clear_color[4], float clear_depth, int depth_func) {
+    if (width == 0 || height == 0 || width > static_cast<uint32_t>(ttr::kMaxTargetSize) || height > static_cast<uint32_t>(ttr::kMaxTargetSize)) {
+        g_error = "frame size must be 1 to 2048 pixels in each direction";
+        return -1;
+    }
+    ctx->frame.width = width;
+    ctx->frame.height = height;
+    std::memcpy(ctx->frame.clear_color, clear_color, 4 * sizeof(float));
+    ctx->frame.clear_depth = clear_depth;
+    ctx->depth_func = depth_func;
+    ctx->frame.depth_func = depth_func == TTR_DEPTH_LESS ? ttr::DepthFunc::Less : ttr::DepthFunc::LessEqual;
+    ctx->frame.cull = ttr::CullMode::None;
+    ctx->frame.triangles.clear();   // keeps the capacity
+    ctx->frame.viewports.clear();
+    ctx->open = true;
+    return 0;
+}
+
+int ttr_frame_triangles(ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull) {
+    if (!ctx->open) {
+        g_error = "ttr_frame_triangles outside a frame";
+        return -1;
+    }
+    // Culling is per frame in the rasterizer: draws with different cull modes cannot share a frame, so the
+    // caller must end the frame (or the driver must cull before submitting). Mixed modes are refused.
+    const ttr::CullMode mode = cull == TTR_CULL_POSITIVE_AREA ? ttr::CullMode::Positive
+                               : cull == TTR_CULL_NEGATIVE_AREA ? ttr::CullMode::Negative : ttr::CullMode::None;
+    if (!ctx->frame.triangles.empty() && ctx->frame.cull != mode) {
+        g_error = "all triangles of a frame must use the same cull mode";
+        return -1;
+    }
+    ctx->frame.cull = mode;
+    const size_t base = ctx->frame.triangles.size();
+    ctx->frame.triangles.resize(base + n_triangles);
+    for (uint32_t t = 0; t < n_triangles; t++) {
+        ttr::Triangle& tri = ctx->frame.triangles[base + t];
+        tri.viewport = 0;
+        tri.flat = shading == TTR_SHADE_FLAT;
+        tri.perspective = shading == TTR_SHADE_PERSPECTIVE;
+        for (int k = 0; k < 3; k++) {
+            const ttr_vertex& v = verts[3 * t + k];
+            tri.v[k].x = v.x;
+            tri.v[k].y = v.y;
+            tri.v[k].z = ctx->depth_func == TTR_DEPTH_ALWAYS ? 0.0f : v.z;
+            tri.v[k].rhw = v.rhw;
+            std::memcpy(tri.v[k].color, v.color, sizeof v.color);
+        }
+    }
+    return 0;
+}
+
+int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y) {
+    try {
+        if (!ctx->open) {
+            g_error = "ttr_frame_end outside a frame";
+            return -1;
+        }
+        ctx->open = false;
+        const ttr::Frame& f = ctx->frame;
+        const ttr::Framebuffer& fb = ctx->backend->render(
+            f, ttr::scene::kPlaneColor | (depth ? ttr::scene::kPlaneDepth : 0u));
+        ctx->report = ctx->backend->report();
+        const uint32_t pitch = stride_bytes != 0 ? stride_bytes : f.width * 4;
+        for (uint32_t y = 0; y < f.height; y++) {
+            const uint32_t src_y = flip_y ? f.height - 1 - y : y;
+            if (rgba) {
+                std::memcpy(rgba + static_cast<size_t>(y) * pitch, &fb.color[fb.index(0, src_y)], static_cast<size_t>(f.width) * 4);
+            }
+            if (depth) {
+                std::memcpy(depth + static_cast<size_t>(y) * f.width, &fb.depth[fb.index(0, src_y)], static_cast<size_t>(f.width) * 4);
+            }
+        }
         return 0;
     } catch (const std::exception& e) {
         g_error = e.what();

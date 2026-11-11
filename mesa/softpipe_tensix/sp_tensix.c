@@ -1,0 +1,652 @@
+/*
+ * Copyright 2026 tt-raster contributors
+ * SPDX-License-Identifier: MIT
+ *
+ * Tensix fast path for softpipe. See sp_tensix.h.
+ *
+ * Life of a frame: a full colour+depth clear opens a frame (the clear values are remembered, the actual
+ * rasterizer frame starts at the first accepted draw, when the depth function is known). Every draw is checked
+ * against what libttraster can do; accepted draws hand their post-transform triangles (window coordinates from the
+ * draw module) to libttraster instead of softpipe's setup stage. The frame is rendered once, when something needs
+ * the pixels (swap, flush, read-back, a different framebuffer) or when a draw the fast path cannot do arrives; the
+ * result is written into the colour and depth tile caches, and softpipe carries on with that content. After such a
+ * fallback the rest of the frame runs on softpipe, so output is never wrong, only slower.
+ *
+ * Environment: TTR_GL = "tensix" | "reference" selects the backend and enables the path (GALLIUM_DRIVER=tensix is an
+ * alias that sets "tensix"); TTR_GL_CHIPS = number of chips; TTRASTER_LIB = path of libttraster.so;
+ * TTR_GL_DEBUG = 1 logs decisions.
+ */
+
+#include "sp_tensix.h"
+
+#include <dlfcn.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "sp_context.h"
+#include "sp_state.h"
+#include "sp_tile_cache.h"
+#include "tgsi/tgsi_parse.h"
+#include "util/format/u_format.h"
+#include "util/u_memory.h"
+#include "util/u_prim.h"
+
+/* ---- libttraster ABI (include/ttraster/ttraster.h), loaded with dlopen --------------------------------------- */
+
+typedef struct {
+   float x, y, z, rhw;
+   float color[4];
+} ttr_vertex;
+
+enum { TTR_DEPTH_LESS = 0, TTR_DEPTH_LEQUAL = 1, TTR_DEPTH_ALWAYS = 2 };
+enum { TTR_SHADE_LINEAR = 0, TTR_SHADE_FLAT = 1, TTR_SHADE_PERSPECTIVE = 2 };
+
+struct ttr_api {
+   void *(*context_create)(const char *backend, uint32_t n_chips);
+   void (*context_destroy)(void *ctx);
+   int (*frame_begin)(void *ctx, uint32_t w, uint32_t h, const float clear_color[4], float clear_depth, int depth_func);
+   int (*frame_triangles)(void *ctx, const ttr_vertex *verts, uint32_t n, int shading, int cull);
+   int (*frame_end)(void *ctx, uint8_t *rgba, uint32_t stride, float *depth, int flip_y);
+   const char *(*last_error)(void);
+   const char *(*context_report)(void *ctx);
+};
+
+enum frame_state {
+   FRAME_NONE,     /* nothing pending; draws go to softpipe (or wait for a clear) */
+   FRAME_CLEARED,  /* a full clear was seen; the rasterizer frame has not begun */
+   FRAME_OPEN,     /* the rasterizer frame is accumulating triangles */
+};
+
+struct sp_tensix {
+   struct softpipe_context *sp;
+   void *lib;
+   struct ttr_api api;
+   void *ctx;
+   bool debug;
+
+   enum frame_state state;
+   float clear_color[4];
+   float clear_depth;
+   int depth_func;          /* of the open frame */
+   uint32_t width, height;  /* of the open frame */
+
+   /* The draw in progress. */
+   bool tri_active;
+   int color_slot;          /* vertex slot of the colour varying */
+   bool flat;
+   bool perspective;        /* the colour varying is perspective-interpolated: accepted within a tolerance */
+   ttr_vertex *verts;
+   size_t nverts, cap;
+
+   /* Scratch for the rendered frame. */
+   uint8_t *rgba;
+   float *depth;
+   size_t scratch_px;
+
+   bool depth_pending;      /* the rendered frame's depth is in `depth`, not yet written into the depth buffer */
+   unsigned frames_fast, draws_fast, draws_slow, frames_fallback;
+   double ms_render, ms_write, ms_depth;   /* accumulated time in ttr_frame_end, in writing the result, of which depth */
+   unsigned depth_writes;
+   bool logged_unsupported;
+};
+
+#define DBG(t, ...)                       \
+   do {                                   \
+      if ((t)->debug) {                   \
+         fprintf(stderr, "tensix: " __VA_ARGS__); \
+         fputc('\n', stderr);             \
+      }                                   \
+   } while (0)
+
+static double
+now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+
+/* ---- setup ------------------------------------------------------------------------------------------------- */
+
+static bool
+load_api(struct sp_tensix *t, const char *path)
+{
+   t->lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+   if (!t->lib) {
+      fprintf(stderr, "tensix: cannot load %s: %s\n", path, dlerror());
+      return false;
+   }
+#define LOAD(field, name)                                                    \
+   t->api.field = (__typeof__(t->api.field))dlsym(t->lib, name);            \
+   if (!t->api.field) {                                                      \
+      fprintf(stderr, "tensix: %s not found in %s\n", name, path);          \
+      return false;                                                          \
+   }
+   LOAD(context_create, "ttr_context_create")
+   LOAD(context_destroy, "ttr_context_destroy")
+   LOAD(frame_begin, "ttr_frame_begin")
+   LOAD(frame_triangles, "ttr_frame_triangles")
+   LOAD(frame_end, "ttr_frame_end")
+   LOAD(last_error, "ttr_last_error")
+   LOAD(context_report, "ttr_context_report")
+#undef LOAD
+   return true;
+}
+
+struct sp_tensix *
+sp_tensix_create(struct softpipe_context *sp)
+{
+   const char *mode = getenv("TTR_GL");
+   if (!mode || !*mode || !strcmp(mode, "0"))
+      return NULL;
+   const char *lib = getenv("TTRASTER_LIB");
+   struct sp_tensix *t = CALLOC_STRUCT(sp_tensix);
+   if (!t)
+      return NULL;
+   t->sp = sp;
+   t->debug = getenv("TTR_GL_DEBUG") != NULL;
+   if (!load_api(t, lib && *lib ? lib : "libttraster.so")) {
+      FREE(t);
+      return NULL;
+   }
+   const char *chips = getenv("TTR_GL_CHIPS");
+   t->ctx = t->api.context_create(!strcmp(mode, "reference") ? "reference" : "tensix", chips ? (uint32_t)atoi(chips) : 1);
+   if (!t->ctx) {
+      fprintf(stderr, "tensix: cannot create the rasterizer context: %s\n", t->api.last_error());
+      dlclose(t->lib);
+      FREE(t);
+      return NULL;
+   }
+   fprintf(stderr, "tensix: softpipe fast path enabled (backend %s)\n", !strcmp(mode, "reference") ? "reference" : "tensix");
+   return t;
+}
+
+void
+sp_tensix_destroy(struct sp_tensix *t)
+{
+   if (!t)
+      return;
+   if (t->debug)
+      fprintf(stderr, "tensix: %u frames on the fast path, %u draws accepted, %u draws refused, %u mid-frame fallbacks\n",
+              t->frames_fast, t->draws_fast, t->draws_slow, t->frames_fallback);
+   t->api.context_destroy(t->ctx);
+   FREE(t->verts);
+   FREE(t->rgba);
+   FREE(t->depth);
+   dlclose(t->lib);
+   FREE(t);
+}
+
+/* ---- what the fast path can do ------------------------------------------------------------------------------- */
+
+static bool
+color_format_ok(enum pipe_format f)
+{
+   const struct util_format_description *d = util_format_description(f);
+   return d && d->layout == UTIL_FORMAT_LAYOUT_PLAIN && d->colorspace == UTIL_FORMAT_COLORSPACE_RGB &&
+          util_format_is_unorm8(d) && d->block.bits == 32;
+}
+
+static bool
+depth_format_ok(enum pipe_format f)
+{
+   switch (f) {
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+   case PIPE_FORMAT_Z24X8_UNORM:
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
+   case PIPE_FORMAT_X8Z24_UNORM:
+   case PIPE_FORMAT_Z32_UNORM:
+   case PIPE_FORMAT_Z32_FLOAT:
+   case PIPE_FORMAT_Z16_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+framebuffer_ok(const struct softpipe_context *sp)
+{
+   const struct pipe_framebuffer_state *fb = &sp->framebuffer;
+   if (fb->nr_cbufs != 1 || !fb->cbufs[0].texture || !fb->zsbuf.texture)
+      return false;
+   if (fb->width == 0 || fb->height == 0 || fb->width > 2048 || fb->height > 2048)
+      return false;
+   if (fb->cbufs[0].first_layer != fb->cbufs[0].last_layer || fb->zsbuf.first_layer != fb->zsbuf.last_layer)
+      return false;
+   if (fb->cbufs[0].texture->nr_samples > 1 || fb->zsbuf.texture->nr_samples > 1)
+      return false;
+   return color_format_ok(fb->cbufs[0].format) && depth_format_ok(fb->zsbuf.format);
+}
+
+/* The fragment shader must be `MOV OUT[0], IN[k]` and nothing else. Returns the fragment input index k, or -1. */
+static int
+passthrough_input(const struct tgsi_token *tokens)
+{
+   struct tgsi_parse_context parse;
+   int input = -1, count = 0;
+   bool ok = true;
+   if (tgsi_parse_init(&parse, tokens) != TGSI_PARSE_OK)
+      return -1;
+   while (!tgsi_parse_end_of_tokens(&parse)) {
+      tgsi_parse_token(&parse);
+      if (parse.FullToken.Token.Type != TGSI_TOKEN_TYPE_INSTRUCTION)
+         continue;
+      const struct tgsi_full_instruction *inst = &parse.FullToken.FullInstruction;
+      if (inst->Instruction.Opcode == TGSI_OPCODE_END)
+         continue;
+      count++;
+      const struct tgsi_full_src_register *s = &inst->Src[0];
+      const struct tgsi_full_dst_register *d = &inst->Dst[0];
+      if (inst->Instruction.Opcode != TGSI_OPCODE_MOV || inst->Instruction.Saturate ||
+          inst->Instruction.NumDstRegs != 1 || inst->Instruction.NumSrcRegs != 1 ||
+          d->Register.File != TGSI_FILE_OUTPUT || d->Register.Index != 0 || d->Register.WriteMask != TGSI_WRITEMASK_XYZW ||
+          d->Register.Indirect || d->Register.Dimension || s->Register.File != TGSI_FILE_INPUT || s->Register.Indirect ||
+          s->Register.Dimension || s->Register.Absolute || s->Register.Negate || s->Register.SwizzleX != TGSI_SWIZZLE_X ||
+          s->Register.SwizzleY != TGSI_SWIZZLE_Y || s->Register.SwizzleZ != TGSI_SWIZZLE_Z ||
+          s->Register.SwizzleW != TGSI_SWIZZLE_W) {
+         ok = false;
+      } else {
+         input = s->Register.Index;
+      }
+   }
+   tgsi_parse_free(&parse);
+   return ok && count == 1 ? input : -1;
+}
+
+/* Why the current draw cannot use the fast path, or NULL. Sets t->color_slot / t->flat when it can. */
+static const char *
+draw_refused(struct sp_tensix *t, const struct pipe_draw_info *info)
+{
+   struct softpipe_context *sp = t->sp;
+   if (info->instance_count != 1)
+      return "instanced draw";
+   if (info->mode != MESA_PRIM_TRIANGLES && info->mode != MESA_PRIM_TRIANGLE_STRIP && info->mode != MESA_PRIM_TRIANGLE_FAN &&
+       info->mode != MESA_PRIM_QUADS && info->mode != MESA_PRIM_QUAD_STRIP && info->mode != MESA_PRIM_POLYGON)
+      return "not a triangle primitive";
+   if (sp->reduced_api_prim != MESA_PRIM_TRIANGLES || sp->gs || sp->num_so_targets > 0)
+      return "geometry shader or stream output";
+   if (!framebuffer_ok(sp))
+      return "framebuffer format or size";
+   const struct pipe_rasterizer_state *r = sp->rasterizer;
+   if (r->fill_front != PIPE_POLYGON_MODE_FILL || r->fill_back != PIPE_POLYGON_MODE_FILL)
+      return "polygon mode is not fill";
+   if (r->scissor || r->poly_stipple_enable || r->poly_smooth || r->multisample || r->light_twoside || r->rasterizer_discard)
+      return "rasterizer state (scissor, stipple, smoothing, multisample, two-sided colour, discard)";
+   if (sp->active_query_count || sp->active_statistics_queries)
+      return "active query";
+   const struct pipe_blend_state *b = sp->blend;
+   if (b->rt[0].blend_enable || b->logicop_enable || b->alpha_to_coverage || b->alpha_to_one || b->rt[0].colormask != 0xf)
+      return "blending, logic op or colour mask";
+   const struct pipe_depth_stencil_alpha_state *ds = sp->depth_stencil;
+   if (ds->stencil[0].enabled || ds->stencil[1].enabled || ds->alpha_enabled || ds->depth_bounds_test)
+      return "stencil, alpha or depth bounds test";
+   int depth_func;
+   if (ds->depth_enabled) {
+      if (!ds->depth_writemask)
+         return "depth test without depth writes";
+      if (ds->depth_func == PIPE_FUNC_LESS)
+         depth_func = TTR_DEPTH_LESS;
+      else if (ds->depth_func == PIPE_FUNC_LEQUAL)
+         depth_func = TTR_DEPTH_LEQUAL;
+      else if (ds->depth_func == PIPE_FUNC_ALWAYS)
+         depth_func = TTR_DEPTH_ALWAYS;
+      else
+         return "depth function";
+   } else {
+      depth_func = TTR_DEPTH_ALWAYS;
+   }
+   if (t->state == FRAME_OPEN && depth_func != t->depth_func)
+      return "depth function changed within the frame";
+   if (!sp->fs_variant)
+      return "no fragment shader";
+   /* softpipe derives the vertex layout and the setup info lazily, when the draw module asks for it. */
+   softpipe_get_vbuf_vertex_info(sp);
+   const struct tgsi_shader_info *fi = &sp->fs_variant->info;
+   if (fi->uses_kill || fi->writes_z || fi->writes_stencil || fi->num_outputs != 1)
+      return "fragment shader kills or writes depth";
+   const int k = passthrough_input(sp->fs_variant->tokens);
+   if (k < 0 || (unsigned)k >= fi->num_inputs)
+      return "fragment shader is not a colour pass-through";
+   if (t->debug) {
+      for (unsigned i = 0; i < fi->num_inputs; i++)
+         fprintf(stderr, "tensix: fs input %u: semantic %d index %d interpolate %d -> setup interp %d src slot %d%s\n", i,
+                 (int)fi->input_semantic_name[i], (int)fi->input_semantic_index[i], (int)fi->input_interpolate[i],
+                 (int)sp->setup_info.attrib[i].interp, (int)sp->setup_info.attrib[i].src_index, (int)i == k ? " <- colour" : "");
+   }
+   const enum sp_interp_mode interp = sp->setup_info.attrib[k].interp;
+   if (interp != SP_INTERP_LINEAR && interp != SP_INTERP_CONSTANT && interp != SP_INTERP_PERSPECTIVE) {
+      if (t->debug)
+         fprintf(stderr, "tensix: fragment input %d has interpolation mode %d, semantic %d\n", k, (int)interp,
+                 (int)fi->input_semantic_name[k]);
+      return "colour varying interpolation mode";
+   }
+   t->color_slot = sp->setup_info.attrib[k].src_index;
+   t->flat = interp == SP_INTERP_CONSTANT;
+   t->perspective = interp == SP_INTERP_PERSPECTIVE;
+   t->depth_func = depth_func;   /* adopted when the frame begins; compared above once it is open */
+   return NULL;
+}
+
+/* ---- frame handling ------------------------------------------------------------------------------------------ */
+
+/* Forget what a tile cache holds (nothing in it is wanted: the whole surface is about to be overwritten) and a
+ * pending lazy clear with it. */
+static void
+discard_cache(struct softpipe_tile_cache *tc)
+{
+   for (unsigned pos = 0; pos < ARRAY_SIZE(tc->tile_addrs); pos++)
+      tc->tile_addrs[pos].bits.invalid = 1;
+   if (tc->clear_flags)
+      memset(tc->clear_flags, 0, tc->clear_flags_size);
+   tc->last_tile_addr.bits.invalid = 1;
+}
+
+/* Layout of a 32-bit colour format in the words of the surface: bit position of R and B (G is at 8, A at 24). */
+static bool
+color_shifts(enum pipe_format f, unsigned *r_shift, unsigned *b_shift, bool *has_alpha)
+{
+   switch (f) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_A8B8G8R8_UNORM:
+      *r_shift = 0, *b_shift = 16, *has_alpha = true;
+      return true;
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_X8B8G8R8_UNORM:
+      *r_shift = 0, *b_shift = 16, *has_alpha = false;
+      return true;
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_A8R8G8B8_UNORM:
+      *r_shift = 16, *b_shift = 0, *has_alpha = true;
+      return true;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_X8R8G8B8_UNORM:
+      *r_shift = 16, *b_shift = 0, *has_alpha = false;
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* The rendered colours straight into the surface memory (the rendering owns every pixel). */
+static void
+write_color(struct sp_tensix *t)
+{
+   struct softpipe_tile_cache *tc = t->sp->cbuf_cache[0];
+   const uint32_t w = t->width, h = t->height;
+   unsigned rs, bs;
+   bool has_alpha;
+   if (!tc->num_maps || !color_shifts(t->sp->framebuffer.cbufs[0].format, &rs, &bs, &has_alpha))
+      return;
+   discard_cache(tc);
+   uint8_t *dst = tc->transfer_map[0];
+   const unsigned stride = tc->transfer[0]->stride;
+   const uint32_t amask = has_alpha ? 0u : 0xff000000u;
+   for (uint32_t y = 0; y < h; y++) {
+      const uint32_t *src = (const uint32_t *)(t->rgba + (size_t)y * w * 4);   /* R in the low byte */
+      uint32_t *out = (uint32_t *)(dst + (size_t)y * stride);
+      if (rs == 0) {
+         for (uint32_t x = 0; x < w; x++)
+            out[x] = src[x] | amask;
+      } else {
+         for (uint32_t x = 0; x < w; x++) {
+            const uint32_t c = src[x];
+            out[x] = ((c & 0xffu) << 16) | (c & 0xff00u) | ((c >> 16) & 0xffu) | (c & 0xff000000u) | amask;
+         }
+      }
+   }
+   t->sp->dirty_render_cache = true;
+}
+
+/* The rendered depth into the depth buffer (stencil bits are kept for combined formats). */
+static void
+write_depth(struct sp_tensix *t)
+{
+   struct softpipe_context *sp = t->sp;
+   struct softpipe_tile_cache *tc = sp->zsbuf_cache;
+   const enum pipe_format zf = sp->framebuffer.zsbuf.format;
+   const uint32_t w = t->width, h = t->height;
+   if (!tc->num_maps)
+      return;
+   if (t->debug) {
+      unsigned ones = 0;
+      for (size_t i = 0; i < (size_t)w * h; i++)
+         ones += t->depth[i] >= 0.9999f;
+      fprintf(stderr, "tensix: writing depth (%ux%u, format %d, %u pixels at 1.0)\n", w, h, (int)zf, ones);
+   }
+   discard_cache(tc);
+   uint8_t *dst = tc->transfer_map[0];
+   const unsigned stride = tc->transfer[0]->stride;
+   for (uint32_t y = 0; y < h; y++) {
+      const float *src = t->depth + (size_t)y * w;
+      uint32_t *d32 = (uint32_t *)(dst + (size_t)y * stride);
+      uint16_t *d16 = (uint16_t *)(dst + (size_t)y * stride);
+      for (uint32_t x = 0; x < w; x++) {
+         const double zd = src[x] < 0.0f ? 0.0 : src[x] > 1.0f ? 1.0 : (double)src[x];   /* double: 1.0 * 16777215 + 0.5 must not round up to 2^24 */
+         switch (zf) {
+         case PIPE_FORMAT_Z24_UNORM_S8_UINT:   /* depth in the low 24 bits, stencil above */
+            d32[x] = (d32[x] & 0xff000000u) | (uint32_t)(zd * 16777215.0 + 0.5);
+            break;
+         case PIPE_FORMAT_Z24X8_UNORM:
+            d32[x] = (uint32_t)(zd * 16777215.0 + 0.5);
+            break;
+         case PIPE_FORMAT_S8_UINT_Z24_UNORM:   /* stencil in the low byte, depth above */
+            d32[x] = (d32[x] & 0xffu) | ((uint32_t)(zd * 16777215.0 + 0.5) << 8);
+            break;
+         case PIPE_FORMAT_X8Z24_UNORM:
+            d32[x] = (uint32_t)(zd * 16777215.0 + 0.5) << 8;
+            break;
+         case PIPE_FORMAT_Z32_UNORM:
+            d32[x] = (uint32_t)(zd * 4294967295.0 + 0.5);
+            break;
+         case PIPE_FORMAT_Z32_FLOAT:
+            memcpy(&d32[x], &src[x], 4);
+            break;
+         case PIPE_FORMAT_Z16_UNORM:
+            d16[x] = (uint16_t)(zd * 65535.0 + 0.5);
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   sp->dirty_render_cache = true;
+}
+
+/* Write a deferred depth buffer now (someone is about to read or draw into it). */
+static void
+materialize_depth(struct sp_tensix *t)
+{
+   if (!t->depth_pending)
+      return;
+   t->depth_pending = false;
+   const double t0 = now_ms();
+   write_depth(t);
+   t->ms_depth += now_ms() - t0;
+   t->depth_writes++;
+   t->ms_write += now_ms() - t0;
+}
+
+void
+sp_tensix_flush(struct sp_tensix *t)
+{
+   if (!t)
+      return;
+   if (t->state != FRAME_OPEN)
+      return;
+   t->state = FRAME_NONE;
+   const size_t px = (size_t)t->width * t->height;
+   if (t->scratch_px < px) {
+      FREE(t->rgba);
+      FREE(t->depth);
+      t->rgba = MALLOC(px * 4);
+      t->depth = MALLOC(px * sizeof(float));
+      t->scratch_px = t->rgba && t->depth ? px : 0;
+      if (!t->scratch_px) {
+         fprintf(stderr, "tensix: out of memory\n");
+         return;
+      }
+   }
+   t->depth_pending = false;
+   const double t0 = now_ms();
+   if (t->api.frame_end(t->ctx, t->rgba, 0, t->depth, 0) != 0) {
+      fprintf(stderr, "tensix: frame failed: %s\n", t->api.last_error());
+      return;
+   }
+   const double t1 = now_ms();
+   t->frames_fast++;
+   write_color(t);
+   /* The depth buffer is only needed if something reads it before the next full clear overwrites it. In the usual
+    * loop (draw, swap, clear) nothing does, so the write is deferred until a draw, a framebuffer change, a partial
+    * clear or a CPU access to the depth resource asks for it. */
+   t->depth_pending = true;
+   t->ms_render += t1 - t0;
+   t->ms_write += now_ms() - t1;
+   if (t->debug && t->frames_fast % 300 == 0)
+      fprintf(stderr, "tensix: %u frames (%u depth writes): %.2f ms per frame in the rasterizer (%s), %.2f ms writing the result into softpipe's buffers (%.2f of it depth)\n",
+              t->frames_fast, t->depth_writes, t->ms_render / t->frames_fast, t->api.context_report(t->ctx),
+              t->ms_write / t->frames_fast, t->ms_depth / t->frames_fast);
+}
+
+void
+sp_tensix_resource_access(struct sp_tensix *t, const struct pipe_resource *resource)
+{
+   if (t && t->depth_pending && resource == t->sp->framebuffer.zsbuf.texture)
+      materialize_depth(t);
+}
+
+void
+sp_tensix_framebuffer_changing(struct sp_tensix *t)
+{
+   if (!t)
+      return;
+   sp_tensix_flush(t);
+   materialize_depth(t);
+   t->state = FRAME_NONE;
+}
+
+void
+sp_tensix_clear(struct sp_tensix *t, unsigned buffers, const struct pipe_scissor_state *scissor,
+                const union pipe_color_union *color, double depth)
+{
+   if (!t)
+      return;
+   const bool full = !scissor && (buffers & PIPE_CLEAR_COLOR0) && (buffers & PIPE_CLEAR_DEPTH);
+   if (!full || !framebuffer_ok(t->sp)) {
+      /* A partial clear or a clear of other buffers touches pixels the pending frame owns. */
+         sp_tensix_flush(t);
+      materialize_depth(t);
+      t->state = FRAME_NONE;
+      return;
+   }
+   /* Everything drawn before this clear is overwritten by it: the pending frame is dropped, not rendered, and a
+    * deferred depth buffer is never written. */
+   t->depth_pending = false;
+   t->state = FRAME_CLEARED;
+   for (int i = 0; i < 4; i++)
+      t->clear_color[i] = color->f[i];
+   t->clear_depth = (float)depth;
+   t->width = t->sp->framebuffer.width;
+   t->height = t->sp->framebuffer.height;
+}
+
+void
+sp_tensix_begin_draw(struct sp_tensix *t, const struct pipe_draw_info *info)
+{
+   if (!t)
+      return;
+   t->tri_active = false;
+   if (t->state == FRAME_NONE) {
+      materialize_depth(t);   /* softpipe is about to draw into the depth buffer */
+      t->draws_slow++;
+      return;
+   }
+   const char *why = draw_refused(t, info);
+   if (why) {
+      if (!t->logged_unsupported || t->debug) {
+         fprintf(stderr, "tensix: draw handled by softpipe: %s\n", why);
+         t->logged_unsupported = true;
+      }
+      if (t->state == FRAME_OPEN) {
+         t->frames_fallback++;
+               sp_tensix_flush(t);   /* render what is pending, then the rest of the frame is softpipe's */
+      }
+      materialize_depth(t);
+      t->state = FRAME_NONE;
+      t->draws_slow++;
+      return;
+   }
+   if (t->state == FRAME_CLEARED) {
+      if (t->api.frame_begin(t->ctx, t->width, t->height, t->clear_color, t->clear_depth, t->depth_func) != 0) {
+         fprintf(stderr, "tensix: frame_begin failed: %s\n", t->api.last_error());
+         t->state = FRAME_NONE;
+         t->draws_slow++;
+         return;
+      }
+      t->state = FRAME_OPEN;
+   }
+   t->nverts = 0;
+   t->tri_active = true;
+   t->draws_fast++;
+}
+
+bool
+sp_tensix_tri_active(const struct sp_tensix *t)
+{
+   return t && t->tri_active;
+}
+
+static void
+submit_batch(struct sp_tensix *t)
+{
+   if (t->nverts &&
+       t->api.frame_triangles(t->ctx, t->verts, (uint32_t)(t->nverts / 3),
+                              t->flat ? TTR_SHADE_FLAT : t->perspective ? TTR_SHADE_PERSPECTIVE : TTR_SHADE_LINEAR, 0) != 0) {
+      fprintf(stderr, "tensix: frame_triangles failed: %s\n", t->api.last_error());
+   }
+   t->nverts = 0;
+}
+
+/* Returns true if the triangle was taken. False: the fast path stopped (the frame so far was rendered into the
+ * buffers) and the caller must rasterize this triangle with softpipe. */
+bool
+sp_tensix_tri(struct sp_tensix *t, const float (*v0)[4], const float (*v1)[4], const float (*v2)[4],
+              const float (*vprovoke)[4])
+{
+   const float (*in[3])[4] = {v0, v1, v2};
+   if (t->perspective && !(in[0][0][3] > 0.0f && in[1][0][3] > 0.0f && in[2][0][3] > 0.0f)) {
+      /* a vertex at or behind the eye plane (1/w <= 0): not expected after clipping; let softpipe decide */
+      submit_batch(t);
+      t->tri_active = false;
+      t->frames_fallback++;
+         sp_tensix_flush(t);
+      t->state = FRAME_NONE;
+      return false;
+   }
+   if (t->nverts + 3 > t->cap) {
+      t->cap = t->cap ? t->cap * 2 : 3 * 1024;
+      t->verts = REALLOC(t->verts, 0, t->cap * sizeof(ttr_vertex));
+   }
+   for (int k = 0; k < 3; k++) {
+      ttr_vertex *o = &t->verts[t->nverts++];
+      const float *p = in[k][0];   /* slot 0: window position, w holds 1/w */
+      o->x = p[0];
+      o->y = p[1];
+      o->z = p[2];
+      o->rhw = p[3];
+      memcpy(o->color, t->flat ? vprovoke[t->color_slot] : in[k][t->color_slot], 4 * sizeof(float));
+   }
+   return true;
+}
+
+void
+sp_tensix_end_draw(struct sp_tensix *t)
+{
+   if (!t || !t->tri_active)
+      return;
+   t->tri_active = false;
+   submit_batch(t);
+}

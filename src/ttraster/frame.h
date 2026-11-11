@@ -40,8 +40,11 @@ struct Triangle {
     Vertex v[3];
     uint32_t viewport = 0;  // index into Frame::viewports (ignored when that list is empty)
     // Flat shading takes the colour of v[0], the provoking vertex. Smooth shading interpolates
-    // linearly in screen space.
+    // linearly in screen space, or perspective-correctly when `perspective` is set: the colour is then
+    // (sum of lambda_i * c_i * rhw_i) / (sum of lambda_i * rhw_i) with screen-space weights lambda, and every
+    // vertex needs a finite rhw > 0 (triangles with other values are dropped as non-finite).
     bool flat = false;
+    bool perspective = false;
 };
 
 enum class DepthFunc : uint8_t { Less, LessEqual };

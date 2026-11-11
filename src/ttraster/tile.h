@@ -50,6 +50,10 @@ struct TileParams {
     TileEdge edge[3];
     float depth_c, depth_gx, depth_gy;
     float color_c[4], color_gx[4], color_gy[4];
+    // Perspective triangles: the colour planes hold colour * rhw, and the colour of a pixel is that divided by the
+    // value of this plane (rhw), evaluated like every plane as fma(gx, ddx, fma(gy, ddy, c)).
+    bool perspective;
+    float w_c, w_gx, w_gy;
     TileCoverage coverage;
 };
 

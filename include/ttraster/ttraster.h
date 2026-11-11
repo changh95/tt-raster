@@ -85,6 +85,40 @@ int ttr_submit(
     ttr_scene* s, const ttr_camera* camera, const float* camera_poses, const float* light_direction, const ttr_images* out);
 int ttr_collect(ttr_scene* s, int ticket, ttr_stats* stats);
 
+/* ---- Raster API: a frame of screen-space triangles (for graphics drivers) -----------------------------------
+ *
+ * ttr_context owns a backend ("reference" or "tensix"). A frame is: begin (target size, clear values, depth
+ * function), any number of ttr_frame_triangles() in API order, end (render everything at once and read back).
+ * Window coordinates: x right, y down, pixel centres at +0.5, z in [0, 1], 1 = far. Targets are at most 2048
+ * pixels wide and high. Colours are RGBA in [0, 1].
+ * Everything the rasterizer does not support (blending, stencil, textures) must be filtered out by the caller.
+ */
+typedef struct ttr_context ttr_context;
+
+typedef struct {
+    float x, y, z, rhw;   /* window position, depth, 1/w (reserved for perspective-correct varyings) */
+    float color[4];
+} ttr_vertex;
+
+enum { TTR_DEPTH_LESS = 0, TTR_DEPTH_LEQUAL = 1, TTR_DEPTH_ALWAYS = 2 /* depth test off: later triangles win */ };
+enum { TTR_CULL_NONE = 0, TTR_CULL_POSITIVE_AREA = 1, TTR_CULL_NEGATIVE_AREA = 2 }; /* sign of the window-space area */
+/* Colour interpolation of a batch of triangles: linear in screen space, the colour of each triangle's first vertex,
+ * or perspective-correct (colour * rhw and rhw are interpolated, then divided; every vertex needs rhw > 0). */
+enum { TTR_SHADE_LINEAR = 0, TTR_SHADE_FLAT = 1, TTR_SHADE_PERSPECTIVE = 2 };
+
+ttr_context* ttr_context_create(const char* backend, uint32_t n_chips);
+void ttr_context_destroy(ttr_context* ctx);
+
+int ttr_frame_begin(
+    ttr_context* ctx, uint32_t width, uint32_t height, const float clear_color[4], float clear_depth, int depth_func);
+/* verts: 3 per triangle. shading: TTR_SHADE_*. cull: TTR_CULL_* (one mode per frame). */
+int ttr_frame_triangles(ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull);
+/* Render the frame. rgba: width x height x 4 bytes (row pitch `stride_bytes`, 0 = width * 4); depth: width x height
+ * floats or NULL. flip_y != 0 writes the bottom row of the render target first (OpenGL window orientation). */
+int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y);
+/* Phase timings of the last frame as text; valid until the next call. */
+const char* ttr_context_report(ttr_context* ctx);
+
 #ifdef __cplusplus
 }
 #endif

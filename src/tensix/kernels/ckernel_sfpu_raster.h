@@ -59,11 +59,12 @@ struct TriScalars {
     float a0, b0, c0, a1, b1, c1, a2, b2, c2;  // edges
     float zc, zx, zy;                          // depth plane
     float rc, rx, ry, gc, gx, gy, bc, bx, by, ac, ax, ay;  // colour planes (gradients unused when flat)
+    float wc, wx, wy;                          // rhw plane (perspective triangles only)
     float id;
     uint32_t packed;  // flat colour packed to RGBA8 (packed-colour variant)
 };
 
-template <bool FLAT>
+template <bool FLAT, bool PERSP>
 inline TriScalars load_scalars(const volatile float* rec) {
     TriScalars s;
     s.a0 = rec[0]; s.b0 = rec[1]; s.c0 = rec[2];
@@ -76,6 +77,9 @@ inline TriScalars load_scalars(const volatile float* rec) {
         s.gx = rec[16]; s.gy = rec[17];
         s.bx = rec[19]; s.by = rec[20];
         s.ax = rec[22]; s.ay = rec[23];
+    }
+    if constexpr (PERSP) {
+        s.wc = rec[ttr::layout::kWPlane]; s.wx = rec[ttr::layout::kWPlane + 1]; s.wy = rec[ttr::layout::kWPlane + 2];
     }
     s.id = rec[24];
     s.packed = reinterpret_cast<const volatile uint32_t*>(rec)[ttr::layout::kFlatPacked];
@@ -92,9 +96,18 @@ __attribute__((always_inline)) inline sfpi::vUInt raster_quantize(sfpi::vFloat v
     return sfpi::convert<sfpi::vUInt16>(t, sfpi::RoundMode::Nearest);
 }
 
+// 1 / x for x > 0: the hardware estimate refined by two Newton steps (as tt-metal's FP32 reciprocal).
+__attribute__((always_inline)) inline sfpi::vFloat raster_reciprocal(sfpi::vFloat x) {
+    sfpi::vFloat y = sfpi::approx_recip(x);
+    sfpi::vFloat t = x * y - 2.0f;
+    y = y * -t;
+    t = x * y - 2.0f;
+    return y * -t;
+}
+
 // Colour planes of a pixel that won the depth test: constants for flat triangles, otherwise
-// fma(gx, dx, fma(gy, dy, c)) per channel.
-template <bool FLAT>
+// fma(gx, dx, fma(gy, dy, c)) per channel; perspective triangles divide by the rhw plane.
+template <bool FLAT, bool PERSP>
 __attribute__((always_inline)) inline void write_colour(const TriScalars& s, sfpi::vFloat dx, sfpi::vFloat dy) {
 #if defined(RASTER_EXP_NO_COLOUR) || !(RASTER_PLANE_MASK & 1)  // no colour plane requested (or timing experiment)
     (void)s; (void)dx; (void)dy;
@@ -117,6 +130,12 @@ __attribute__((always_inline)) inline void write_colour(const TriScalars& s, sfp
         sfpi::dst_reg[kSlotG * kVectors] = s.gc;
         sfpi::dst_reg[kSlotB * kVectors] = s.bc;
         sfpi::dst_reg[kSlotA * kVectors] = s.ac;
+    } else if constexpr (PERSP) {
+        sfpi::vFloat q = raster_reciprocal(s.wx * dx + (s.wy * dy + s.wc));
+        sfpi::dst_reg[kSlotR * kVectors] = (s.rx * dx + (s.ry * dy + s.rc)) * q;
+        sfpi::dst_reg[kSlotG * kVectors] = (s.gx * dx + (s.gy * dy + s.gc)) * q;
+        sfpi::dst_reg[kSlotB * kVectors] = (s.bx * dx + (s.by * dy + s.bc)) * q;
+        sfpi::dst_reg[kSlotA * kVectors] = (s.ax * dx + (s.ay * dy + s.ac)) * q;
     } else {
         sfpi::dst_reg[kSlotR * kVectors] = s.rx * dx + (s.ry * dy + s.rc);
         sfpi::dst_reg[kSlotG * kVectors] = s.gx * dx + (s.gy * dy + s.gc);
@@ -127,7 +146,7 @@ __attribute__((always_inline)) inline void write_colour(const TriScalars& s, sfp
 }
 
 // What a pixel does once the edge tests have passed. COVER (debug): count coverage, nothing else.
-template <bool FLAT, bool LESS_EQUAL, bool COVER>
+template <bool FLAT, bool PERSP, bool LESS_EQUAL, bool COVER>
 __attribute__((always_inline)) inline void shade_vector(const TriScalars& s, sfpi::vFloat dx, sfpi::vFloat dy) {
     if constexpr (COVER) {
         sfpi::vFloat n = sfpi::dst_reg[kSlotId * kVectors];
@@ -140,14 +159,14 @@ __attribute__((always_inline)) inline void shade_vector(const TriScalars& s, sfp
             v_if (z <= zo) {
                 sfpi::dst_reg[kSlotZ * kVectors] = z;
                 sfpi::dst_reg[kSlotId * kVectors] = s.id;
-                write_colour<FLAT>(s, dx, dy);
+                write_colour<FLAT, PERSP>(s, dx, dy);
             }
             v_endif;
         } else {
             v_if (z < zo) {
                 sfpi::dst_reg[kSlotZ * kVectors] = z;
                 sfpi::dst_reg[kSlotId * kVectors] = s.id;
-                write_colour<FLAT>(s, dx, dy);
+                write_colour<FLAT, PERSP>(s, dx, dy);
             }
             v_endif;
         }
@@ -156,12 +175,12 @@ __attribute__((always_inline)) inline void shade_vector(const TriScalars& s, sfp
 
 // One vector at the current destination counter. FULL: every pixel is inside, no edge tests.
 // Edge test: E = fma(a, dx, fma(b, dy, c)) >= 0 for all three edges (src/ttraster/tile.h).
-template <bool FULL, bool FLAT, bool LESS_EQUAL, bool COVER>
+template <bool FULL, bool FLAT, bool PERSP, bool LESS_EQUAL, bool COVER>
 __attribute__((always_inline)) inline void draw_vector(const TriScalars& s) {
     sfpi::vFloat dx = sfpi::dst_reg[kSlotDx * kVectors];
     sfpi::vFloat dy = sfpi::dst_reg[kSlotDy * kVectors];
     if constexpr (FULL) {
-        shade_vector<FLAT, LESS_EQUAL, COVER>(s, dx, dy);
+        shade_vector<FLAT, PERSP, LESS_EQUAL, COVER>(s, dx, dy);
     } else {
         sfpi::vFloat t0 = s.b0 * dy + s.c0;
         sfpi::vFloat e0 = s.a0 * dx + t0;
@@ -171,7 +190,7 @@ __attribute__((always_inline)) inline void draw_vector(const TriScalars& s) {
             v_if (e1 >= 0.0f) {
                 sfpi::vFloat t2 = s.b2 * dy + s.c2;
                 sfpi::vFloat e2 = s.a2 * dx + t2;
-                v_if (e2 >= 0.0f) { shade_vector<FLAT, LESS_EQUAL, COVER>(s, dx, dy); }
+                v_if (e2 >= 0.0f) { shade_vector<FLAT, PERSP, LESS_EQUAL, COVER>(s, dx, dy); }
                 v_endif;
             }
             v_endif;
@@ -185,9 +204,9 @@ __attribute__((always_inline)) inline void draw_vector(const TriScalars& s) {
 // (no runtime index arithmetic on the RISC-V core, which is the bottleneck). The record's
 // per-vector classes skip vectors that cannot be touched (0) and drop the edge tests for vectors
 // that are entirely inside (2).
-template <bool FLAT, bool LESS_EQUAL, bool COVER>
+template <bool FLAT, bool PERSP, bool LESS_EQUAL, bool COVER>
 inline void raster_triangle_impl(const volatile float* rec) {
-    const TriScalars s = load_scalars<FLAT>(rec);
+    const TriScalars s = load_scalars<FLAT, PERSP>(rec);
     const volatile uint32_t* classes = reinterpret_cast<const volatile uint32_t*>(rec) + ttr::layout::kVecClass;
     for (uint32_t half = 0; half < 2; half++) {
         uint32_t bits = classes[half];
@@ -198,9 +217,9 @@ inline void raster_triangle_impl(const volatile float* rec) {
             cls = cls != 0u ? RASTER_EXP_FORCE_CLASS : 0u;
 #endif
             if (cls == 1u) {
-                draw_vector<false, FLAT, LESS_EQUAL, COVER>(s);
+                draw_vector<false, FLAT, PERSP, LESS_EQUAL, COVER>(s);
             } else if (cls == 2u) {
-                draw_vector<true, FLAT, LESS_EQUAL, COVER>(s);
+                draw_vector<true, FLAT, PERSP, LESS_EQUAL, COVER>(s);
             }
             sfpi::dst_reg++;
         }
@@ -224,9 +243,11 @@ constexpr bool kCover = false;
 inline void raster_triangle(const volatile float* rec) {
     const uint32_t flags = reinterpret_cast<const volatile uint32_t*>(rec)[ttr::layout::kFlags];
     if (flags & ttr::layout::kFlagFlat) {
-        raster_triangle_impl<true, kLessEqual, kCover>(rec);
+        raster_triangle_impl<true, false, kLessEqual, kCover>(rec);
+    } else if (flags & ttr::layout::kFlagPersp) {
+        raster_triangle_impl<false, true, kLessEqual, kCover>(rec);
     } else {
-        raster_triangle_impl<false, kLessEqual, kCover>(rec);
+        raster_triangle_impl<false, false, kLessEqual, kCover>(rec);
     }
 }
 

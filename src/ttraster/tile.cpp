@@ -119,6 +119,10 @@ TileParams make_tile_params(const SetupTriangle& t, int tx, int ty) {
     for (int ch = 0; ch < 4; ch++) {
         fill(t.color[ch], p.color_c[ch], p.color_gx[ch], p.color_gy[ch]);
     }
+    p.perspective = t.perspective;
+    if (t.perspective) {
+        fill(t.inv_w, p.w_c, p.w_gx, p.w_gy);
+    }
     return p;
 }
 

@@ -228,11 +228,24 @@ int main(int argc, char** argv) {
             } else {
                 const Image d = image_from_framebuffer(dev.fb, w, h);
                 // Compare everywhere except pixels the reference flags as depth-ambiguous (the golden is the reference's own output).
-                uint64_t bad = 0;
+                // Perspective triangles divide by a Newton-refined reciprocal on the device, which can differ from the
+                // reference's IEEE division in the last float bit: one colour level is then allowed (and counted).
+                bool perspective = false;
+                for (const Triangle& t : frame.triangles) perspective |= t.perspective && !t.flat;
+                uint64_t bad = 0, off_by_one = 0;
                 for (uint32_t y = 0; y < h; y++)
-                    for (uint32_t x = 0; x < w; x++)
-                        if (!ref.ambiguous[ref.index(x, y)] && std::memcmp(d.pixel(x, y), g.pixel(x, y), 4) != 0) bad++;
-                std::printf("    golden image: %llu mismatching pixels\n", static_cast<unsigned long long>(bad));
+                    for (uint32_t x = 0; x < w; x++) {
+                        if (ref.ambiguous[ref.index(x, y)]) continue;
+                        const uint8_t* a = d.pixel(x, y);
+                        const uint8_t* b = g.pixel(x, y);
+                        if (std::memcmp(a, b, 4) == 0) continue;
+                        int worst = 0;
+                        for (int ch = 0; ch < 4; ch++) worst = std::max(worst, std::abs(static_cast<int>(a[ch]) - static_cast<int>(b[ch])));
+                        if (perspective && worst <= 1) off_by_one++; else bad++;
+                    }
+                std::printf("    golden image: %llu mismatching pixels", static_cast<unsigned long long>(bad));
+                if (perspective) std::printf(" (+ %llu within one level, allowed for perspective colours)", static_cast<unsigned long long>(off_by_one));
+                std::printf("\n");
                 all_ok &= bad == 0;
             }
         }

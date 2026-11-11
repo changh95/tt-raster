@@ -1,0 +1,284 @@
+diff --git a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h b/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
+index ddb67b3..3e97ec3 100644
+--- a/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/inline_sw_helper.h
+@@ -2,6 +2,7 @@
+ #ifndef INLINE_SW_HELPER_H
+ #define INLINE_SW_HELPER_H
+ 
++#include <stdlib.h>
+ #include "util/compiler.h"
+ #include "pipe/p_screen.h"
+ #include "util/u_debug.h"
+@@ -50,6 +51,12 @@ sw_screen_create_named(struct sw_winsys *winsys, const char *driver)
+ #if defined(GALLIUM_SOFTPIPE)
+    if (screen == NULL && strcmp(driver, "softpipe") == 0)
+       screen = softpipe_create_screen(winsys);
++
++   /* GALLIUM_DRIVER=tensix: softpipe with its libttraster fast path switched on (see sp_tensix.c) */
++   if (screen == NULL && strcmp(driver, "tensix") == 0) {
++      setenv("TTR_GL", "tensix", 0);
++      screen = softpipe_create_screen(winsys);
++   }
+ #endif
+ 
+ #if defined(GALLIUM_ZINK)
+diff --git a/src/gallium/auxiliary/target-helpers/sw_helper.h b/src/gallium/auxiliary/target-helpers/sw_helper.h
+index 65fadc4..350e625 100644
+--- a/src/gallium/auxiliary/target-helpers/sw_helper.h
++++ b/src/gallium/auxiliary/target-helpers/sw_helper.h
+@@ -2,6 +2,7 @@
+ #ifndef SW_HELPER_H
+ #define SW_HELPER_H
+ 
++#include <stdlib.h>
+ #include "util/compiler.h"
+ #include "util/u_debug.h"
+ #include "target-helpers/sw_helper_public.h"
+@@ -54,6 +55,12 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
+ #if defined(GALLIUM_SOFTPIPE)
+    if (screen == NULL && strcmp(driver, "softpipe") == 0)
+       screen = softpipe_create_screen(winsys);
++
++   /* GALLIUM_DRIVER=tensix: softpipe with its libttraster fast path switched on (see sp_tensix.c) */
++   if (screen == NULL && strcmp(driver, "tensix") == 0) {
++      setenv("TTR_GL", "tensix", 0);
++      screen = softpipe_create_screen(winsys);
++   }
+ #endif
+ 
+ #if defined(GALLIUM_ZINK)
+diff --git a/src/gallium/drivers/softpipe/meson.build b/src/gallium/drivers/softpipe/meson.build
+index 6b180ef..3cf5f55 100644
+--- a/src/gallium/drivers/softpipe/meson.build
++++ b/src/gallium/drivers/softpipe/meson.build
+@@ -56,6 +56,8 @@ files_softpipe = files(
+   'sp_texture.h',
+   'sp_tile_cache.c',
+   'sp_tile_cache.h',
++  'sp_tensix.c',
++  'sp_tensix.h',
+ )
+ 
+ libsoftpipe = static_library(
+@@ -64,7 +66,7 @@ libsoftpipe = static_library(
+   include_directories : [inc_gallium_aux, inc_gallium, inc_include, inc_src],
+   c_args : [c_msvc_compat_args],
+   gnu_symbol_visibility : 'hidden',
+-  dependencies : [idep_nir, idep_mesautil],
++  dependencies : [idep_nir, idep_mesautil, dep_dl],
+ )
+ 
+ driver_softpipe = declare_dependency(
+diff --git a/src/gallium/drivers/softpipe/sp_clear.c b/src/gallium/drivers/softpipe/sp_clear.c
+index feed7c2..a100de9 100644
+--- a/src/gallium/drivers/softpipe/sp_clear.c
++++ b/src/gallium/drivers/softpipe/sp_clear.c
+@@ -36,6 +36,7 @@
+ #include "util/u_pack_color.h"
+ #include "util/u_surface.h"
+ #include "sp_clear.h"
++#include "sp_tensix.h"
+ #include "sp_context.h"
+ #include "sp_screen.h"
+ #include "sp_query.h"
+@@ -92,4 +93,6 @@ softpipe_clear(struct pipe_context *pipe, unsigned buffers,
+    }
+ 
+    softpipe->dirty_render_cache = true;
++
++   sp_tensix_clear(softpipe->tensix, buffers, scissor_state, color, depth);
+ }
+diff --git a/src/gallium/drivers/softpipe/sp_context.c b/src/gallium/drivers/softpipe/sp_context.c
+index f4e0b9f..ccfe0bb 100644
+--- a/src/gallium/drivers/softpipe/sp_context.c
++++ b/src/gallium/drivers/softpipe/sp_context.c
+@@ -43,6 +43,7 @@
+ #include "sp_buffer.h"
+ #include "sp_clear.h"
+ #include "sp_context.h"
++#include "sp_tensix.h"
+ #include "sp_flush.h"
+ #include "sp_prim_vbuf.h"
+ #include "sp_state.h"
+@@ -63,6 +64,8 @@ softpipe_destroy( struct pipe_context *pipe )
+    struct softpipe_context *softpipe = softpipe_context( pipe );
+    uint i, sh;
+ 
++   sp_tensix_destroy(softpipe->tensix);
++
+    if (softpipe->blitter) {
+       util_blitter_destroy(softpipe->blitter);
+    }
+@@ -328,6 +331,8 @@ softpipe_create_context(struct pipe_screen *screen,
+ 
+    sp_init_surface_functions(softpipe);
+ 
++   softpipe->tensix = sp_tensix_create(softpipe);
++
+    return &softpipe->pipe;
+ 
+  fail:
+diff --git a/src/gallium/drivers/softpipe/sp_context.h b/src/gallium/drivers/softpipe/sp_context.h
+index 46cc466..9e3f793 100644
+--- a/src/gallium/drivers/softpipe/sp_context.h
++++ b/src/gallium/drivers/softpipe/sp_context.h
+@@ -49,6 +49,7 @@ struct softpipe_tex_tile_cache;
+ struct sp_fragment_shader;
+ struct sp_vertex_shader;
+ struct sp_velems_state;
++struct sp_tensix;
+ struct sp_so_state;
+ 
+ struct softpipe_context {
+@@ -175,6 +176,9 @@ struct softpipe_context {
+ 
+    bool dirty_render_cache;
+ 
++   /** Tensix fast path (sp_tensix.c); NULL unless enabled by the environment. */
++   struct sp_tensix *tensix;
++
+    struct softpipe_tile_cache *cbuf_cache[PIPE_MAX_COLOR_BUFS];
+    struct softpipe_tile_cache *zsbuf_cache;
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_draw_arrays.c b/src/gallium/drivers/softpipe/sp_draw_arrays.c
+index 17fe847..f2c6850 100644
+--- a/src/gallium/drivers/softpipe/sp_draw_arrays.c
++++ b/src/gallium/drivers/softpipe/sp_draw_arrays.c
+@@ -38,6 +38,7 @@
+ #include "util/u_prim.h"
+ 
+ #include "sp_context.h"
++#include "sp_tensix.h"
+ #include "sp_query.h"
+ #include "sp_state.h"
+ #include "sp_texture.h"
+@@ -92,6 +93,8 @@ softpipe_draw_vbo(struct pipe_context *pipe,
+       softpipe_update_derived(sp, sp->reduced_api_prim);
+    }
+ 
++   sp_tensix_begin_draw(sp->tensix, info);
++
+    /* Map vertex buffers */
+    for (i = 0; i < sp->num_vertex_buffers; i++) {
+       const void *buf = sp->vertex_buffer[i].is_user_buffer ?
+@@ -156,6 +159,8 @@ softpipe_draw_vbo(struct pipe_context *pipe,
+     */
+    draw_flush(draw);
+ 
++   sp_tensix_end_draw(sp->tensix);
++
+    /* Note: leave drawing surfaces mapped */
+    sp->dirty_render_cache = true;
+ }
+diff --git a/src/gallium/drivers/softpipe/sp_flush.c b/src/gallium/drivers/softpipe/sp_flush.c
+index a5c786d..e5c9425 100644
+--- a/src/gallium/drivers/softpipe/sp_flush.c
++++ b/src/gallium/drivers/softpipe/sp_flush.c
+@@ -34,6 +34,7 @@
+ #include "pipe/p_screen.h"
+ #include "draw/draw_context.h"
+ #include "sp_flush.h"
++#include "sp_tensix.h"
+ #include "sp_context.h"
+ #include "sp_state.h"
+ #include "sp_tile_cache.h"
+@@ -53,6 +54,8 @@ softpipe_flush( struct pipe_context *pipe,
+ 
+    draw_flush(softpipe->draw);
+ 
++   sp_tensix_flush(softpipe->tensix);
++
+    if (flags & SP_FLUSH_TEXTURE_CACHE) {
+       unsigned sh;
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_screen.c b/src/gallium/drivers/softpipe/sp_screen.c
+index a5e5628..b281393 100644
+--- a/src/gallium/drivers/softpipe/sp_screen.c
++++ b/src/gallium/drivers/softpipe/sp_screen.c
+@@ -43,6 +43,8 @@
+ #include "tgsi/tgsi_exec.h"
+ 
+ #include "sp_texture.h"
++#include <stdlib.h>
++#include <string.h>
+ #include "sp_screen.h"
+ #include "sp_context.h"
+ #include "sp_fence.h"
+@@ -71,7 +73,8 @@ softpipe_get_vendor(struct pipe_screen *screen)
+ static const char *
+ softpipe_get_name(struct pipe_screen *screen)
+ {
+-   return "softpipe";
++   const char *mode = getenv("TTR_GL");   /* the Tensix fast path is on: see sp_tensix.c */
++   return mode && *mode && strcmp(mode, "0") ? "tensix (softpipe)" : "softpipe";
+ }
+ 
+ static const nir_shader_compiler_options sp_compiler_options = {
+diff --git a/src/gallium/drivers/softpipe/sp_setup.c b/src/gallium/drivers/softpipe/sp_setup.c
+index 4bc0dfc..9da2ac4 100644
+--- a/src/gallium/drivers/softpipe/sp_setup.c
++++ b/src/gallium/drivers/softpipe/sp_setup.c
+@@ -37,6 +37,7 @@
+ #include "sp_quad.h"
+ #include "sp_quad_pipe.h"
+ #include "sp_setup.h"
++#include "sp_tensix.h"
+ #include "sp_state.h"
+ #include "draw/draw_context.h"
+ #include "pipe/p_shader_tokens.h"
+@@ -776,6 +777,12 @@ sp_setup_tri(struct setup_context *setup,
+    if (!setup_sort_vertices( setup, det, v0, v1, v2 ))
+       return;
+ 
++   if (sp_tensix_tri_active(setup->softpipe->tensix) &&
++       sp_tensix_tri(setup->softpipe->tensix, v0, v1, v2, setup->vprovoke)) {
++      /* culled and oriented like softpipe would; the rasterization itself is libttraster's */
++      return;
++   }
++
+    setup_tri_coefficients( setup );
+    setup_tri_edges( setup );
+ 
+diff --git a/src/gallium/drivers/softpipe/sp_state_surface.c b/src/gallium/drivers/softpipe/sp_state_surface.c
+index 6855a60..791c18f 100644
+--- a/src/gallium/drivers/softpipe/sp_state_surface.c
++++ b/src/gallium/drivers/softpipe/sp_state_surface.c
+@@ -30,6 +30,7 @@
+ 
+ #include "sp_context.h"
+ #include "sp_state.h"
++#include "sp_tensix.h"
+ #include "sp_tile_cache.h"
+ 
+ #include "draw/draw_context.h"
+@@ -53,6 +54,8 @@ softpipe_set_framebuffer_state(struct pipe_context *pipe,
+ 
+    draw_flush(sp->draw);
+ 
++   sp_tensix_framebuffer_changing(sp->tensix);
++
+    for (i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
+       /* check if changing cbuf */
+       if (!pipe_surface_equal(&sp->framebuffer.cbufs[i], &fb->cbufs[i])) {
+diff --git a/src/gallium/drivers/softpipe/sp_texture.c b/src/gallium/drivers/softpipe/sp_texture.c
+index dafb4ee..0dfb7f9 100644
+--- a/src/gallium/drivers/softpipe/sp_texture.c
++++ b/src/gallium/drivers/softpipe/sp_texture.c
+@@ -42,6 +42,7 @@
+ #include "sp_context.h"
+ #include "sp_flush.h"
+ #include "sp_texture.h"
++#include "sp_tensix.h"
+ #include "sp_screen.h"
+ 
+ #include "frontend/sw_winsys.h"
+@@ -310,6 +311,8 @@ softpipe_transfer_map(struct pipe_context *pipe,
+    assert(resource);
+    assert(level <= resource->last_level);
+ 
++   sp_tensix_resource_access(softpipe_context(pipe)->tensix, resource);
++
+    /* make sure the requested region is in the image bounds */
+    assert(box->x + box->width <= (int) u_minify(resource->width0, level));
+    if (resource->target == PIPE_TEXTURE_1D_ARRAY) {

@@ -103,6 +103,9 @@ SetupStatus snap_triangle(const Triangle& tri, CullMode cull, SnappedTriangle& o
         if (std::fabs(v.x) > kMaxInputCoord || std::fabs(v.y) > kMaxInputCoord) {
             return SetupStatus::OutOfRange;
         }
+        if (tri.perspective && !tri.flat && !(std::isfinite(v.rhw) && v.rhw > 0.0f)) {
+            return SetupStatus::NonFinite;
+        }
     }
     for (int i = 0; i < 3; i++) {
         // x * 16 is exact in FP32, nearbyint rounds ties to even in the default rounding mode.
@@ -210,6 +213,16 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
         for (int ch = 0; ch < 4; ch++) {
             color[ch] = fit_plane(s, tri.v[0].color[ch], tri.v[1].color[ch], tri.v[2].color[ch]);
         }
+        Plane inv_w;
+        const bool perspective = tri.perspective && !tri.flat;
+        if (perspective) {
+            for (int ch = 0; ch < 4; ch++) {
+                color[ch] = fit_plane(s, static_cast<double>(tri.v[0].color[ch]) * tri.v[0].rhw,
+                                      static_cast<double>(tri.v[1].color[ch]) * tri.v[1].rhw,
+                                      static_cast<double>(tri.v[2].color[ch]) * tri.v[2].rhw);
+            }
+            inv_w = fit_plane(s, tri.v[0].rhw, tri.v[1].rhw, tri.v[2].rhw);
+        }
         if (tri.flat) {
             for (int ch = 0; ch < 4; ch++) {
                 color[ch] = Plane{tri.v[0].color[ch], 0.0, 0.0};
@@ -262,6 +275,7 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
             t.piece = static_cast<uint32_t>(k);
             t.clipped = outside_guard;
             t.flat = tri.flat;
+            t.perspective = perspective;
             for (int i = 0; i < 3; i++) {
                 t.x[i] = static_cast<int32_t>(pieces[k][i][0]);
                 t.y[i] = static_cast<int32_t>(pieces[k][i][1]);
@@ -277,6 +291,7 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
             for (int ch = 0; ch < 4; ch++) {
                 t.color[ch] = color[ch];
             }
+            t.inv_w = inv_w;
             tris.push_back(t);
             made++;
         }

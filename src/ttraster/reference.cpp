@@ -63,6 +63,14 @@ Framebuffer render_reference(
                         for (int ch = 0; ch < 4; ch++) {
                             rgba[ch] = std::fmaf(p.color_gx[ch], ddx, std::fmaf(p.color_gy[ch], ddy, p.color_c[ch]));
                         }
+                        if (p.perspective) {
+                            // colour * rhw and rhw were interpolated: divide (the device multiplies by a
+                            // Newton-refined reciprocal, which can differ in the last float bit)
+                            const float q = 1.0f / std::fmaf(p.w_gx, ddx, std::fmaf(p.w_gy, ddy, p.w_c));
+                            for (int ch = 0; ch < 4; ch++) {
+                                rgba[ch] *= q;
+                            }
+                        }
                         fb.depth[idx] = z;
                         if (opt.float_planes) {
                             for (int ch = 0; ch < 4; ch++) {

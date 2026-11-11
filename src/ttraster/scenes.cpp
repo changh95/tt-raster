@@ -170,6 +170,46 @@ void scene_interpenetrating(Frame& f, uint32_t w, uint32_t h) {
     }
 }
 
+// A receding floor and 20 large smooth triangles with strongly varying 1/w, colours interpolated
+// perspective-correctly (Triangle::perspective).
+void scene_perspective(Frame& f, uint32_t w, uint32_t h) {
+    Rng rng(0x70657273ull);
+    const float W = static_cast<float>(w), H = static_cast<float>(h);
+    auto pv = [&](float x, float y, float z, float depth_w, float r, float g, float b) {
+        Vertex v = vtx(x, y, z, r, g, b);
+        v.rhw = 1.0f / depth_w;
+        return v;
+    };
+    // The floor: near edge at the bottom (w = 1), far edge at the top (w = 16).
+    Triangle a, b;
+    a.perspective = b.perspective = true;
+    a.v[0] = pv(0.05f * W, 0.95f * H, 0.1f, 1.0f, 1.0f, 0.1f, 0.1f);
+    a.v[1] = pv(0.95f * W, 0.95f * H, 0.1f, 1.0f, 0.1f, 1.0f, 0.1f);
+    a.v[2] = pv(0.65f * W, 0.35f * H, 0.9f, 16.0f, 0.1f, 0.1f, 1.0f);
+    b.v[0] = a.v[0];
+    b.v[1] = a.v[2];
+    b.v[2] = pv(0.35f * W, 0.35f * H, 0.9f, 16.0f, 1.0f, 1.0f, 0.1f);
+    f.triangles.push_back(a);
+    f.triangles.push_back(b);
+    for (int k = 0; k < 20; k++) {
+        const float cx = rng.range(0.25f, 0.75f) * W;
+        const float cy = rng.range(0.25f, 0.75f) * H;
+        Triangle t;
+        t.perspective = true;
+        for (int i = 0; i < 3; i++) {
+            const float dx = rng.range(-0.4f, 0.4f) * W;
+            const float dy = rng.range(-0.4f, 0.4f) * H;
+            const float z = rng.range(0.05f, 0.95f);
+            const float depth_w = rng.range(1.0f, 12.0f);
+            const float cr = rng.range(0.0f, 1.0f);
+            const float cg = rng.range(0.0f, 1.0f);
+            const float cb = rng.range(0.0f, 1.0f);
+            t.v[i] = pv(cx + dx, cy + dy, z, depth_w, cr, cg, cb);
+        }
+        f.triangles.push_back(t);
+    }
+}
+
 // One right triangle whose legs run far past the viewport, so that its edges need guard-band
 // clipping and the hypotenuse still lies beyond the far corner of the viewport.
 void scene_fullscreen(Frame& f, uint32_t w, uint32_t h) {
@@ -259,6 +299,7 @@ const std::vector<SceneInfo>& scene_list() {
         {"interpenetrating", "24 large flat triangles with random depths that cut through each other", false},
         {"fullscreen", "one right triangle covering the viewport, edges beyond the guard band", false},
         {"coplanar_lequal", "overlapping coplanar flat triangles under LESS_EQUAL: the last drawn wins ties", false},
+        {"perspective", "a receding floor and 20 large triangles with perspective-correct colours", false},
         {"tiny_10k", "10,000 triangles 1 to 6 pixels across", false},
         {"random_10k", "10,000 random triangles, 3 px to a third of the screen, partly off screen", false},
     };
@@ -273,6 +314,7 @@ bool make_scene(const std::string& name, uint32_t width, uint32_t height, Frame&
     else if (name == "interpenetrating") scene_interpenetrating(out, width, height);
     else if (name == "fullscreen") scene_fullscreen(out, width, height);
     else if (name == "coplanar_lequal") scene_coplanar(out, width, height);
+    else if (name == "perspective") scene_perspective(out, width, height);
     else if (name == "tiny_10k") scene_tiny(out, width, height);
     else if (name == "random_10k") scene_random(out, width, height);
     else return false;
