@@ -57,6 +57,21 @@ cmp_vk() {  # cmp_vk <name> <backend> <vk_offscreen args...>   (MAX_BAD: share o
     fi
 }
 
+cmp_present() {  # cmp_present <name> <backend> <vk_present args...>: frames through an X11 swapchain, read back from the X server
+    local name="$1" be="$2"; shift 2
+    "$root/scripts/run_vk.sh" --size 640x480 --backend off "$work/vk/vk_present" "$@" --out "$work/${name}_off.ppm" >"$work/${name}_off.log" 2>&1
+    TTR_LP_DEBUG=1 "$root/scripts/run_vk.sh" --size 640x480 --backend "$be" --node "$node" "$work/vk/vk_present" "$@" \
+        --out "$work/${name}_$be.ppm" >"$work/${name}_$be.log" 2>&1
+    local taken
+    taken="$(grep -c 'frame rendered' "$work/${name}_$be.log" || true)"
+    if "$py" "$root/api/gl/tests/compare_ppm.py" "$work/${name}_off.ppm" "$work/${name}_$be.ppm" --max-bad "${MAX_BAD:-0.002}" >"$work/cmp.txt" && [[ "$taken" -gt 0 ]] &&
+       grep -q "differ in 0 of" "$work/${name}_$be.log"; then
+        echo "ok   Vulkan $name ($be, $taken frame(s) offloaded, window equals the copy of the image): $(sed 's/.*ppm: //' "$work/cmp.txt")"
+    else
+        echo "FAIL Vulkan $name ($be): offloaded $taken, $(sed 's/.*ppm: //' "$work/cmp.txt"); $(grep differ "$work/${name}_$be.log")"; fail=1
+    fi
+}
+
 backends=(reference)
 [[ -n "${TT_METAL_HOME:-}" ]] && backends+=(tensix)
 for be in "${backends[@]}"; do
@@ -78,6 +93,7 @@ for be in "${backends[@]}"; do
     cmp_gl uniform "$be" --fs uniform --continue --frames 3
     MAX_BAD=0.005 cmp_vk triangles "$be" --size 320x240 --tris 3000   # 3000 triangles of about 25 pixels: edge pixels are a larger share
     cmp_vk shader "$be" --size 320x240 --tris 0 --layers 2
+    cmp_present swapchain "$be" --tris 2000 --frames 4
 done
 if [[ -n "${TT_METAL_HOME:-}" ]]; then
     COMPILE=1 cmp_vk shader_compiled tensix --size 640x360 --tris 0 --layers 3

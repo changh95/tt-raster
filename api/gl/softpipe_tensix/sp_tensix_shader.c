@@ -304,13 +304,15 @@ get_src(struct xl *x, const struct tgsi_full_src_register *s, unsigned lane, str
          *o = imm_bits(x, bits == 0xffffffffu ? 0x3f800000u : bits);
       }
       break;
-   case TGSI_FILE_CONSTANT:
-      if (s->Register.Dimension && (s->Dimension.Index != 0 || s->Dimension.Indirect))
-         return fail(x, "uniform buffer object");
-      if (s->Register.Index < 0)
+   case TGSI_FILE_CONSTANT: {
+      if (s->Register.Dimension && (s->Dimension.Index < 0 || s->Dimension.Index >= TTR_MAX_CBUFS || s->Dimension.Indirect))
+         return fail(x, "uniform buffer object with a run-time index");
+      if (s->Register.Index < 0 || s->Register.Indirect || (uint32_t)s->Register.Index >= (1u << 22))
          return fail(x, "constant index");
-      *o = uni_op(x, (uint32_t)s->Register.Index * 4 + c);
+      const uint32_t buf = s->Register.Dimension ? (uint32_t)s->Dimension.Index : 0;
+      *o = uni_op(x, (buf << 24) | ((uint32_t)s->Register.Index * 4 + c));
       break;
+   }
    default:
       return fail(x, "unsupported source register file");
    }
@@ -408,15 +410,16 @@ f_load(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, in
 {
    const struct tgsi_full_src_register *b = &inst->Src[0], *o = &inst->Src[1];
    if (b->Register.File != TGSI_FILE_CONSTANT || b->Register.Indirect || b->Register.Index != 0 ||
-       (b->Register.Dimension && (b->Dimension.Index != 0 || b->Dimension.Indirect)))
-      return fail(x, "buffer load other than constant buffer 0");
+       (b->Register.Dimension && (b->Dimension.Index < 0 || b->Dimension.Index >= TTR_MAX_CBUFS || b->Dimension.Indirect)))
+      return fail(x, "buffer load other than from a constant buffer");
+   const uint32_t buf = b->Register.Dimension ? (uint32_t)b->Dimension.Index : 0;
    if (o->Register.File != TGSI_FILE_IMMEDIATE || o->Register.Indirect || o->Register.Index < 0 || (unsigned)o->Register.Index >= x->n_timm)
       return fail(x, "constant load with a run-time offset");
    const unsigned swz4[4] = {o->Register.SwizzleX, o->Register.SwizzleY, o->Register.SwizzleZ, o->Register.SwizzleW};
    const uint32_t bytes = x->timm[o->Register.Index][swz4[lane]];
-   if (bytes % 4)
+   if (bytes % 4 || bytes / 4 + lane >= (1u << 24))
       return fail(x, "unaligned constant load");
-   emit(x, TTR_OP_MOV, dst, uni_op(x, bytes / 4 + lane), none(), none(), sat);
+   emit(x, TTR_OP_MOV, dst, uni_op(x, (buf << 24) | (bytes / 4 + lane)), none(), none(), sat);
    return true;
 }
 
@@ -1220,18 +1223,29 @@ ttr_prog_free(struct ttr_prog *p)
 }
 
 bool
-ttr_prog_constants(const struct ttr_prog *p, const float *cbuf, unsigned cbuf_bytes, unsigned fb_height, float *out)
+ttr_prog_constants_multi(const struct ttr_prog *p, const struct ttr_prog_cbuf *bufs, unsigned fb_height, float *out)
 {
    memcpy(out, p->consts, p->n_imm * sizeof(float));
    for (unsigned k = 0; k < p->n_consts - p->n_imm; k++) {
-      const uint32_t idx = p->uniform_index[k];
-      if (idx == HEIGHT_MARK) {
+      const uint32_t key = p->uniform_index[k];
+      if (key == HEIGHT_MARK) {
          out[p->n_imm + k] = (float)fb_height - p->height_offset;
          continue;
       }
-      if ((size_t)(idx + 1) * sizeof(float) > cbuf_bytes || !cbuf)
+      const struct ttr_prog_cbuf *cb = &bufs[key >> 24];
+      const uint32_t idx = key & 0xffffffu;
+      if (!cb->data || (size_t)(idx + 1) * sizeof(float) > cb->bytes)
          return false;
-      out[p->n_imm + k] = cbuf[idx];
+      out[p->n_imm + k] = cb->data[idx];
    }
    return true;
+}
+
+bool
+ttr_prog_constants(const struct ttr_prog *p, const float *cbuf, unsigned cbuf_bytes, unsigned fb_height, float *out)
+{
+   struct ttr_prog_cbuf bufs[TTR_MAX_CBUFS] = {{0}};
+   bufs[0].data = cbuf;
+   bufs[0].bytes = cbuf_bytes;
+   return ttr_prog_constants_multi(p, bufs, fb_height, out);
 }

@@ -31,7 +31,7 @@ struct ttr_prog {
    uint32_t n_instr;
    float *consts;           /* immediates first (n_imm), then one slot per uniform component the program reads */
    uint32_t n_imm, n_consts;
-   uint32_t *uniform_index; /* for const slot n_imm + k: the float index into constant buffer 0 */
+   uint32_t *uniform_index; /* for const slot n_imm + k: (constant buffer << 24) | float index in it (HEIGHT_MARK: the framebuffer height) */
    uint32_t num_inputs;     /* varying components: program input register k is (map[k].input, map[k].comp) */
    struct ttr_prog_input map[32];
    uint32_t num_regs, out_reg;
@@ -48,9 +48,18 @@ struct ttr_prog *ttr_prog_translate(const struct tgsi_token *tokens, const char 
 struct ttr_prog *ttr_prog_translate_ex(const struct tgsi_token *tokens, const char **why, bool origin_in_shader);
 void ttr_prog_free(struct ttr_prog *p);
 
+/* Constant buffers a program may read (llvmpipe's PIPE_MAX_CONSTANT_BUFFERS). */
+#define TTR_MAX_CBUFS 16
+struct ttr_prog_cbuf {
+   const float *data;
+   unsigned bytes;
+};
+
 /* The constant table of the program for the current constants: immediates, then uniforms read from `cbuf` (constant
  * buffer 0, `cbuf_bytes` long), and the framebuffer height where the program needs it. `out` has p->n_consts floats. Returns
  * false if a uniform lies outside the buffer. */
 bool ttr_prog_constants(const struct ttr_prog *p, const float *cbuf, unsigned cbuf_bytes, unsigned fb_height, float *out);
+/* The same with all constant buffers (`bufs` has TTR_MAX_CBUFS entries; a program's uniform slot names its buffer and float index). */
+bool ttr_prog_constants_multi(const struct ttr_prog *p, const struct ttr_prog_cbuf *bufs, unsigned fb_height, float *out);
 
 #endif

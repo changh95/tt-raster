@@ -368,6 +368,8 @@ get_program(struct lp_tensix *t, const struct lp_fragment_shader *fs, const char
       NIR_PASS(_, clone, nir_lower_global_vars_to_local);
       NIR_PASS(_, clone, nir_lower_vars_to_ssa);
       NIR_PASS(_, clone, nir_opt_dce);
+      if (t->debug_tgsi)
+         nir_print_shader(clone, stderr);
       const struct tgsi_token *tok = nir_to_tgsi(clone, t->lp->pipe.screen);
       if (!tok) {
          reason = "nir_to_tgsi failed";
@@ -390,6 +392,30 @@ get_program(struct lp_tensix *t, const struct lp_fragment_shader *fs, const char
    t->shaders[slot].why = reason;
    *why = reason;
    return prog;
+}
+
+/* nir_to_tgsi does not survive every intrinsic llvmpipe's shaders can contain (bindless image loads of input attachments, global and
+ * shared memory, atomics, barriers): refuse those shaders before converting them. */
+static bool
+shader_nir_ok(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex)
+               return false;
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const char *name = nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name;
+            if (strstr(name, "image") || strstr(name, "bindless") || strstr(name, "global") || strstr(name, "shared") ||
+                strstr(name, "ssbo") || strstr(name, "atomic") || strstr(name, "barrier") || strstr(name, "scratch") ||
+                strstr(name, "fbfetch") || strstr(name, "const_buf_base_addr") || strstr(name, "sample_") || strstr(name, "ballot") ||
+                strstr(name, "subgroup") || strstr(name, "vote") || strstr(name, "shuffle") || strstr(name, "quad"))
+               return false;
+         }
+      }
+   }
+   return true;
 }
 
 /* Why the current state cannot be offloaded, or NULL (and fills in the draw's description). */
@@ -476,8 +502,11 @@ state_refused(struct lp_tensix *t)
       return "no fragment shader";
    /* What the shader uses decides, not what is bound (lavapipe binds null descriptors whatever the shader does). */
    const nir_shader *nir = fs->base.ir.nir;
-   if (!nir || BITSET_LAST_BIT(nir->info.textures_used) || BITSET_LAST_BIT(nir->info.images_used) || nir->info.num_ssbos)
+   if (!nir || BITSET_LAST_BIT(nir->info.textures_used) || BITSET_LAST_BIT(nir->info.images_used) || nir->info.num_ssbos ||
+       nir->info.num_textures || nir->info.num_images || nir->info.fs.uses_fbfetch_output || nir->info.writes_memory)
       return "textures, images or storage buffers";
+   if (!shader_nir_ok(nir))
+      return "shader uses bindless resources, memory or other intrinsics the converter cannot take";
    const char *why = NULL;
    const struct lp_ttr_prog *prog = get_program(t, fs, &why);
    t->shaded = false;
@@ -592,7 +621,7 @@ apply_clear(struct lp_tensix *t)
       c.f[i] = t->clear_color[i];
    const bool was_busy = t->busy;
    t->busy = true;   /* the clear passes through our hook */
-   lp_setup_clear(t->setup, &c, t->clear_depth, 0, PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH);
+   lp_setup_clear(t->setup, &c, t->clear_depth, 0, PIPE_CLEAR_COLOR0 | (t->zbuf ? PIPE_CLEAR_DEPTH : 0));
    t->busy = was_busy;
 }
 
@@ -873,25 +902,29 @@ register_shader(struct lp_tensix *t)
 {
    const struct lp_ttr_prog *p = t->prog;
    float consts[1024];
-   const struct pipe_constant_buffer *cb = &t->lp->constants[MESA_SHADER_FRAGMENT][0];
-   const uint8_t *data = NULL;
-   unsigned size = 0;
-   if (cb->user_buffer) {
-      data = cb->user_buffer;
-      size = cb->buffer_size;
-   } else if (cb->buffer) {
-      data = (const uint8_t *)llvmpipe_resource_data(cb->buffer) + cb->buffer_offset;
-      size = cb->buffer_size;
+   /* Every constant buffer the program reads: buffer 0 holds uniforms, push constants and driver state, the others are uniform buffers
+    * (lavapipe binds descriptor-set UBOs to the constant buffer slots). */
+   struct lp_ttr_prog_cbuf bufs[TTR_MAX_CBUFS];
+   memset(bufs, 0, sizeof bufs);
+   for (unsigned b = 0; b < TTR_MAX_CBUFS && b < PIPE_MAX_CONSTANT_BUFFERS; b++) {
+      const struct pipe_constant_buffer *cb = &t->lp->constants[MESA_SHADER_FRAGMENT][b];
+      if (cb->user_buffer) {
+         bufs[b].data = cb->user_buffer;
+         bufs[b].bytes = cb->buffer_size;
+      } else if (cb->buffer) {
+         bufs[b].data = (const float *)((const uint8_t *)llvmpipe_resource_data(cb->buffer) + cb->buffer_offset);
+         bufs[b].bytes = cb->buffer_size;
+      }
    }
-   if (!lp_ttr_prog_constants(p, (const float *)data, size, t->lp->framebuffer.height, consts))
+   if (!lp_ttr_prog_constants_multi(p, bufs, t->lp->framebuffer.height, consts))
       return "uniform outside the constant buffer";
    if (t->debug_tgsi) {
-      fprintf(stderr, "tensix: constant buffer %u bytes at %p, program constants:", size, (const void *)data);
+      fprintf(stderr, "tensix: constant buffer 0 %u bytes at %p, program constants:", bufs[0].bytes, (const void *)bufs[0].data);
       for (unsigned i = 0; i < p->n_consts && i < 16; i++)
          fprintf(stderr, " %g", consts[i]);
       fprintf(stderr, " | buffer floats:");
-      for (unsigned i = 0; data && i < size / 4 && i < 8; i++)
-         fprintf(stderr, " %g", ((const float *)data)[i]);
+      for (unsigned i = 0; bufs[0].data && i < bufs[0].bytes / 4 && i < 8; i++)
+         fprintf(stderr, " %g", bufs[0].data[i]);
       fprintf(stderr, " | fragcoord_reg %d\n", p->fragcoord_reg);
    }
    const ttr_shader_desc desc = {p->code, p->n_instr, consts, p->n_consts, p->num_inputs, p->num_regs, p->out_reg, p->fragcoord_reg};

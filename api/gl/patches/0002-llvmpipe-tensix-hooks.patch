@@ -1,3 +1,25 @@
+diff --git a/src/gallium/drivers/llvmpipe/lp_screen.c b/src/gallium/drivers/llvmpipe/lp_screen.c
+index c7ae705..4d739f5 100644
+--- a/src/gallium/drivers/llvmpipe/lp_screen.c
++++ b/src/gallium/drivers/llvmpipe/lp_screen.c
+@@ -57,6 +57,7 @@
+ #include "lp_rast.h"
+ #include "lp_cs_tpool.h"
+ #include "lp_flush.h"
++#include "lp_tensix.h"
+ 
+ #include "frontend/sw_winsys.h"
+ 
+@@ -339,7 +340,8 @@ llvmpipe_init_screen_caps(struct pipe_screen *screen)
+    caps->device_reset_status_query = true;
+    caps->robust_buffer_access_behavior = true;
+    caps->max_shader_patch_varyings = 32;
+-   caps->rasterizer_subpixel_bits = 8;
++   /* The Tensix offload snaps vertices to a 1/16 pixel grid; a driver that offloads reports what its coarsest path does. */
++   caps->rasterizer_subpixel_bits = lp_tensix_enabled() ? 4 : 8;
+    caps->pci_group =
+    caps->pci_bus =
+    caps->pci_device =
 diff --git a/src/gallium/drivers/llvmpipe/lp_setup.c b/src/gallium/drivers/llvmpipe/lp_setup.c
 index 527d372..0f321f2 100644
 --- a/src/gallium/drivers/llvmpipe/lp_setup.c
