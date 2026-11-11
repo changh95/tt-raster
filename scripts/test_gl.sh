@@ -90,4 +90,10 @@ for c in "${cases[@]}"; do
         done
     fi
 done
+# Random GLSL fragment shaders: the translator against stock softpipe (CPU backend), and some of them on the chip.
+echo "== random GLSL shaders"
+if ! "$py" "$root/mesa/tests/fuzz_glsl.py" --count 150 --seed 1 --keep "$work/fuzz"; then fail=1; fi
+if [[ -n "${TT_METAL_HOME:-}" ]]; then
+    if ! "$py" "$root/mesa/tests/fuzz_glsl.py" --count 12 --seed 7000 --backend tensix --node "$node" --keep "$work/fuzz_tx"; then fail=1; fi
+fi
 [[ $fail -eq 0 ]] && echo "GL tests OK" || { echo "GL tests FAILED"; exit 1; }

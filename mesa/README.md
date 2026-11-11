@@ -37,9 +37,11 @@ and uniforms are read into the program's constant table at every draw.
 What the translator expands: every TGSI vec4 instruction per component (swizzles, write masks, negate and absolute value, saturate);
 `MOV ADD MUL MAD FMA MIN MAX LRP DIV`, `DP2 DP3 DP4`, `RCP RSQ SQRT EX2 LG2 POW SIN COS`, `FRC FLR CEIL TRUNC SSG`, the compares and
 `CMP UCMP`, `KILL KILL_IF` (`discard`), `IF/ELSE/ENDIF` (if-converted: both sides run and the writes are selected by a lane mask),
-`gl_FragCoord` (with Mesa's origin and pixel-centre conventions), constants and uniforms, boolean to float conversion. Loops the GLSL
+`gl_FragCoord` (with Mesa's origin and pixel-centre conventions), constants and uniforms, boolean to float conversion and the logic of
+`&&`, `||`, `!`. Loops the GLSL
 compiler unrolled are straight-line code and work; a loop with run-time bounds is refused, and so are textures, derivatives, indirect
-addressing and integer arithmetic. A refused shader means that draw (and the rest of the frame) runs on softpipe, with a message.
+addressing and integer arithmetic. `tests/fuzz_glsl.py` draws random GLSL shaders with stock softpipe and with the fast path and compares the images
+(`scripts/test_gl.sh` runs it). A refused shader means that draw (and the rest of the frame) runs on softpipe, with a message.
 A frame with arithmetic fragment shaders has an RGBA8 target on the rasterizer (colour is quantized with every write, blending reads
 the quantized colour), which is also what softpipe does.
 

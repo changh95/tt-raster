@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "pipe/p_shader_tokens.h"
+#include "tgsi/tgsi_info.h"
 #include "tgsi/tgsi_parse.h"
 #include "util/u_memory.h"
 
@@ -55,6 +56,7 @@ struct vi {
 
 struct ifctx {
    int mask, cond, parent;
+   int if_mask;   /* on the ELSE side: the mask of the IF side, whose comparison results join the ELSE side's (store_lane); else -1 */
 };
 
 struct xl {
@@ -65,6 +67,12 @@ struct xl {
    uint32_t uni[TTR_MAX_CONSTS];
    unsigned n_uni;
    uint8_t *defined;
+   /* A vreg that holds a comparison result (1.0 or 0.0): written by a compare, AND/OR/XOR/NOT of such, or a move of one. A write
+    * under a lane mask only makes the register a comparison result for the lanes of that mask, so reads inside the region (the
+    * mask is on the stack) see one, reads after the ENDIF do not unless the value it overwrote was one too (bool_scope: the mask
+    * the property is limited to, -1 for all lanes). */
+   uint8_t *is_bool;
+   int32_t *bool_scope;
    int next_scratch;
    int in_slot[MAX_IN_DECL][4];
    unsigned n_in;
@@ -175,8 +183,11 @@ emit(struct xl *x, uint8_t op, int dst, struct opnd a, struct opnd b, struct opn
    i->s[0] = a;
    i->s[1] = b;
    i->s[2] = c;
-   if (dst >= 0)
+   if (dst >= 0) {
       x->defined[dst] = 1;
+      x->is_bool[dst] = 0;   /* the instruction translators that produce a comparison result say so afterwards */
+      x->bool_scope[dst] = -1;
+   }
 }
 
 /* A register that was never written reads as 0 (TGSI leaves it undefined; the device must not read stale rows). */
@@ -191,6 +202,20 @@ static int
 cur_mask(const struct xl *x)
 {
    return x->depth ? x->stack[x->depth - 1].mask : -1;
+}
+
+/* Does register `v` hold a comparison result in the lanes that are active here? */
+static bool
+bool_now(const struct xl *x, int v)
+{
+   if (!x->is_bool[v])
+      return false;
+   if (x->bool_scope[v] < 0)
+      return true;
+   for (int i = 0; i < x->depth; i++)
+      if (x->stack[i].mask == x->bool_scope[v])
+         return true;
+   return false;
 }
 
 /* The fragment coordinate as softpipe gives it to TGSI (sp_setup.c, setup_fragcoord_coeff): x + 0.5 or x for an integer pixel
@@ -272,7 +297,12 @@ get_src(struct xl *x, const struct tgsi_full_src_register *s, unsigned lane, str
    case TGSI_FILE_IMMEDIATE:
       if (s->Register.Index < 0 || (unsigned)s->Register.Index >= x->n_timm)
          return fail(x, "immediate index");
-      *o = imm_bits(x, x->timm[s->Register.Index][c]);
+      {
+         /* "True" of an integer mask is all ones, which as a float is a NaN: comparison results are 1.0 in this instruction set
+          * (see f_and), so the constant is 1.0 here. NIR writes it for the taken side of a short-circuit || or &&. */
+         const uint32_t bits = x->timm[s->Register.Index][c];
+         *o = imm_bits(x, bits == 0xffffffffu ? 0x3f800000u : bits);
+      }
       break;
    case TGSI_FILE_CONSTANT:
       if (s->Register.Dimension && (s->Dimension.Index != 0 || s->Dimension.Indirect))
@@ -351,6 +381,16 @@ typedef bool (*lane_fn)(struct xl *x, const struct tgsi_full_instruction *inst, 
       emit(x, OP, dst, b, a, none(), sat);                                                                        \
       return true;                                                                                                \
    }
+/* Comparisons: 1.0 or 0.0, which is also what the integer masks of FSLT & co. are in this instruction set (see f_and). */
+#define LANE_CMP(NAME, OP, SWAP)                                                                                  \
+   static bool NAME(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)    \
+   {                                                                                                              \
+      SRC(0, lane, a)                                                                                             \
+      SRC(1, lane, b)                                                                                             \
+      emit(x, OP, dst, SWAP ? b : a, SWAP ? a : b, none(), sat);                                                  \
+      x->is_bool[dst] = !sat;                                                                                     \
+      return true;                                                                                                \
+   }
 #define LANE_OP3(NAME, OP)                                                                                        \
    static bool NAME(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)    \
    {                                                                                                              \
@@ -361,19 +401,29 @@ typedef bool (*lane_fn)(struct xl *x, const struct tgsi_full_instruction *inst, 
       return true;                                                                                                \
    }
 
-LANE_OP1(f_mov, TTR_OP_MOV)
+/* A move keeps the comparison-result property of its source. */
+static bool
+f_mov(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)
+{
+   SRC(0, lane, a)
+   emit(x, TTR_OP_MOV, dst, a, none(), none(), sat);
+   if (!a.neg && !a.abs && !sat &&
+       ((a.kind == K_REG && bool_now(x, a.id)) || (a.kind == K_IMM && (x->imm[a.id] == 0u || x->imm[a.id] == 0x3f800000u))))
+      x->is_bool[dst] = 1;
+   return true;
+}
 LANE_OP1(f_frc, TTR_OP_FRC)
 LANE_OP1(f_flr, TTR_OP_FLR)
 LANE_OP2(f_add, TTR_OP_ADD)
 LANE_OP2(f_mul, TTR_OP_MUL)
 LANE_OP2(f_min, TTR_OP_MIN)
 LANE_OP2(f_max, TTR_OP_MAX)
-LANE_OP2(f_slt, TTR_OP_SLT)
-LANE_OP2(f_sge, TTR_OP_SGE)
-LANE_OP2(f_seq, TTR_OP_SEQ)
-LANE_OP2(f_sne, TTR_OP_SNE)
-LANE_OP2_SWAPPED(f_sgt, TTR_OP_SLT) /* a > b is b < a */
-LANE_OP2_SWAPPED(f_sle, TTR_OP_SGE) /* a <= b is b >= a */
+LANE_CMP(f_slt, TTR_OP_SLT, false)
+LANE_CMP(f_sge, TTR_OP_SGE, false)
+LANE_CMP(f_seq, TTR_OP_SEQ, false)
+LANE_CMP(f_sne, TTR_OP_SNE, false)
+LANE_CMP(f_sgt, TTR_OP_SLT, true) /* a > b is b < a */
+LANE_CMP(f_sle, TTR_OP_SGE, true) /* a <= b is b >= a */
 LANE_OP3(f_mad, TTR_OP_MAD)
 LANE_OP3(f_cmp, TTR_OP_CMP)
 LANE_OP3(f_ucmp, TTR_OP_SEL)
@@ -445,8 +495,21 @@ f_div(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int
    return true;
 }
 
-/* Boolean to float: AND of a comparison result with the bits of 1.0f. The comparisons of this instruction set already produce
- * 1.0 or 0.0, so the AND is a move of the other operand. */
+/* A comparison result as an operand of a bitwise instruction: a register that holds one, or the constants of "true" (all
+ * ones) and "false" (zero), which become 1.0 and 0.0. Anything else is an integer the instruction set cannot represent. */
+static bool
+bool_operand(struct xl *x, struct opnd *o)
+{
+   if (o->neg || o->abs)
+      return false;
+   if (o->kind == K_REG)
+      return bool_now(x, o->id);
+   /* The constants of "false" (0) and "true" (all ones, read as 1.0, see get_src). */
+   return o->kind == K_IMM && (x->imm[o->id] == 0u || x->imm[o->id] == 0x3f800000u);
+}
+
+/* AND: either the boolean to float conversion (a comparison result AND the bits of 1.0f, which in this instruction set is a move,
+ * since comparisons produce 1.0 or 0.0), or the conjunction of two comparison results (a product). */
 static bool
 f_and(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)
 {
@@ -454,9 +517,50 @@ f_and(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int
    SRC(1, lane, b)
    const bool a_one = a.kind == K_IMM && x->imm[a.id] == 0x3f800000u;
    const bool b_one = b.kind == K_IMM && x->imm[b.id] == 0x3f800000u;
-   if (!a_one && !b_one)
+   if (a_one || b_one) {
+      emit(x, TTR_OP_MOV, dst, b_one ? a : b, none(), none(), sat);
+      return true;
+   }
+   if (!sat && bool_operand(x, &a) && bool_operand(x, &b)) {
+      emit(x, TTR_OP_MUL, dst, a, b, none(), false);
+      x->is_bool[dst] = 1;
+      return true;
+   }
+   return fail(x, "integer or bitwise operation");
+}
+
+static bool
+f_or(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)
+{
+   SRC(0, lane, a)
+   SRC(1, lane, b)
+   if (sat || !bool_operand(x, &a) || !bool_operand(x, &b))
       return fail(x, "integer or bitwise operation");
-   emit(x, TTR_OP_MOV, dst, b_one ? a : b, none(), none(), sat);
+   emit(x, TTR_OP_MAX, dst, a, b, none(), false);
+   x->is_bool[dst] = 1;
+   return true;
+}
+
+static bool
+f_xor(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)
+{
+   SRC(0, lane, a)
+   SRC(1, lane, b)
+   if (sat || !bool_operand(x, &a) || !bool_operand(x, &b))
+      return fail(x, "integer or bitwise operation");
+   emit(x, TTR_OP_SNE, dst, a, b, none(), false);
+   x->is_bool[dst] = 1;
+   return true;
+}
+
+static bool
+f_not(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)
+{
+   SRC(0, lane, a)
+   if (sat || !bool_operand(x, &a))
+      return fail(x, "integer or bitwise operation");
+   emit(x, TTR_OP_SEQ, dst, a, imm_f(x, 0.0f), none(), false);   /* NOT: true where the comparison result is 0 */
+   x->is_bool[dst] = 1;
    return true;
 }
 
@@ -486,11 +590,26 @@ static void
 store_lane(struct xl *x, int dst, int value)
 {
    const int m = cur_mask(x);
+   const bool value_bool = x->is_bool[value];
    if (m >= 0) {
+      const bool old_bool = !x->defined[dst] || bool_now(x, dst);   /* an unwritten register reads as 0 */
+      int scope = x->defined[dst] && x->is_bool[dst] ? x->bool_scope[dst] : -1;
+      if (!old_bool) {
+         scope = m;
+         /* Both sides of one IF/ELSE wrote a comparison result: it is one wherever the whole construct is active. */
+         const struct ifctx *c = &x->stack[x->depth - 1];
+         if (x->is_bool[dst] && c->if_mask >= 0 && x->bool_scope[dst] == c->if_mask)
+            scope = c->parent;
+      }
       ensure_defined(x, dst);
       emit(x, TTR_OP_SEL, dst, reg(m), reg(value), reg(dst), false);
+      if (value_bool) {
+         x->is_bool[dst] = 1;
+         x->bool_scope[dst] = scope;
+      }
    } else {
       emit(x, TTR_OP_MOV, dst, reg(value), none(), none(), false);
+      x->is_bool[dst] = value_bool;
    }
 }
 
@@ -625,6 +744,7 @@ tr_if(struct xl *x, const struct tgsi_full_instruction *inst)
    x->stack[x->depth].mask = mk;
    x->stack[x->depth].cond = m;
    x->stack[x->depth].parent = parent;
+   x->stack[x->depth].if_mask = -1;
    x->depth++;
    return true;
 }
@@ -642,6 +762,7 @@ tr_else(struct xl *x)
       mk = new_scratch(x);
       emit(x, TTR_OP_MUL, mk, reg(c->parent), reg(inv), none(), false);
    }
+   c->if_mask = c->mask;
    c->mask = mk;
    return true;
 }
@@ -709,6 +830,9 @@ translate_inst(struct xl *x, const struct tgsi_full_instruction *inst)
    case TGSI_OPCODE_LRP: return tr_lanes(x, inst, f_lrp);
    case TGSI_OPCODE_DIV: return tr_lanes(x, inst, f_div);
    case TGSI_OPCODE_AND: return tr_lanes(x, inst, f_and);
+   case TGSI_OPCODE_OR: return tr_lanes(x, inst, f_or);
+   case TGSI_OPCODE_XOR: return tr_lanes(x, inst, f_xor);
+   case TGSI_OPCODE_NOT: return tr_lanes(x, inst, f_not);
    case TGSI_OPCODE_RCP: return tr_scalar(x, inst, s_rcp);
    case TGSI_OPCODE_RSQ: return tr_scalar(x, inst, s_rsq);
    case TGSI_OPCODE_SQRT: return tr_scalar(x, inst, s_sqrt);
@@ -758,7 +882,11 @@ translate_inst(struct xl *x, const struct tgsi_full_instruction *inst)
    case TGSI_OPCODE_DDY:
    case TGSI_OPCODE_DDX_FINE:
    case TGSI_OPCODE_DDY_FINE: return fail(x, "derivatives");
-   default: return fail(x, "TGSI opcode without a translation");
+   default: {
+      static __thread char msg[64];
+      snprintf(msg, sizeof msg, "TGSI opcode %s without a translation", tgsi_get_opcode_name(inst->Instruction.Opcode));
+      return fail(x, msg);
+   }
    }
 }
 
@@ -955,9 +1083,13 @@ ttr_prog_translate(const struct tgsi_token *tokens, const char **why)
    }
    x->v = MALLOC(MAX_VI * sizeof(struct vi));
    x->defined = CALLOC(MAX_VREGS, 1);
-   if (!x->v || !x->defined) {
+   x->is_bool = CALLOC(MAX_VREGS, 1);
+   x->bool_scope = CALLOC(MAX_VREGS, sizeof(int32_t));
+   if (!x->v || !x->defined || !x->is_bool || !x->bool_scope) {
       FREE(x->v);
       FREE(x->defined);
+      FREE(x->is_bool);
+      FREE(x->bool_scope);
       FREE(x);
       *why = oom;
       return NULL;
@@ -1043,6 +1175,8 @@ ttr_prog_translate(const struct tgsi_token *tokens, const char **why)
 out:
    FREE(x->v);
    FREE(x->defined);
+   FREE(x->is_bool);
+   FREE(x->bool_scope);
    FREE(x);
    return result;
 }

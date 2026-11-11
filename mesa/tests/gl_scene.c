@@ -2,7 +2,7 @@
  *
  * Deterministic fixed-function OpenGL test scene for the softpipe fast path (mesa/README.md).
  *
- *   gl_scene [--glsl|--glsl-alu|--fs NAME] [--sphere] [--frames N] [--size S] [--dump PREFIX] [--blend|--blend-sep] [--depthmask] [--nodepth] [--lighting] [--cull] [--swap] [--ortho] [--depth] [--continue]
+ *   gl_scene [--glsl|--glsl-alu|--fs NAME|--fs-file PATH] [--sphere] [--frames N] [--size S] [--dump PREFIX] [--blend|--blend-sep] [--depthmask] [--nodepth] [--lighting] [--cull] [--swap] [--ortho] [--depth] [--continue]
  *
  * Draws N frames (rotation angle = frame index), reads every frame back with glReadPixels and, with --dump,
  * writes PREFIX<frame>.ppm. --blend draws one extra alpha-blended triangle; --blend-sep the same with separate alpha
@@ -10,7 +10,8 @@
  * writes off, then an opaque triangle behind them; --nodepth an overlay drawn with the depth test off; --lighting uses fixed-function lighting; --cull enables back-face culling; --swap also
  * calls glXSwapBuffers every frame; --glsl draws with a GLSL 1.20 program (lighting in the vertex shader, the fragment
  * shader passes the colour through), --glsl-alu has a fragment shader with arithmetic, --fs NAME one of the fragment shaders
- * of the table fs_cases (lighting, procedural, discard, conditionals, loops, uniforms, ...); --ortho uses an orthographic projection (w = 1); --depth also dumps the depth
+ * of the table fs_cases (lighting, procedural, discard, conditionals, loops, uniforms, ...), --fs-file the source of one from a file
+ * (mesa/tests/fuzz_glsl.py); --ortho uses an orthographic projection (w = 1); --depth also dumps the depth
  * buffer (PREFIX<frame>_depth.pgm, 16 bit); --continue draws one more triangle after the read-back, without a clear
  * (it needs the depth buffer of the frame so far) and dumps PREFIX<frame>b.ppm.
  */
@@ -362,7 +363,7 @@ int
 main(int argc, char **argv)
 {
    int frames = 1, size = 256, blend = 0, lighting = 0, cull = 0, swap = 0, ortho = 0, depth_out = 0, cont = 0, glsl = 0, glsl_alu = 0, depthmask = 0, nodepth = 0;
-   const char *dump = NULL, *fs_name = NULL;
+   const char *dump = NULL, *fs_name = NULL, *fs_file = NULL;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--size") && i + 1 < argc) size = atoi(argv[++i]);
@@ -379,6 +380,7 @@ main(int argc, char **argv)
       else if (!strcmp(argv[i], "--glsl")) glsl = 1;
       else if (!strcmp(argv[i], "--glsl-alu")) glsl_alu = 1;
       else if (!strcmp(argv[i], "--fs") && i + 1 < argc) fs_name = argv[++i];
+      else if (!strcmp(argv[i], "--fs-file") && i + 1 < argc) fs_file = argv[++i];
       else if (!strcmp(argv[i], "--sphere")) g_sphere = 1;
       else if (!strcmp(argv[i], "--continue")) cont = 1;
    }
@@ -399,8 +401,17 @@ main(int argc, char **argv)
    glViewport(0, 0, size, size);
    if (cull) { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
 
+   static char fs_text[1 << 16];
+   if (fs_file) {
+      FILE *fp = fopen(fs_file, "rb");
+      if (!fp) { perror(fs_file); return 1; }
+      const size_t n = fread(fs_text, 1, sizeof fs_text - 1, fp);
+      fs_text[n] = 0;
+      fclose(fp);
+      fs_name = "file";
+   }
    g_normals = fs_name != NULL;
-   const GLuint program = fs_name ? make_program(fs_name, NULL) : glsl || glsl_alu ? make_program(glsl_alu ? "alu" : "pass", NULL) : 0;
+   const GLuint program = fs_file ? make_program("file", fs_text) : fs_name ? make_program(fs_name, NULL) : glsl || glsl_alu ? make_program(glsl_alu ? "alu" : "pass", NULL) : 0;
    unsigned char *px = malloc((size_t)size * size * 4);
    for (int f = 0; f < frames; f++) {
       draw_scene(f, blend, lighting, ortho, program, depthmask, nodepth);

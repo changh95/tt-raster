@@ -8,7 +8,8 @@
  * TGSI vec4 instructions are expanded per component. Conditionals (IF/ELSE/ENDIF) are if-converted: both sides run and
  * assignments are selected by a lane mask. Not handled (the translator refuses and softpipe draws): texture and memory
  * instructions, derivatives, loops and subroutines, indirect addressing, integer and bit operations other than the
- * boolean-to-float conversion, outputs other than colour 0, system values and the front-face flag.
+ * boolean-to-float conversion and the logic of comparison results (&&, ||, !), outputs other than colour 0, system values and
+ * the front-face flag.
  */
 
 #ifndef SP_TENSIX_SHADER_H
