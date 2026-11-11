@@ -94,7 +94,13 @@ follow-up draws after a read-back) with stock softpipe, the fast path on the CPU
 
 Speed (glxgears, Xvfb, one x8 chip, stock softpipe is single-threaded on this host): 300 x 300 575 FPS stock and
 310 FPS on Tensix (a frame costs about 2 ms of fixed chip latency), 1024 x 1024 79 and 173 FPS, 1920 x 1080 31 and 126 FPS
-(`docs/PERF.md`).
+(`docs/PERF.md`). Where the crossover lies (glxgears, FPS stock / Tensix): 300 x 300 560 / 330, 500 x 500 275 / 245, 700 x 700 151 / 236,
+1000 x 1000 76 / 181. A window below about 300,000 pixels therefore stays on softpipe by default when started through
+`scripts/run_gl.sh` (`TTR_GL_MIN_PIXELS=300000`; the library itself defaults to 0, always the chip; set it to 0 to force the chip in
+`run_gl.sh`).
+
+GLES 2 programs work too (the build enables EGL on X11): `es2gears_x11` runs on the fast path, 575 FPS stock and 262 to 300 FPS on Tensix
+in its 300 x 300 window (the same fixed chip latency), and `scripts/test_gl.sh` runs it for a few seconds on the CPU backend.
 
 ![glxgears, stock softpipe and Tensix, recorded side by side](../docs/images/glxgears_stock_vs_tensix.gif)
 

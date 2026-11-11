@@ -274,7 +274,7 @@ def run_gl(args, exe, shader_path, backend, out_prefix):
     prefix = os.path.expanduser(args.prefix)
     lib = os.path.join(prefix, "lib", "x86_64-linux-gnu")
     env = dict(os.environ, LD_LIBRARY_PATH=lib, LIBGL_DRIVERS_PATH=os.path.join(lib, "dri"), LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="softpipe",
-               TTRASTER_LIB=os.path.join(ROOT, "build", "src", "libttraster.so"), TTR_GL_DEBUG="1")
+               TTRASTER_LIB=os.path.join(ROOT, "build", "src", "libttraster.so"), TTR_GL_DEBUG="1", TTR_GL_MIN_PIXELS="0")
     env.pop("TTR_GL", None)
     cmd = [exe, "--fs-file", shader_path, "--sphere", "--size", str(args.size), "--frames", "1", "--dump", out_prefix]
     if backend == "tensix":

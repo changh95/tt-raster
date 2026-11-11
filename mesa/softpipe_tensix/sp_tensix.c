@@ -44,6 +44,8 @@ typedef struct {
    float color[4];
 } ttr_vertex;
 
+static unsigned g_min_pixels;   /* TTR_GL_MIN_PIXELS, see framebuffer_ok */
+
 enum { TTR_DEPTH_LESS = 0, TTR_DEPTH_LEQUAL = 1, TTR_DEPTH_ALWAYS = 2 };
 enum { TTR_BLEND_NONE = 0, TTR_BLEND_ALPHA = 1, TTR_BLEND_ADD = 2, TTR_BLEND_PREMULTIPLIED = 3, TTR_BLEND_MULTIPLY = 4, TTR_BLEND_ALPHA_ADD = 5 };
 typedef struct {
@@ -190,6 +192,7 @@ sp_tensix_create(struct softpipe_context *sp)
       return NULL;
    t->sp = sp;
    t->debug = getenv("TTR_GL_DEBUG") != NULL;
+   g_min_pixels = getenv("TTR_GL_MIN_PIXELS") ? (unsigned)strtoul(getenv("TTR_GL_MIN_PIXELS"), NULL, 10) : 0;
    t->debug_tgsi = t->debug && atoi(getenv("TTR_GL_DEBUG")) >= 2;
    if (!load_api(t, lib && *lib ? lib : "libttraster.so")) {
       FREE(t);
@@ -253,10 +256,15 @@ depth_format_ok(enum pipe_format f)
    }
 }
 
+/* Windows with fewer pixels than this stay on softpipe: a frame costs the chip about 1.5 ms (launch, upload, read-back) however
+ * small it is, and softpipe is faster below roughly 300,000 pixels (glxgears: 560 against 330 FPS at 300 x 300, 275 against 245 at
+ * 500 x 500, 150 against 235 at 700 x 700). TTR_GL_MIN_PIXELS overrides it; the default of the library is 0 (always), scripts/run_gl.sh sets 300000. */
 static bool
 framebuffer_ok(const struct softpipe_context *sp)
 {
    const struct pipe_framebuffer_state *fb = &sp->framebuffer;
+   if ((unsigned long)fb->width * fb->height < g_min_pixels)
+      return false;
    if (fb->nr_cbufs != 1 || !fb->cbufs[0].texture || !fb->zsbuf.texture)
       return false;
    if (fb->width == 0 || fb->height == 0 || fb->width > 2048 || fb->height > 2048)
@@ -369,7 +377,9 @@ draw_refused(struct sp_tensix *t, const struct pipe_draw_info *info)
    if (sp->reduced_api_prim != MESA_PRIM_TRIANGLES || sp->gs || sp->num_so_targets > 0)
       return "geometry shader or stream output";
    if (!framebuffer_ok(sp))
-      return "framebuffer format or size";
+      return (unsigned long)sp->framebuffer.width * sp->framebuffer.height < g_min_pixels
+                ? "window smaller than TTR_GL_MIN_PIXELS pixels (softpipe is faster there)"
+                : "framebuffer format or size";
    const struct pipe_rasterizer_state *r = sp->rasterizer;
    if (r->fill_front != PIPE_POLYGON_MODE_FILL || r->fill_back != PIPE_POLYGON_MODE_FILL)
       return "polygon mode is not fill";

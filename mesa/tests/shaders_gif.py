@@ -38,7 +38,7 @@ def main():
         prefix = os.path.join(work, name)
         cmd = [os.path.join(ROOT, "scripts", "run_gl.sh"), args.node, "--size", f"{args.size}x{args.size}", "--backend", "tensix", exe,
                "--fs", name, "--sphere", "--size", str(args.size), "--frames", str(args.frames), "--dump", prefix]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ, TTR_GL_MIN_PIXELS="0"))
         sheets.append([Image.open(f"{prefix}{f}.ppm").convert("RGB") for f in range(args.frames)])
     cols = 3
     rows = (len(names) + cols - 1) // cols

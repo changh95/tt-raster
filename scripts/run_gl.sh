@@ -36,6 +36,8 @@ export LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LIBGL_DRIVERS_PATH="$lib/dri"
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=softpipe
+# Below about 300,000 pixels (550 x 550) stock softpipe is faster than a chip frame (mesa/README.md); set 0 to always use the chip.
+export TTR_GL_MIN_PIXELS="${TTR_GL_MIN_PIXELS:-300000}"
 export TTRASTER_LIB="${TTRASTER_LIB:-$build/src/libttraster.so}"
 if [[ "$backend" == "off" ]]; then
     unset TTR_GL

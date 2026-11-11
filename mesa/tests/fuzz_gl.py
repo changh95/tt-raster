@@ -49,7 +49,7 @@ def run(args, exe, seed, backend, prefix):
     install = os.path.expanduser(args.prefix)
     lib = os.path.join(install, "lib", "x86_64-linux-gnu")
     env = dict(os.environ, LD_LIBRARY_PATH=lib, LIBGL_DRIVERS_PATH=os.path.join(lib, "dri"), LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="softpipe",
-               TTRASTER_LIB=os.path.join(ROOT, "build", "src", "libttraster.so"), TTR_GL_DEBUG="1")
+               TTRASTER_LIB=os.path.join(ROOT, "build", "src", "libttraster.so"), TTR_GL_DEBUG="1", TTR_GL_MIN_PIXELS="0")
     env.pop("TTR_GL", None)
     cmd = [exe, "--seed", str(seed), "--size", str(args.size), "--frames", str(args.frames), "--dump", prefix] + (["--no-refused"] if args.no_refused else []) + (["--tame"] if args.tame else [])
     if backend == "tensix":

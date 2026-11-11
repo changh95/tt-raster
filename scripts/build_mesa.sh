@@ -45,10 +45,11 @@ cp "$root/mesa/softpipe_tensix/"sp_tensix*.[ch] "$root/include/ttraster/ttraster
 
 if [[ ! -d "$build" ]]; then
     meson setup "$build" "$src" --prefix="$prefix" -Dbuildtype=release -Dgallium-drivers=softpipe -Dvulkan-drivers= \
-        -Dllvm=disabled -Dplatforms=x11 -Dglx=dri -Degl=disabled -Dgbm=disabled -Dgles1=disabled -Dgles2=enabled \
+        -Dllvm=disabled -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=disabled -Dgles1=disabled -Dgles2=enabled \
         -Dvideo-codecs= -Dlmsensors=disabled -Dvalgrind=disabled -Dzstd=disabled -Dgallium-rusticl=false -Dtools= \
         -Dbuild-tests=false
 fi
+meson configure "$build" -Degl=enabled >/dev/null   # builds made before EGL was added pick it up here
 ninja -C "$build"
 ninja -C "$build" install
 echo "Mesa installed in $prefix; run GL programs with scripts/run_gl.sh"

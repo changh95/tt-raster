@@ -26,7 +26,7 @@ gl_run() {
     local backend="$1" out="$2"
     shift 2
     if [[ "$backend" == "tensix" ]]; then
-        "$root/scripts/run_gl.sh" "$node" --size 400x400 --backend tensix "$work/gl_scene" "$@" --dump "$out" >"$out.log" 2>&1
+        TTR_GL_MIN_PIXELS=0 "$root/scripts/run_gl.sh" "$node" --size 400x400 --backend tensix "$work/gl_scene" "$@" --dump "$out" >"$out.log" 2>&1
     else
         env LD_LIBRARY_PATH="$lib" LIBGL_DRIVERS_PATH="$lib/dri" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe \
             TTRASTER_LIB="$build/src/libttraster.so" TTR_GL_DEBUG=1 ${backend:+$([[ $backend == reference ]] && echo TTR_GL=reference)} \
@@ -90,6 +90,18 @@ for c in "${cases[@]}"; do
         done
     fi
 done
+# A GLES 2 program through EGL (es2gears_x11 from mesa-utils-extra, if installed): the fast path must take its frames.
+if command -v es2gears_x11 >/dev/null; then
+    echo "== es2gears (GLES 2, EGL)"
+    env LD_LIBRARY_PATH="$lib" LIBGL_DRIVERS_PATH="$lib/dri" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe TTRASTER_LIB="$build/src/libttraster.so" \
+        TTR_GL=reference TTR_GL_DEBUG=1 TTR_GL_MIN_PIXELS=0 timeout 12 xvfb-run -a -s "-screen 0 400x400x24" es2gears_x11 >"$work/es2.log" 2>&1 || true
+    if grep -q "tensix: [0-9]* frames (" "$work/es2.log" && ! grep -q "handled by softpipe" "$work/es2.log"; then
+        grep -m1 "tensix: [0-9]* frames (" "$work/es2.log" | cut -c1-120
+    else
+        echo "FAIL: es2gears did not run on the fast path"; grep -E "tensix|EGL" "$work/es2.log" | head -5; fail=1
+    fi
+fi
+
 # Random fixed-function frames (state, primitives, clipping, mid-frame fallbacks): stock softpipe against the fast path.
 echo "== random GL frames"
 if ! "$py" "$root/mesa/tests/fuzz_gl.py" --count 100 --seed 1 --tame --no-refused --keep "$work/fuzzgl"; then fail=1; fi
