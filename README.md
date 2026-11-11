@@ -32,7 +32,7 @@ Every image below is rendered at 1920 x 1088 on one Blackhole chip (all 120 work
 | jittered grid mesh, 4,080 triangles (watertight: every pixel hit once) | 0 | 0.8 ms | ![grid](docs/images/grid.png) |
 | 24 interpenetrating triangles | 0 | 0.7 ms | ![interpenetrating](docs/images/interpenetrating.png) |
 | one screen-covering triangle (guard-band clipping) | 0 | 0.6 ms | ![fullscreen](docs/images/fullscreen.png) |
-| coplanar triangles, `LESS_EQUAL` depth ties | 0 | see PERF.md | ![coplanar](docs/images/coplanar_lequal.png) |
+| coplanar triangles, `LESS_EQUAL` depth ties | 0 | 0.7 ms | ![coplanar](docs/images/coplanar_lequal.png) |
 | 10,000 tiny triangles | 0 | 0.6 ms | ![tiny](docs/images/tiny_10k.png) |
 | 10,000 random triangles | 0 | 2.7 ms | ![random](docs/images/random_10k.png) |
 
