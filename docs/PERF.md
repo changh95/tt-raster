@@ -10,8 +10,8 @@ One row per measurement: what was measured, configuration, result with units, co
 | `metal_example_add_2_integers_in_riscv` wall time | chip 0, cold JIT cache (0/7 hits) | 3.4 s | n/a (tt-metal example) |
 | `metal_example_eltwise_sfpu` wall time | chip 0, warm JIT cache (6/11 hits) | 1.2 s | n/a (tt-metal example) |
 | AI clock under test | `TT_VISIBLE_DEVICES=0..7` mesh open | 1337 MHz settled (requested 1350), 800 MHz idle | n/a |
-| Math-thread wall-clock tick rate | `read_wall_clock()` against host time, two runs of different length (launch overhead cancels) | 1348.8 and 1349.1 MHz in two runs, so one tick is one AI clock cycle (1350 MHz) | spikes/b_scalars |
-| First-run time of a new kernel variant | JIT compile plus run, cold cache, one compute+two data-movement kernels | about 0.6 s | spikes/b_scalars |
+| Math-thread wall-clock tick rate | `read_wall_clock()` against host time, two runs of different length (launch overhead cancels) | 1348.8 and 1349.1 MHz in two runs, so one tick is one AI clock cycle (1350 MHz) | core/spikes/b_scalars |
+| First-run time of a new kernel variant | JIT compile plus run, cold cache, one compute+two data-movement kernels | about 0.6 s | core/spikes/b_scalars |
 
 ### Spike B: runtime scalars into the SFPU
 
@@ -42,7 +42,7 @@ Derived scalar-delivery cost per triangle (4 scalars): A about 37 cycles (9 per 
 
 ### SFPU multiply-add issue rate (V6)
 
-`x = x*a + b` on one vector, 8 steps per loop iteration, cycles per multiply-add from the slope between 1000 and 3000 iterations (loop and start-up overhead cancel). One chip, `spikes/b_scalars/mad_bench`.
+`x = x*a + b` on one vector, 8 steps per loop iteration, cycles per multiply-add from the slope between 1000 and 3000 iterations (loop and start-up overhead cancel). One chip, `core/spikes/b_scalars/mad_bench`.
 
 | Independent chains | Cycles per multiply-add | Reading |
 | --- | --- | --- |
@@ -53,7 +53,7 @@ Derived scalar-delivery cost per triangle (4 scalars): A about 37 cycles (9 per 
 
 ### NoC multicast (Spike D)
 
-One chip, sender core multicasts a 4 KB buffer. Latency = multicast of data plus flag, until every receiver's ack has arrived at the sender (round trip, includes ack serialization). Injection bandwidth = 256 back-to-back 4 KB multicasts completed at the sender (`noc_async_write_barrier`), 4 KB x 256 / time. Delivered bandwidth = injection x destinations. AI clock 1.35 GHz. `spikes/d_multicast`.
+One chip, sender core multicasts a 4 KB buffer. Latency = multicast of data plus flag, until every receiver's ack has arrived at the sender (round trip, includes ack serialization). Injection bandwidth = 256 back-to-back 4 KB multicasts completed at the sender (`noc_async_write_barrier`), 4 KB x 256 / time. Delivered bandwidth = injection x destinations. AI clock 1.35 GHz. `core/spikes/d_multicast`.
 
 | Rectangle (sender outside unless noted) | Receivers | Latency (cycles) | Latency (ns) | Injection (GB/s) | Delivered (GB/s) |
 | --- | --- | --- | --- | --- | --- |
@@ -73,7 +73,7 @@ Reading: the sender's injection rate falls from 64 GB/s (one receiver) to 11 to 
 
 ### Host to chip bandwidth (Spike E)
 
-256 MiB DRAM buffer, 64 KiB pages, median of 3 repetitions, buffers verified bit for bit. `spikes/e_tray`, nodes 0-7 as a 2x4 mesh (and single chips for comparison). Write = host to chip DRAM, read = chip DRAM to host.
+256 MiB DRAM buffer, 64 KiB pages, median of 3 repetitions, buffers verified bit for bit. `core/spikes/e_tray`, nodes 0-7 as a 2x4 mesh (and single chips for comparison). Write = host to chip DRAM, read = chip DRAM to host.
 
 | Device (mesh coordinate, node) | Link | Write GB/s | Read GB/s |
 | --- | --- | --- | --- |
@@ -208,7 +208,7 @@ Reading: device and read-back shrink with the chip count (read-back runs on eigh
 
 ## Tiled-camera rendering for Isaac Lab (Track I)
 
-`validation/bench_scene.py`, 1,024 environments of 96 x 96, 316 triangles per environment (pole capsule 4 x 16), poses change every frame, median of 9 frames after a warm-up, outputs written into preallocated host arrays. Chips: one x8 chip (node 5), one x1 chip (node 0) or all eight of the tray. Seven of the eight chips have x1 PCIe links, so which chip is used matters (see below).
+`plugins/isaaclab/validation/bench_scene.py`, 1,024 environments of 96 x 96, 316 triangles per environment (pole capsule 4 x 16), poses change every frame, median of 9 frames after a warm-up, outputs written into preallocated host arrays. Chips: one x8 chip (node 5), one x1 chip (node 0) or all eight of the tray. Seven of the eight chips have x1 PCIe links, so which chip is used matters (see below).
 
 | Outputs | Passes | 1 chip, x8: frame | 1 chip, x8: images/s | 1 chip, x1: frame | 8 chips: frame |
 | --- | --- | --- | --- | --- | --- |
@@ -220,9 +220,9 @@ Breakdown of the depth frame (ms), slowest chip where several: vertex stage 3.3,
 
 ### Pipelined frames and the host thread pool
 
-Two changes after the table above. (1) `parallel_for` now runs on one persistent worker pool (`src/ttraster/parallel.h`) instead of creating and joining up to 64 `std::thread`s in every stage; the stages shrank (frame construction 2.5 to 0.8 ms, setup 4.6 to 2.0 ms) and a synchronous depth frame went from about 33 to 25 to 29 ms on the x8 chip. (2) `ttr_submit` / `ttr_collect` (`Scene.submit` / `Scene.collect` in Python) keep two frames in flight: poses are snapshotted at submit, each frame has its own storage slot (triangles, bins, record buffer, read-back buffer, framebuffer), and the chips serialize only their device section (buffers, upload, run, transfer) with a mutex, so the host stages of one frame overlap the device section of the other. Output is bit-identical to synchronous frames (`validation/test_pipeline.py`, CPU and Tensix backends); the price is one frame of latency.
+Two changes after the table above. (1) `parallel_for` now runs on one persistent worker pool (`core/src/ttraster/parallel.h`) instead of creating and joining up to 64 `std::thread`s in every stage; the stages shrank (frame construction 2.5 to 0.8 ms, setup 4.6 to 2.0 ms) and a synchronous depth frame went from about 33 to 25 to 29 ms on the x8 chip. (2) `ttr_submit` / `ttr_collect` (`Scene.submit` / `Scene.collect` in Python) keep two frames in flight: poses are snapshotted at submit, each frame has its own storage slot (triangles, bins, record buffer, read-back buffer, framebuffer), and the chips serialize only their device section (buffers, upload, run, transfer) with a mutex, so the host stages of one frame overlap the device section of the other. Output is bit-identical to synchronous frames (`plugins/isaaclab/validation/test_pipeline.py`, CPU and Tensix backends); the price is one frame of latency.
 
-1,024 environments, 96 x 96, depth, steady state over 80 frames, three runs each (`validation/bench_scene.py --pipeline`; the host carried other users' load during these runs, load average 35, so expect +-15 %):
+1,024 environments, 96 x 96, depth, steady state over 80 frames, three runs each (`plugins/isaaclab/validation/bench_scene.py --pipeline`; the host carried other users' load during these runs, load average 35, so expect +-15 %):
 
 | Chips | Synchronous | Pipelined (2 in flight) | Images/s pipelined | Latency submit to collect |
 | --- | --- | --- | --- | --- |
@@ -234,7 +234,7 @@ Other outputs, one run: rgb + depth 35.2 to 25.2 ms (x8 chip), four outputs 62.5
 
 Where the pipelined frame goes (`TTR_TRACE=1` prints a timeline of stage boundaries per slot): one frame is about 38 ms long, a new one starts every 18 to 20 ms. The device section (create buffers, upload, run, transfer) is 10 to 12 ms of it and is mutually exclusive, so a single chip cannot go below that; the rest is host work (vertex 3.5, construction 3, setup 2, binning 3 before the change described under "Binning", 1.3 after, encode 2, untile 2, assemble 2 ms) that now runs concurrently with the other frame. With eight chips the device sections of different chips run in parallel, but the frame still takes as long as with one x8 chip, because the transfer problem described above (eight chips do not read back eight times faster) and the host stages remain.
 
-Binning (`bin_triangles`, `src/ttraster/tile.cpp`). The loop kept its counters in the caller's `TileBins` and pushed into vectors reachable through the same reference, so the compiler reloaded and stored them for every (tile, triangle) pair; with local counters the single-thread loop on `random_10k` at 1920 x 1088 takes 0.35 to 0.41 ms instead of 1.35 ms (host-only, back to back on the same machine). Tile rows are independent (a bin belongs to exactly one row), so above 2,048 triangles and 16,384 candidate pairs the rows are binned as one band per row on the worker pool, each band walking the triangles in API order; a compact array of (first row, last row) per triangle keeps a band from touching the 330-byte `SetupTriangle` of triangles outside its row. The result is identical to the sequential loop (`tests/test_reuse.cpp` compares it with a plain loop on 17,000- and 13,000-triangle frames). Two things cost time on the way: per-band counters in one array shared cache lines between threads (2.4 ms instead of 1.2 ms for 36,000 triangles), and `getenv` in the inner loop of an experiment. On the Track I frame (1,024 x 96 x 96 depth, 323,584 triangles, 94,632 records, x8 chip, loaded machine) binning went from 2.7 to 3.7 ms with the sequential loop to 1.2 to 1.4 ms, and the synchronous frame from 27.0 to 24.3 to 25.8 ms. The pipelined frame did not get faster (21.4 to 21.7 ms per frame in two runs): the device section and the other host stages decide it, and the host stages share one worker pool. The gain does not grow with triangle count the way the core count suggests: at 143,000 `random_10k` triangles the banded and sequential loops both take about 5 ms, probably because the bands re-read the same large triangle structures from other cores' caches.
+Binning (`bin_triangles`, `core/src/ttraster/tile.cpp`). The loop kept its counters in the caller's `TileBins` and pushed into vectors reachable through the same reference, so the compiler reloaded and stored them for every (tile, triangle) pair; with local counters the single-thread loop on `random_10k` at 1920 x 1088 takes 0.35 to 0.41 ms instead of 1.35 ms (host-only, back to back on the same machine). Tile rows are independent (a bin belongs to exactly one row), so above 2,048 triangles and 16,384 candidate pairs the rows are binned as one band per row on the worker pool, each band walking the triangles in API order; a compact array of (first row, last row) per triangle keeps a band from touching the 330-byte `SetupTriangle` of triangles outside its row. The result is identical to the sequential loop (`core/tests/test_reuse.cpp` compares it with a plain loop on 17,000- and 13,000-triangle frames). Two things cost time on the way: per-band counters in one array shared cache lines between threads (2.4 ms instead of 1.2 ms for 36,000 triangles), and `getenv` in the inner loop of an experiment. On the Track I frame (1,024 x 96 x 96 depth, 323,584 triangles, 94,632 records, x8 chip, loaded machine) binning went from 2.7 to 3.7 ms with the sequential loop to 1.2 to 1.4 ms, and the synchronous frame from 27.0 to 24.3 to 25.8 ms. The pipelined frame did not get faster (21.4 to 21.7 ms per frame in two runs): the device section and the other host stages decide it, and the host stages share one worker pool. The gain does not grow with triangle count the way the core count suggests: at 143,000 `random_10k` triangles the banded and sequential loops both take about 5 ms, probably because the bands re-read the same large triangle structures from other cores' caches.
 
 Empty tiles are no longer sent to the chip (`MultiChipRenderer`): a tile with no record shows only the clear values, so the host writes those (only when the tile does not hold them already) instead of encoding, drawing and reading back a blank tile. About a third of the tiles of this scene are sky. Measured afterwards, same scene (one run each, host load average about 20): x1 chip, depth, transfer 24.2 to 15.8 ms, synchronous 55.7 to 42.6 ms, pipelined 43.8 to 30.5 ms; x8 chip 24.4 ms synchronous and 19.1 ms pipelined; eight chips 23.4 ms synchronous and 17.7 ms pipelined (58,000 images/s); rgb + depth on the x8 chip 27.6 and 22.8 ms. Pixels are unchanged: the device acceptance run (every scene on 1, 2, 4 and 8 chips against the CPU reference) and the Newton comparisons pass.
 
@@ -255,7 +255,7 @@ The shader runs for every covered vector of every triangle (about 40 instruction
 
 ### Isaac Lab renderer: asynchronous rendering (`async_rendering`)
 
-`TtRasterRendererCfg.async_rendering` uses the pipeline above the way Isaac Lab's delayed captures do (`OVRTXRendererCfg.async_rendering`, `BaseRenderer.prepare_capture`): `render()` submits the frame of the current step, collects the frame of the previous step and publishes it into the camera's buffers, so the chip renders while the physics step and the policy run, at the price of one step of latency in the camera observations (the first capture and the first after a reset wait for a fresh image; the pose, calibration and frame indices of the delivered image come with it in `camera.data.info[output]["capture"]`). `validation/bench_isaaclab_shim.py` (stand-ins for Isaac Lab, a real Newton model of 1,024 environments with coarse shape tessellation: 356,352 triangles per frame, 96 x 96, `distance_to_camera`, node 5 = x8 chip, median of 30 steps, a sleep stands in for physics and policy):
+`TtRasterRendererCfg.async_rendering` uses the pipeline above the way Isaac Lab's delayed captures do (`OVRTXRendererCfg.async_rendering`, `BaseRenderer.prepare_capture`): `render()` submits the frame of the current step, collects the frame of the previous step and publishes it into the camera's buffers, so the chip renders while the physics step and the policy run, at the price of one step of latency in the camera observations (the first capture and the first after a reset wait for a fresh image; the pose, calibration and frame indices of the delivered image come with it in `camera.data.info[output]["capture"]`). `plugins/isaaclab/validation/bench_isaaclab_shim.py` (stand-ins for Isaac Lab, a real Newton model of 1,024 environments with coarse shape tessellation: 356,352 triangles per frame, 96 x 96, `distance_to_camera`, node 5 = x8 chip, median of 30 steps, a sleep stands in for physics and policy):
 
 | Other work per step | Synchronous step | `render()` blocks | Asynchronous step | `render()` blocks |
 | --- | --- | --- | --- | --- |
@@ -284,7 +284,7 @@ Per-frame breakdown of the fast path at 1920 x 1080 (`TTR_GL_DEBUG=1`): 3.9 ms i
 
 ## Fragment shaders (G.6)
 
-### Interpreter cost (`tools/ttr_shader_bench`, node 5, 1920 x 1088, one full-screen quad, 120 cores, median of 20 warm runs)
+### Interpreter cost (`core/tools/ttr_shader_bench`, node 5, 1920 x 1088, one full-screen quad, 120 cores, median of 20 warm runs)
 
 The program is a chain of K instructions of one kind on one register; the device time rises linearly with K. Time per instruction and per pixel vector (32 lanes) on the busiest core (17 tiles of 2 triangles x 32 vectors):
 

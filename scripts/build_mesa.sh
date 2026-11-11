@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build a Mesa (softpipe only, GLX on X11) with the tt-raster Tensix fast path (mesa/README.md).
+# Build a Mesa (softpipe only, GLX on X11) with the tt-raster Tensix fast path (api/gl/README.md).
 #
 #   scripts/build_mesa.sh
 #
@@ -35,13 +35,13 @@ if [[ ! -d "$src/.git" ]]; then
 fi
 
 # Apply the patch once (it touches softpipe and the software driver helpers) and copy the new files.
-patch_file="$root/mesa/patches/0001-softpipe-tensix-fast-path.patch"
+patch_file="$root/api/gl/patches/0001-softpipe-tensix-fast-path.patch"
 if git -C "$src" apply --reverse --check "$patch_file" 2>/dev/null; then
     echo "patch already applied"
 else
     git -C "$src" apply "$patch_file"
 fi
-cp "$root/mesa/softpipe_tensix/"sp_tensix*.[ch] "$root/include/ttraster/ttraster_isa.h" "$src/src/gallium/drivers/softpipe/"
+cp "$root/api/gl/softpipe_tensix/"sp_tensix*.[ch] "$root/core/include/ttraster/ttraster_isa.h" "$src/src/gallium/drivers/softpipe/"
 
 if [[ ! -d "$build" ]]; then
     meson setup "$build" "$src" --prefix="$prefix" -Dbuildtype=release -Dgallium-drivers=softpipe -Dvulkan-drivers= \

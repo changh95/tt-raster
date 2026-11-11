@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# OpenGL through Mesa with the Tensix fast path (mesa/README.md): a deterministic fixed-function scene is
+# OpenGL through Mesa with the Tensix fast path (api/gl/README.md): a deterministic fixed-function scene is
 # rendered by stock softpipe, by the fast path on the CPU reference backend, and (with TT_METAL_HOME set) on a
 # Tensix chip; the images are compared. Needs scripts/build_mesa.sh done, the host build (libttraster.so), a C
 # compiler with X11/GL headers, xvfb, and a Python with numpy (TT_RASTER_PYTHON, default ~/experiments/venv-newton).
@@ -18,7 +18,7 @@ node="${TT_RASTER_NODE:-5}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-gcc -O1 -o "$work/gl_scene" "$root/mesa/tests/gl_scene.c" -lGL -lX11 -lm
+gcc -O1 -o "$work/gl_scene" "$root/api/gl/tests/gl_scene.c" -lGL -lX11 -lm
 lib="$prefix/lib/x86_64-linux-gnu"
 
 # gl_run <backend: off|reference|tensix> <output prefix> <gl_scene args...>
@@ -29,14 +29,14 @@ gl_run() {
         TTR_GL_MIN_PIXELS=0 "$root/scripts/run_gl.sh" "$node" --size 400x400 --backend tensix "$work/gl_scene" "$@" --dump "$out" >"$out.log" 2>&1
     else
         env LD_LIBRARY_PATH="$lib" LIBGL_DRIVERS_PATH="$lib/dri" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe \
-            TTRASTER_LIB="$build/src/libttraster.so" TTR_GL_DEBUG=1 ${backend:+$([[ $backend == reference ]] && echo TTR_GL=reference)} \
+            TTRASTER_LIB="$build/core/libttraster.so" TTR_GL_DEBUG=1 ${backend:+$([[ $backend == reference ]] && echo TTR_GL=reference)} \
             xvfb-run -a -s "-screen 0 400x400x24" "$work/gl_scene" "$@" --dump "$out" >"$out.log" 2>&1
     fi
 }
 
 fail=0
 compare() {  # compare <a> <b> <max-bad>
-    if ! "$py" "$root/mesa/tests/compare_ppm.py" "$1" "$2" --max-bad "$3"; then
+    if ! "$py" "$root/api/gl/tests/compare_ppm.py" "$1" "$2" --max-bad "$3"; then
         fail=1
     fi
 }
@@ -93,7 +93,7 @@ done
 # A GLES 2 program through EGL (es2gears_x11 from mesa-utils-extra, if installed): the fast path must take its frames.
 if command -v es2gears_x11 >/dev/null; then
     echo "== es2gears (GLES 2, EGL)"
-    env LD_LIBRARY_PATH="$lib" LIBGL_DRIVERS_PATH="$lib/dri" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe TTRASTER_LIB="$build/src/libttraster.so" \
+    env LD_LIBRARY_PATH="$lib" LIBGL_DRIVERS_PATH="$lib/dri" LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe TTRASTER_LIB="$build/core/libttraster.so" \
         TTR_GL=reference TTR_GL_DEBUG=1 TTR_GL_MIN_PIXELS=0 timeout 12 xvfb-run -a -s "-screen 0 400x400x24" es2gears_x11 >"$work/es2.log" 2>&1 || true
     if grep -q "tensix: [0-9]* frames (" "$work/es2.log" && ! grep -q "handled by softpipe" "$work/es2.log"; then
         grep -m1 "tensix: [0-9]* frames (" "$work/es2.log" | cut -c1-120
@@ -104,16 +104,16 @@ fi
 
 # Random fixed-function frames (state, primitives, clipping, mid-frame fallbacks): stock softpipe against the fast path.
 echo "== random GL frames"
-if ! "$py" "$root/mesa/tests/fuzz_gl.py" --count 100 --seed 1 --tame --no-refused --keep "$work/fuzzgl"; then fail=1; fi
-if ! "$py" "$root/mesa/tests/fuzz_gl.py" --count 60 --seed 1000 --tame --keep "$work/fuzzgl2"; then fail=1; fi
+if ! "$py" "$root/api/gl/tests/fuzz_gl.py" --count 100 --seed 1 --tame --no-refused --keep "$work/fuzzgl"; then fail=1; fi
+if ! "$py" "$root/api/gl/tests/fuzz_gl.py" --count 60 --seed 1000 --tame --keep "$work/fuzzgl2"; then fail=1; fi
 if [[ -n "${TT_METAL_HOME:-}" ]]; then
-    if ! "$py" "$root/mesa/tests/fuzz_gl.py" --count 12 --seed 3000 --tame --backend tensix --node "$node" --keep "$work/fuzzgl_tx"; then fail=1; fi
+    if ! "$py" "$root/api/gl/tests/fuzz_gl.py" --count 12 --seed 3000 --tame --backend tensix --node "$node" --keep "$work/fuzzgl_tx"; then fail=1; fi
 fi
 
 # Random GLSL fragment shaders: the translator against stock softpipe (CPU backend), and some of them on the chip.
 echo "== random GLSL shaders"
-if ! "$py" "$root/mesa/tests/fuzz_glsl.py" --count 150 --seed 1 --keep "$work/fuzz"; then fail=1; fi
+if ! "$py" "$root/api/gl/tests/fuzz_glsl.py" --count 150 --seed 1 --keep "$work/fuzz"; then fail=1; fi
 if [[ -n "${TT_METAL_HOME:-}" ]]; then
-    if ! "$py" "$root/mesa/tests/fuzz_glsl.py" --count 12 --seed 7000 --backend tensix --node "$node" --keep "$work/fuzz_tx"; then fail=1; fi
+    if ! "$py" "$root/api/gl/tests/fuzz_glsl.py" --count 12 --seed 7000 --backend tensix --node "$node" --keep "$work/fuzz_tx"; then fail=1; fi
 fi
 [[ $fail -eq 0 ]] && echo "GL tests OK" || { echo "GL tests FAILED"; exit 1; }

@@ -27,10 +27,10 @@ echo "== UndefinedBehaviorSanitizer: host tests"
 build ubsan "-fsanitize=undefined -fno-sanitize-recover=undefined"
 UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir "$work/ubsan" --output-on-failure | grep -E "tests passed|Failed|\*\*\*"
 
-if [[ -n "${TT_METAL_HOME:-}" && -x "$work/asan/tools/ttr_shader_fuzz" ]]; then
+if [[ -n "${TT_METAL_HOME:-}" && -x "$work/asan/core/tools/ttr_shader_fuzz" ]]; then
     echo "== AddressSanitizer: shader fuzz on a chip and on four chips"
     export ASAN_OPTIONS=detect_leaks=0
-    "$root/scripts/run.sh" "$node" "$work/asan/tools/ttr_shader_fuzz" --iters 8 --seed 1 | grep -E "total|^OK|FAILED"
-    "$root/scripts/run.sh" 0,1,2,3 "$work/asan/tools/ttr_shader_fuzz" --chips 4 --iters 6 --seed 9 | grep -E "total|^OK|FAILED"
+    "$root/scripts/run.sh" "$node" "$work/asan/core/tools/ttr_shader_fuzz" --iters 8 --seed 1 | grep -E "total|^OK|FAILED"
+    "$root/scripts/run.sh" 0,1,2,3 "$work/asan/core/tools/ttr_shader_fuzz" --chips 4 --iters 6 --seed 9 | grep -E "total|^OK|FAILED"
 fi
 echo "sanitizer tests OK"

@@ -14,7 +14,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 export TT_RASTER_TIMEOUT="${TT_RASTER_TIMEOUT:-900}"
-bin="${TT_RASTER_BUILD_DIR:-$root/build}/tools"
+bin="${TT_RASTER_BUILD_DIR:-$root/build}/core/tools"
 node="${TT_RASTER_NODE:-0}"
 mc_nodes="${TT_RASTER_MC_NODES:-0,1,2,3,4,5,6,7}"
 mc_chips="${TT_RASTER_MC_CHIPS:-1,2,4,8}"

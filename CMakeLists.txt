@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# tt-raster. Two parts:
-#   * the host library, tools and tests (src/, tools/, tests/): plain C++20 plus zlib, no tt-metal;
-#   * the device spikes and the Tensix renderer, built out of tree against a built tt-metal checkout.
+# tt-raster. Layout: core/ (the renderer), api/ (OpenGL and Vulkan drivers), plugins/ (Isaac Lab, ...).
+# Two parts of the build:
+#   * the host library, tools and tests (plain C++20 plus zlib, no tt-metal);
+#   * the device spikes and the Tensix renderer, built against a built tt-metal checkout.
 # Use scripts/build.sh. Without TT_METAL_HOME only the host part is built.
 
 cmake_minimum_required(VERSION 3.22...4.2)
@@ -34,9 +35,11 @@ if(TT_RASTER_BUILD_DEVICE)
     find_package(tt-metalium REQUIRED)
 endif()
 
-add_subdirectory(src)
-add_subdirectory(tests)
-add_subdirectory(tools)
-if(TT_RASTER_BUILD_DEVICE)
-    add_subdirectory(spikes)
+# core/     the renderer (library, tools, tests, device spikes)
+# api/      graphics API drivers (api/gl, api/vulkan): built with Mesa by scripts, not by this CMake project
+# plugins/  consumers of the core that are not graphics APIs (plugins/isaaclab; later a Gaussian-splatting renderer)
+add_subdirectory(core)
+option(TT_RASTER_BUILD_PLUGINS "Build the plugins" ON)
+if(TT_RASTER_BUILD_PLUGINS)
+    add_subdirectory(plugins/isaaclab)
 endif()

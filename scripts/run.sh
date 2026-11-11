@@ -6,8 +6,8 @@
 # directory outside the repository (never from the repository root).
 #
 #   scripts/run.sh <node-list> <binary> [args...]
-#   scripts/run.sh 0 build/spikes/a_lane_map/spike_a
-#   scripts/run.sh 0,1,2,3 build/tools/probe_device mesh
+#   scripts/run.sh 0 build/core/spikes/a_lane_map/spike_a
+#   scripts/run.sh 0,1,2,3 build/core/tools/probe_device mesh
 #
 # Chips are always selected by device node id through TT_VISIBLE_DEVICES; only nodes 0-7
 # (the assigned tray) are accepted. A timeout kills a hung program.
