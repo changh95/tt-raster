@@ -179,7 +179,11 @@ An entry-level discrete GPU is in the 5 to 10 TFLOP/s FP32 class (spec sheets), 
 1. **Keep the conformant baseline integrated** (done here): one Mesa with llvmpipe, lavapipe and our `tensix` driver, scripts and a test that checks the baseline.
 2. **Shader compiler** (the decisive piece). Done: ISA program to SFPI, bit-identical, cached, with fallback (above). Left: compile without stalling the first frame (see above: not possible beside a render with this tt-metal; needs a warm-up or an offline pre-warm), a NIR front end so that lavapipe and llvmpipe shaders reach the same instruction set (today the OpenGL fast path translates TGSI), a size model calibrated on kernel ELFs. Gate (met for the case measured above): a workload beats llvmpipe at 64 threads on this host.
 3. **Frame-level offload at llvmpipe's seam** (`lp_setup`: post-clip triangles with float vertices, the fragment shader's NIR through `nir_to_tgsi` and the existing translator). Done (section above); the gate (a workload beats llvmpipe on the same host) is met for shader-heavy untextured frames in both OpenGL and Vulkan.
-4. **Texture unit**, **compute**, **device server** (several processes at once), **CTS farm**: as in `docs/FULL_COVERAGE_PLAN.md`, in that order, each behind its own gate.
+4. As in `docs/FULL_COVERAGE_PLAN.md`, each behind its own gate:
+   - **Texture unit**: gate measured (spike F) and not met on this host, so textures stay on the CPU path; it is not built.
+   - **Compute**: not started and not planned here (lavapipe runs compute shaders on the CPU; nothing of the chip's SFPU model maps to pointers, shared memory and atomics without the plan's workstream 4).
+   - **Device server**: the simplest form is done: per-device locks and a device pool (`TTR_DEVICE_POOL`, `scripts/run.sh pool:4,5`, `scripts/test_pool.sh`) give each process a chip of the tray and send the next one to the CPU. A daemon that multiplexes one chip between clients, schedules and recovers hangs is not built.
+   - **CTS farm**: `scripts/run_cts.sh` runs any group on lavapipe alone, with the offload on the CPU backend or on a chip; the drawing groups pass (section above). Sharding over the tray and nightly runs are not set up.
 
 Until step 2 passes its gate there is no reason to promise GPU-like results. What can be promised today: complete API coverage on the CPU, a Tensix path for the OpenGL subset, and a measured route to making Tensix worth using for ALU-heavy untextured work.
 
