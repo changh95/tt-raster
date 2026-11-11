@@ -254,13 +254,13 @@ The whole-image figures are lower because of silhouette pixels (one renderer hit
 
 **Speed** (`validation/bench_scene.py`: 1,024 environments of 96 x 96, 316 triangles each, poses change every frame, median of 5 frames, frame = everything from poses to output arrays in host memory):
 
-| Outputs | CPU reference (64 threads for the host stages) | Tensix, 1 chip (x8 link) | Tensix, 4 chips (nodes 4 to 7) |
-| --- | --- | --- | --- |
-| depth | 827 ms | 57.5 ms (17,800 images/s) | 63.8 ms |
-| rgb + depth | | 64.1 ms | 75.3 ms |
-| depth, shape, rgb, normals (2 passes) | | 128.4 ms | 128.8 ms |
+| Outputs | Passes | CPU reference (64 threads for the host stages) | Tensix, 1 chip (x8 link) | Tensix, 8 chips |
+| --- | --- | --- | --- | --- |
+| depth | 1 | 827 ms | 36.5 ms (28,000 images/s) | 40.9 ms |
+| rgb + depth | 1 | | 44.9 ms | 47.2 ms |
+| depth, shape, rgb, normals | 2 | | 86.9 ms | 88.1 ms |
 
-For scale only: Newton's Warp ray tracer on this host's CPU needs about 1.3 ms per environment (10 ms for 8), which says nothing about its GPU speed; the comparison that matters, against Newton on a GPU, was not possible here. Where a frame goes (depth, 1 chip): vertex stage 3 ms, setup 5, binning 1.5, record encoding 2.6, upload 3, **device 1.5**, read-back 7.6, output assembly 6, and about 25 ms outside the instrumented phases (building the frame, allocating output arrays in Python). The kernels are not the bottleneck: the Tensix draws 324,000 triangles into 9.4 million pixels in 1.5 ms. Frame time is host work and PCIe. Four chips do not help because three of the four are x1 links (about 3 GB/s) and the host stages are serial per frame; on this host only one chip per tray has an x8 link. What would help, in order: keep the output on the device and in tile layout (I.6 stretch), send transforms instead of triangles (device vertex stage, I.3), and overlap frames (asynchronous capture).
+For scale only: Newton's Warp ray tracer on this host's CPU needs about 1.3 ms per environment (10 ms for 8), which says nothing about its GPU speed; the comparison that matters, against Newton on a GPU, was not possible here. Where a frame goes (depth, 1 chip): vertex stage 3.4 ms, setup 6, binning 1.6, record encoding 2.5, upload 3, **device 1.4**, read-back 7.6, frame construction 2.4, output assembly 5.2. The kernels are not the bottleneck: the Tensix draws 324,000 triangles into 9.4 million pixels in 1.4 ms. Frame time is host work and PCIe, and it is serial per frame, so eight chips do not beat one x8 chip (seven of the eight chips have x1 links, about 3 GB/s each, and the per-chip work is too small to matter). Two host fixes were worth 2x: reusing the frame's triangle storage between frames (a fresh 35 MB allocation cost 21 ms in page faults) and running setup, assembly and untiling on all host threads (frame time 126 ms to 57 ms to 36.5 ms). What would help next, in order: keep setup and bins in reused storage, keep outputs on the device in tile layout (I.6 stretch), send transforms instead of triangles (device vertex stage, I.3), and overlap frames (asynchronous capture).
 
 ### Incident: chip 0 stuck after a hang, and how it was recovered (2026-11-11)
 

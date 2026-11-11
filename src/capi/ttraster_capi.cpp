@@ -144,6 +144,8 @@ int ttr_render(
             stats->vertex_ms = st.vertex_ms;
             stats->raster_ms = st.raster_ms;
             stats->assemble_ms = st.assemble_ms;
+            stats->build_ms = st.build_ms;
+            stats->total_ms = st.total_ms;
             stats->triangles = st.triangles;
             stats->passes = st.passes;
         }

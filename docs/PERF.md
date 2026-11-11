@@ -208,13 +208,12 @@ Reading: device and read-back shrink with the chip count (read-back runs on eigh
 
 ## Tiled-camera rendering for Isaac Lab (Track I)
 
-`validation/bench_scene.py`, 1,024 environments of 96 x 96, 316 triangles per environment (pole capsule 4 x 16), poses change every frame, median of 5 frames after a warm-up, outputs copied to host memory. Chips: one x8 chip (node 5) or nodes 4 to 7.
+`validation/bench_scene.py`, 1,024 environments of 96 x 96, 316 triangles per environment (pole capsule 4 x 16), poses change every frame, median of 5 frames after a warm-up, outputs copied to host memory. Chips: one x8 chip (node 5) or all eight of the tray.
 
-| Outputs | Passes | 1 chip: frame | 1 chip: device kernels | 1 chip: read-back | 4 chips: frame |
-| --- | --- | --- | --- | --- | --- |
-| depth | 1 | 57.5 ms | 1.5 ms | 7.6 ms | 63.8 ms |
-| rgb + depth | 1 | 64.1 ms | 2.0 ms | 11.1 ms | 75.3 ms |
-| depth, shape, rgb, normals | 2 | 128.4 ms | 2.1 ms | 15.2 ms | 128.8 ms |
+| Outputs | Passes | 1 chip: frame | 1 chip: images/s | 8 chips: frame |
+| --- | --- | --- | --- | --- |
+| depth | 1 | 36.5 ms | 28,000 | 40.9 ms |
+| rgb + depth | 1 | 44.9 ms | 22,800 | 47.2 ms |
+| depth, shape, rgb, normals | 2 | 86.9 ms | 11,800 | 88.1 ms |
 
-CPU reference backend, same scene, depth: 827 ms for 1,024 environments (256: 219 ms). Before the host stages were parallelized the 8-chip depth frame took 126 ms; setup (single thread) 25 ms and output assembly 27 ms were the largest parts. Quality against Newton Warp is in FINDINGS.md.
-
+Breakdown of the 1-chip depth frame (ms): vertex stage 3.4, setup 6.1, binning 1.6, record encoding 2.5, upload 3.0, device kernels 1.4, read-back 7.6, frame construction 2.4, output assembly 5.2. CPU reference backend, same scene, depth: 827 ms for 1,024 environments (256: 219 ms). History of the 1-chip depth frame: 126 ms (serial setup 25 ms, assembly 27 ms), 57 ms after parallelizing the host stages, 36.5 ms after reusing the frame's triangle storage (frame construction 20.6 ms to 2.4 ms). Quality against Newton Warp is in FINDINGS.md.

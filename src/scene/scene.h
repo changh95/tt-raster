@@ -111,6 +111,8 @@ struct RenderStats {
     double vertex_ms = 0;     // transform, clipping, projection, frame construction
     double raster_ms = 0;     // backend render calls (all passes)
     double assemble_ms = 0;   // output images from framebuffers
+    double build_ms = 0;      // frame construction for the passes
+    double total_ms = 0;      // all of Scene::render()
     uint64_t triangles = 0;   // triangles submitted to the rasterizer (per pass)
     uint32_t passes = 0;
     std::string backend_report;   // Backend::report() after the last pass
@@ -134,6 +136,10 @@ private:
     uint32_t worlds_;
     std::vector<Mesh> meshes_;
     std::vector<Instance> instances_;
+    // Frame storage reused between render() calls: a fresh allocation of tens of megabytes per frame
+    // costs page faults that dominate the frame time otherwise.
+    mutable Frame work_frame_;
+    mutable std::vector<uint32_t> shape_cache_;
 };
 
 float srgb_to_linear(float c);

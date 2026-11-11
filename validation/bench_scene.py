@@ -54,7 +54,7 @@ def main():
     med = walls[len(walls) // 2]
     print(f"{args.backend} chips={args.chips} worlds={W} {N}x{N} outputs={args.outputs}: frame {med:.1f} ms median "
           f"({W / med * 1000:.0f} images/s)  vertex {last['vertex_ms']:.1f} raster {last['raster_ms']:.1f} "
-          f"assemble {last['assemble_ms']:.1f} ms, {last['triangles']} triangles, {last['passes']} pass(es)")
+          f"assemble {last['assemble_ms']:.1f} build {last['build_ms']:.1f} ms (C++ total {last['total_ms']:.1f}), {last['triangles']} triangles, {last['passes']} pass(es)")
     rep = sc.backend_report()
     if rep:
         print("   backend:", rep)

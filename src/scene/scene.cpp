@@ -344,15 +344,22 @@ void Scene::render(
     // Every pass draws the same triangles with a different colour payload; depth and triangle id come
     // with each. Pass 1 is the first one requested.
     enum Payload { kPAlbedo, kPLit, kPNormal };
-    std::vector<uint32_t> shape_of;   // per triangle of the frame: shape id (same for all passes)
+    std::vector<uint32_t>& shape_of = shape_cache_;   // per triangle of the frame: shape id (same for all passes)
     // Triangles of the frame in world order; shape ids per triangle are the same for every pass.
     std::vector<size_t> first_tri(worlds_ + 1, 0);
     for (uint32_t w = 0; w < worlds_; w++) first_tri[w + 1] = first_tri[w] + per_world[w].size();
     shape_of.resize(first_tri[worlds_]);
     for (uint32_t w = 0; w < worlds_; w++)
         for (size_t k = 0; k < per_world[w].size(); k++) shape_of[first_tri[w] + k] = per_world[w][k].shape;
-    auto build = [&](Payload payload) {
-        Frame f = base;
+    auto build = [&](Payload payload) -> Frame& {
+        Frame& f = work_frame_;
+        f.width = base.width;
+        f.height = base.height;
+        std::memcpy(f.clear_color, base.clear_color, sizeof f.clear_color);
+        f.clear_depth = base.clear_depth;
+        f.depth_func = base.depth_func;
+        f.cull = base.cull;
+        f.viewports = base.viewports;
         f.triangles.resize(first_tri[worlds_]);
         parallel_for(worlds_, threads, [&](uint32_t w) {
             size_t o = first_tri[w];
@@ -373,6 +380,12 @@ void Scene::render(
         return f;
     };
 
+    auto timed_build = [&](Payload payload) -> Frame& {
+        const auto b0 = Clock::now();
+        Frame& f = build(payload);
+        local.build_ms += std::chrono::duration<double, std::milli>(Clock::now() - b0).count();
+        return f;
+    };
     auto timed_render = [&](const Frame& f, uint32_t planes) -> const Framebuffer& {
         const auto r0 = Clock::now();
         const Framebuffer& fb = backend.render(f, planes);
@@ -433,19 +446,19 @@ void Scene::render(
 
     const bool want_geometry = (mask & (kDepth | kForwardDepth | kShape)) != 0;
     if (mask & kAlbedo) {
-        const Frame f = build(kPAlbedo);
+        const Frame& f = timed_build(kPAlbedo);
         const Framebuffer& fb = timed_render(f, kPlaneColor | (want_geometry && !have_geometry ? kPlaneDepth | kPlaneId : 0u));
         colour_from(fb, out.albedo);
         geometry_from(fb);
     }
     if (mask & kRgb) {
-        const Frame f = build(kPLit);
+        const Frame& f = timed_build(kPLit);
         const Framebuffer& fb = timed_render(f, kPlaneColor | (want_geometry && !have_geometry ? kPlaneDepth | kPlaneId : 0u));
         colour_from(fb, out.rgb);
         geometry_from(fb);
     }
     if (mask & kNormal) {
-        const Frame f = build(kPNormal);
+        const Frame& f = timed_build(kPNormal);
         // Normals need the unquantized channels and the id (to know where something was hit); depth only
         // if no earlier pass supplied it.
         const Framebuffer& fb = timed_render(f, kPlaneColor | kPlaneFloat | kPlaneId | (want_geometry && !have_geometry ? kPlaneDepth : 0u));
@@ -463,9 +476,10 @@ void Scene::render(
         geometry_from(fb);
     }
     if (!have_geometry && (mask & (kDepth | kForwardDepth | kShape))) {
-        const Frame f = build(kPAlbedo);
+        const Frame& f = timed_build(kPAlbedo);
         geometry_from(timed_render(f, kPlaneDepth | kPlaneId));
     }
+    local.total_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     local.backend_report = backend.report();
     if (stats) *stats = local;
 }

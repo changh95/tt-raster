@@ -36,7 +36,7 @@ typedef struct {
 } ttr_images;
 
 typedef struct {
-    double vertex_ms, raster_ms, assemble_ms;
+    double vertex_ms, raster_ms, assemble_ms, build_ms, total_ms;
     uint64_t triangles;
     uint32_t passes;
 } ttr_stats;

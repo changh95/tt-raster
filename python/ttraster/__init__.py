@@ -27,6 +27,7 @@ class _Images(C.Structure):
 
 class _Stats(C.Structure):
     _fields_ = [("vertex_ms", C.c_double), ("raster_ms", C.c_double), ("assemble_ms", C.c_double),
+                ("build_ms", C.c_double), ("total_ms", C.c_double),
                 ("triangles", C.c_uint64), ("passes", C.c_uint32)]
 
 
@@ -160,5 +161,5 @@ class Scene:
         st = _Stats()
         _check(_l().ttr_render(self._h, C.byref(cam), poses.ctypes.data, None if light is None else light.ctypes.data,
                                C.byref(ptrs), C.byref(st)))
-        return out, dict(vertex_ms=st.vertex_ms, raster_ms=st.raster_ms, assemble_ms=st.assemble_ms,
+        return out, dict(vertex_ms=st.vertex_ms, raster_ms=st.raster_ms, assemble_ms=st.assemble_ms, build_ms=st.build_ms, total_ms=st.total_ms,
                          triangles=st.triangles, passes=st.passes)

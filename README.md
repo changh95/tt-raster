@@ -55,5 +55,5 @@ Top to bottom, for four environments (96 x 96, the Isaac Lab cartpole camera): N
 | Normals, mean angle error | 0.05 degrees |
 | RGB PSNR over pixels both renderers hit | 49 dB |
 
-Speed: 1,024 environments of 96 x 96 take 57 ms per frame for depth on one chip (17,800 images/s), of which the Tensix kernels are 1.5 ms; the rest is host work and PCIe (`docs/PERF.md`). The Isaac Lab `BaseRenderer` shim, per-pixel lighting and the training run are not done; `docs/FINDINGS.md` has the interface contract, the measurements and what is missing.
+Speed: 1,024 environments of 96 x 96 take 36.5 ms per frame for depth on one chip (28,000 images/s), of which the Tensix kernels are 1.4 ms; the rest is host work and PCIe, which is why eight chips do not help yet (`docs/PERF.md`). The Isaac Lab `BaseRenderer` shim, per-pixel lighting and the training run are not done; `docs/FINDINGS.md` has the interface contract, the measurements and what is missing.
 
