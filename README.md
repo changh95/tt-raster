@@ -16,6 +16,7 @@ A tile-based software rasterizer for Tenstorrent Blackhole Tensix cores, checked
 ```
 scripts/build.sh                                  # host library, tools, tests
 scripts/test.sh                                   # all host tests, about 10 s
+scripts/test_sanitizers.sh                        # the same under AddressSanitizer and UBSan (and the fuzz on chips, with TT_METAL_HOME)
 TT_METAL_HOME=/path/to/tt-metal scripts/build.sh  # also the device spikes
 scripts/run.sh 0 build/spikes/a_lane_map/spike_a  # run a device program on node 0 only
 scripts/test_device.sh                            # on a chip: scenes against the reference, 1/2/4/8 chips, shader instruction accuracy, random shader programs
