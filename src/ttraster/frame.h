@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "ttraster/shader.h"
+
 namespace ttr {
 
 inline constexpr int32_t kTileSize = 32;
@@ -65,6 +67,14 @@ struct Triangle {
     DepthFunc depth_func = DepthFunc::Less;
     bool depth_write = true;
     BlendMode blend = BlendMode::None;
+    // Fragment shader: Frame::shaders[shader - 1] computes the fragment colour (0: fixed function, the vertex colours).
+    // The program's varyings of the three vertices are Frame::attrs[attr_offset ...], vertex-major: num_inputs floats
+    // of vertex 0, then of vertex 1, then of vertex 2 (a multiple of 3 floats per triangle, so the block can be
+    // addressed in thirds). They are interpolated like the colour, perspective-correctly when `perspective` is set;
+    // `flat` is ignored (give all vertices the same value for a flat varying). The vertex colours are not used.
+    // The shader's colour goes through the same blend and depth state as a fixed-function colour.
+    uint16_t shader = 0;
+    uint32_t attr_offset = 0;
 };
 
 // Face culling by the sign of signed_area2 = (x1-x0)*(y2-y0) - (y1-y0)*(x2-x0) in window
@@ -83,6 +93,11 @@ struct Frame {
     // original single-image mode). Otherwise every triangle is confined to its viewport and the
     // target may be larger than kMaxTargetSize.
     std::vector<Viewport> viewports;
+    // Fragment shader programs and the varyings of the triangles that use them (Triangle::shader). A frame with any
+    // shader triangle has an RGBA8 target: every colour write is quantized to 8 bits and blending reads the quantized
+    // colour back, as on a GPU; frames without shaders keep unquantized float colour while drawing.
+    std::vector<ShaderProgram> shaders;
+    std::vector<float> attrs;
 
     // The render target is the viewport padded up to whole tiles. Pixels in the padding are
     // rasterized like any other and are cropped away on read-back.

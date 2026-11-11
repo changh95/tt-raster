@@ -160,6 +160,10 @@ int main(int argc, char** argv) {
     for (const std::string& name : names) {
         Frame frame;
         make_scene(name, w, h, frame);
+        if (!frame.shaders.empty()) {
+            std::printf("%-18s skipped: fragment shaders are not on the device yet\n", name.c_str());
+            continue;
+        }
         const SetupResult setup = setup_frame(frame);
         const TileBins bins = bin_triangles(setup, frame.tiles_x(), frame.tiles_y());
         const Framebuffer ref = render_reference(frame, setup, bins);

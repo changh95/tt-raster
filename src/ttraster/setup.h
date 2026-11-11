@@ -60,7 +60,9 @@ struct SetupTriangle {
     Edge edge[3] = {};             // edge i runs from vertex i to vertex (i+1)%3
     Plane depth;
     Plane color[4];
-    Plane inv_w;                   // rhw, only for perspective triangles
+    Plane inv_w;                   // rhw, only for perspective triangles and shader triangles
+    uint16_t shader = 0;           // Triangle::shader: the fragment shader of this triangle (0: none)
+    uint32_t plane_base = 0;       // shader triangles: its varying planes are SetupResult::attr_planes[plane_base ...]
     int32_t tile_x0 = 0, tile_y0 = 0, tile_x1 = 0, tile_y1 = 0;  // inclusive, inside the target
 };
 
@@ -74,6 +76,10 @@ struct SetupStats {
 
 struct SetupResult {
     std::vector<SetupTriangle> tris;
+    // Screen-space planes of the shader varyings, one per component, shared by all pieces of a source triangle:
+    // the plane of component k of triangle t is attr_planes[Triangle::attr_offset / 3 + k]. Perspective triangles
+    // hold component * rhw (divide by the `inv_w` plane at the pixel). Empty if the frame has no shader triangles.
+    std::vector<Plane> attr_planes;
     SetupStats stats;
 };
 

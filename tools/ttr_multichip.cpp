@@ -67,6 +67,10 @@ int main(int argc, char** argv) {
         if (which != "all" && which != info.name) continue;
         Frame frame;
         make_scene(info.name, w, h, frame);
+        if (!frame.shaders.empty()) {
+            std::printf("\n%s\n  skipped: fragment shaders are not on the device yet\n", info.name);
+            continue;
+        }
         const SetupResult setup = setup_frame(frame);
         const TileBins bins = bin_triangles(setup, frame.tiles_x(), frame.tiles_y());
         const Framebuffer ref = render_reference(frame, setup, bins);

@@ -58,6 +58,12 @@ struct TileParams {
     TileCoverage coverage;
 };
 
+// One plane relative to the tile centre: value at a pixel = fma(gx, ddx, fma(gy, ddy, c)).
+struct TilePlane {
+    float c, gx, gy;
+};
+TilePlane make_tile_plane(const Plane& pl, int tx, int ty);
+
 inline float tile_offset(int i) { return static_cast<float>(kSubpixelScale * i - (kTileSize * kSubpixelScale / 2 - kSubpixelScale / 2)); }
 
 // Exact classification of tile (tx, ty) against a triangle using integer arithmetic.

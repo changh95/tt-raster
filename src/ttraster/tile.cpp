@@ -100,20 +100,28 @@ VectorClasses classify_vectors(const SetupTriangle& t, int tx, int ty, TileCover
     return c;
 }
 
+TilePlane make_tile_plane(const Plane& pl, int tx, int ty) {
+    const double tcx = static_cast<double>(tile_centre(tx)) / kSubpixelScale;
+    const double tcy = static_cast<double>(tile_centre(ty)) / kSubpixelScale;
+    TilePlane r;
+    r.c = static_cast<float>(pl.c + pl.gx * tcx + pl.gy * tcy);
+    r.gx = static_cast<float>(pl.gx / kSubpixelScale);  // per subpixel unit: exact scaling
+    r.gy = static_cast<float>(pl.gy / kSubpixelScale);
+    return r;
+}
+
 TileParams make_tile_params(const SetupTriangle& t, int tx, int ty) {
     TileParams p{};
     p.coverage = classify_tile(t, tx, ty);
-    const int64_t cx = tile_centre(tx), cy = tile_centre(ty);
     for (int i = 0; i < 3; i++) {
         p.edge[i] = make_tile_edge(t.edge[i], tx, ty);
     }
 
-    const double tcx = static_cast<double>(cx) / kSubpixelScale;
-    const double tcy = static_cast<double>(cy) / kSubpixelScale;
     auto fill = [&](const Plane& pl, float& c, float& gx, float& gy) {
-        c = static_cast<float>(pl.c + pl.gx * tcx + pl.gy * tcy);
-        gx = static_cast<float>(pl.gx / kSubpixelScale);  // per subpixel unit: exact scaling
-        gy = static_cast<float>(pl.gy / kSubpixelScale);
+        const TilePlane tp = make_tile_plane(pl, tx, ty);
+        c = tp.c;
+        gx = tp.gx;
+        gy = tp.gy;
     };
     fill(t.depth, p.depth_c, p.depth_gx, p.depth_gy);
     for (int ch = 0; ch < 4; ch++) {

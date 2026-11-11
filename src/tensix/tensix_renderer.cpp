@@ -170,6 +170,9 @@ DeviceFrame TensixRenderer::render(
     const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
     const DeviceOptions& opt, Framebuffer* target) {
     using namespace layout;
+    if (!frame.shaders.empty()) {
+        throw std::runtime_error("fragment shaders are not supported by the Tensix renderer yet (CPU reference only)");
+    }
     DeviceFrame out;
     const uint32_t pw = frame.padded_width(), ph = frame.padded_height();
     if (target == nullptr) {

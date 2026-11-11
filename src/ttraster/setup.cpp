@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 namespace ttr {
@@ -103,7 +104,7 @@ SetupStatus snap_triangle(const Triangle& tri, CullMode cull, SnappedTriangle& o
         if (std::fabs(v.x) > kMaxInputCoord || std::fabs(v.y) > kMaxInputCoord) {
             return SetupStatus::OutOfRange;
         }
-        if (tri.perspective && !tri.flat && !(std::isfinite(v.rhw) && v.rhw > 0.0f)) {
+        if (tri.perspective && (!tri.flat || tri.shader != 0) && !(std::isfinite(v.rhw) && v.rhw > 0.0f)) {
             return SetupStatus::NonFinite;
         }
     }
@@ -193,6 +194,16 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
         }
     }
 
+    for (size_t k = 0; k < frame.shaders.size(); k++) {
+        const std::string err = validate_shader(frame.shaders[k]);
+        if (!err.empty()) throw std::invalid_argument("shader " + std::to_string(k) + ": " + err);
+    }
+    if (frame.shaders.empty()) {
+        res.attr_planes.clear();
+    } else {
+        res.attr_planes.resize(frame.attrs.size() / 3);
+    }
+
     res.stats = SetupStats{};
     res.stats.input = frame.triangles.size();
     auto process = [&](uint32_t src, std::vector<SetupTriangle>& tris, SetupStats& stats) {
@@ -214,8 +225,27 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
             color[ch] = fit_plane(s, tri.v[0].color[ch], tri.v[1].color[ch], tri.v[2].color[ch]);
         }
         Plane inv_w;
-        const bool perspective = tri.perspective && !tri.flat;
-        if (perspective) {
+        const bool shaded = tri.shader != 0;
+        const bool flat = tri.flat && !shaded;
+        const bool perspective = tri.perspective && !flat;
+        uint32_t plane_base = 0;
+        if (shaded) {
+            if (tri.shader > frame.shaders.size()) throw std::invalid_argument("triangle shader index out of range");
+            const uint32_t n = frame.shaders[tri.shader - 1].num_inputs;
+            if (tri.attr_offset % 3 != 0 || static_cast<uint64_t>(tri.attr_offset) + 3ull * n > frame.attrs.size()) {
+                throw std::invalid_argument("triangle varyings outside Frame::attrs");
+            }
+            plane_base = tri.attr_offset / 3;
+            const float* a = frame.attrs.data() + tri.attr_offset;
+            for (uint32_t k = 0; k < n; k++) {
+                const double v0 = a[k], v1 = a[n + k], v2 = a[2 * n + k];
+                res.attr_planes[plane_base + k] = perspective
+                    ? fit_plane(s, v0 * tri.v[0].rhw, v1 * tri.v[1].rhw, v2 * tri.v[2].rhw)
+                    : fit_plane(s, v0, v1, v2);
+            }
+            inv_w = fit_plane(s, tri.v[0].rhw, tri.v[1].rhw, tri.v[2].rhw);   // gl_FragCoord.w, and the perspective divisor
+        }
+        if (perspective && !shaded) {
             for (int ch = 0; ch < 4; ch++) {
                 color[ch] = fit_plane(s, static_cast<double>(tri.v[0].color[ch]) * tri.v[0].rhw,
                                       static_cast<double>(tri.v[1].color[ch]) * tri.v[1].rhw,
@@ -223,7 +253,7 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
             }
             inv_w = fit_plane(s, tri.v[0].rhw, tri.v[1].rhw, tri.v[2].rhw);
         }
-        if (tri.flat) {
+        if (flat) {
             for (int ch = 0; ch < 4; ch++) {
                 color[ch] = Plane{tri.v[0].color[ch], 0.0, 0.0};
             }
@@ -274,8 +304,10 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
             t.source = src;
             t.piece = static_cast<uint32_t>(k);
             t.clipped = outside_guard;
-            t.flat = tri.flat;
+            t.flat = flat;
             t.perspective = perspective;
+            t.shader = tri.shader;
+            t.plane_base = plane_base;
             t.depth_func = tri.own_state ? tri.depth_func : frame.depth_func;
             t.depth_write = tri.own_state ? tri.depth_write : true;
             t.blend = tri.own_state ? tri.blend : BlendMode::None;

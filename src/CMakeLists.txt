@@ -6,6 +6,7 @@ find_package(ZLIB REQUIRED)
 
 add_library(ttraster_core STATIC
     ttraster/frame.cpp
+    ttraster/shader.cpp
     ttraster/setup.cpp
     ttraster/tile.cpp
     ttraster/reference.cpp
