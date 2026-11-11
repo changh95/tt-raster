@@ -271,6 +271,43 @@ Image make_heatmap(const Image& a, const Image& b) {
     return h;
 }
 
+Image downscale(const Image& img, uint32_t f) {
+    Image out;
+    out.width = img.width / f;
+    out.height = img.height / f;
+    out.rgba.resize(static_cast<size_t>(out.width) * out.height * 4);
+    for (uint32_t y = 0; y < out.height; y++) {
+        for (uint32_t x = 0; x < out.width; x++) {
+            uint32_t sum[4] = {0, 0, 0, 0};
+            for (uint32_t j = 0; j < f; j++)
+                for (uint32_t i = 0; i < f; i++) {
+                    const uint8_t* p = img.pixel(x * f + i, y * f + j);
+                    for (int c = 0; c < 4; c++) sum[c] += p[c];
+                }
+            uint8_t* o = &out.rgba[(static_cast<size_t>(y) * out.width + x) * 4];
+            for (int c = 0; c < 4; c++) o[c] = static_cast<uint8_t>((sum[c] + f * f / 2) / (f * f));
+        }
+    }
+    return out;
+}
+
+Image hstack(const std::vector<Image>& panels, uint32_t gap, const uint8_t gap_rgba[4]) {
+    Image out;
+    if (panels.empty()) return out;
+    out.height = panels[0].height;
+    for (const Image& p : panels) out.width += p.width;
+    out.width += gap * static_cast<uint32_t>(panels.size() - 1);
+    out.rgba.resize(static_cast<size_t>(out.width) * out.height * 4);
+    for (size_t i = 0; i < static_cast<size_t>(out.width) * out.height; i++) std::memcpy(&out.rgba[i * 4], gap_rgba, 4);
+    uint32_t x0 = 0;
+    for (const Image& p : panels) {
+        for (uint32_t y = 0; y < out.height; y++)
+            std::memcpy(&out.rgba[(static_cast<size_t>(y) * out.width + x0) * 4], p.pixel(0, y), static_cast<size_t>(p.width) * 4);
+        x0 += p.width + gap;
+    }
+    return out;
+}
+
 uint64_t fnv1a64(const void* data, size_t bytes, uint64_t seed) {
     const auto* p = static_cast<const uint8_t*>(data);
     uint64_t h = seed;

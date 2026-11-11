@@ -20,3 +20,23 @@ scripts/test_device.sh                            # Phase 2 acceptance: crops, f
 ```
 
 The host part needs a C++20 compiler, CMake, Ninja and zlib.
+
+## Results: Tensix against the CPU reference
+
+Every image below is rendered at 1920 x 1088 on one Blackhole chip (all 120 worker cores) and compared pixel by pixel with the CPU reference. Each picture shows, left to right, **CPU reference | Tensix device | difference** (black = identical; any differing pixel would show up red to yellow). The images are downscaled 4x for the page; the comparison itself is at full resolution, and the committed full-size reference images are in `tests/golden/`.
+
+| Scene | Pixels that differ | Device time (1 chip) | Comparison |
+| --- | --- | --- | --- |
+| one smooth triangle | 0 of 2,088,960 | 0.6 ms | ![one_triangle](docs/images/one_triangle.png) |
+| 96-triangle fan (shared edges) | 0 | 0.9 ms | ![fan](docs/images/fan.png) |
+| jittered grid mesh, 4,080 triangles (watertight: every pixel hit once) | 0 | 0.8 ms | ![grid](docs/images/grid.png) |
+| 24 interpenetrating triangles | 0 | 0.7 ms | ![interpenetrating](docs/images/interpenetrating.png) |
+| one screen-covering triangle (guard-band clipping) | 0 | 0.6 ms | ![fullscreen](docs/images/fullscreen.png) |
+| coplanar triangles, `LESS_EQUAL` depth ties | 0 | see PERF.md | ![coplanar](docs/images/coplanar_lequal.png) |
+| 10,000 tiny triangles | 0 | 0.6 ms | ![tiny](docs/images/tiny_10k.png) |
+| 10,000 random triangles | 0 | 2.7 ms | ![random](docs/images/random_10k.png) |
+
+Device time is the minimum over repeated warm frames, colour plane only (`docs/PERF.md`). Whole-frame time including host setup, upload and read-back is 12 to 16 ms on one chip and 6 to 7 ms on eight chips, with the eight-chip image bit-identical to the one-chip image.
+
+Regenerate: `scripts/run.sh 0 build/tools/ttr_device all --mode grid --colour-only --png DIR`, then `build/tools/ttr_compare DIR/<scene>_reference.png DIR/<scene>_device.png docs/images/<scene>.png`.
+

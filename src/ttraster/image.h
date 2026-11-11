@@ -44,6 +44,11 @@ DiffStats diff_images(const Image& a, const Image& b, int tolerance = 0);
 // Black where identical, dark red to yellow by increasing maximum channel error.
 Image make_heatmap(const Image& a, const Image& b);
 
+// Box-filter downscale by an integer factor (edge pixels that do not fill a block are dropped).
+Image downscale(const Image& img, uint32_t factor);
+// Place images side by side (same height), separated by `gap` pixels of `gap_rgba`.
+Image hstack(const std::vector<Image>& panels, uint32_t gap, const uint8_t gap_rgba[4]);
+
 // FNV-1a 64-bit, used for golden manifests of buffers that have no image form.
 uint64_t fnv1a64(const void* data, size_t bytes, uint64_t seed = 0xcbf29ce484222325ull);
 

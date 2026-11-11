@@ -7,6 +7,9 @@ target_link_libraries(ttr_render PRIVATE ttraster_core)
 add_executable(ttr_diff ttr_diff.cpp)
 target_link_libraries(ttr_diff PRIVATE ttraster_core)
 
+add_executable(ttr_compare ttr_compare.cpp)
+target_link_libraries(ttr_compare PRIVATE ttraster_core)
+
 # Device tool: needs tt-metal.
 if(TT_RASTER_BUILD_DEVICE)
     add_executable(probe_device probe_device.cpp)
