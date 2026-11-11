@@ -395,27 +395,31 @@ get_program(struct lp_tensix *t, const struct lp_fragment_shader *fs, const char
 }
 
 /* nir_to_tgsi does not survive every intrinsic llvmpipe's shaders can contain (bindless image loads of input attachments, global and
- * shared memory, atomics, barriers): refuse those shaders before converting them. */
-static bool
-shader_nir_ok(const nir_shader *nir)
+ * shared memory, atomics, barriers): screen the shader before converting it. Returns why it is refused, or NULL. */
+static const char *
+shader_nir_refused(struct lp_tensix *t, const nir_shader *nir)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_tex)
-               return false;
+               return "textures, images or storage buffers";
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             const char *name = nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].name;
-            if (strstr(name, "image") || strstr(name, "bindless") || strstr(name, "global") || strstr(name, "shared") ||
-                strstr(name, "ssbo") || strstr(name, "atomic") || strstr(name, "barrier") || strstr(name, "scratch") ||
-                strstr(name, "fbfetch") || strstr(name, "const_buf_base_addr") || strstr(name, "sample_") || strstr(name, "ballot") ||
-                strstr(name, "subgroup") || strstr(name, "vote") || strstr(name, "shuffle") || strstr(name, "quad"))
-               return false;
+            if (strstr(name, "image") || strstr(name, "bindless") || strstr(name, "ssbo") || strstr(name, "fbfetch") ||
+                strstr(name, "const_buf_base_addr"))
+               return "textures, images or storage buffers";
+            if (strstr(name, "global") || strstr(name, "shared") || strstr(name, "atomic") || strstr(name, "barrier") ||
+                strstr(name, "scratch") || strstr(name, "sample_") || strstr(name, "ballot") || strstr(name, "subgroup") ||
+                strstr(name, "vote") || strstr(name, "shuffle") || strstr(name, "quad")) {
+               DBG(t, "shader refused for intrinsic %s", name);
+               return "memory, subgroup or sample intrinsics";
+            }
          }
       }
    }
-   return true;
+   return NULL;
 }
 
 /* Why the current state cannot be offloaded, or NULL (and fills in the draw's description). */
@@ -505,8 +509,9 @@ state_refused(struct lp_tensix *t)
    if (!nir || BITSET_LAST_BIT(nir->info.textures_used) || BITSET_LAST_BIT(nir->info.images_used) || nir->info.num_ssbos ||
        nir->info.num_textures || nir->info.num_images || nir->info.fs.uses_fbfetch_output || nir->info.writes_memory)
       return "textures, images or storage buffers";
-   if (!shader_nir_ok(nir))
-      return "shader uses bindless resources, memory or other intrinsics the converter cannot take";
+   const char *nir_why = shader_nir_refused(t, nir);
+   if (nir_why)
+      return nir_why;
    const char *why = NULL;
    const struct lp_ttr_prog *prog = get_program(t, fs, &why);
    t->shaded = false;

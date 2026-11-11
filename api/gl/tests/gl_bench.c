@@ -4,12 +4,14 @@
  * fragment ALU work. One frame is a clear plus the draws below, then glFinish and a one-pixel read-back (so the frame is rendered
  * but not copied to a window).
  *
- *   gl_bench [--size WxH] [--frames N] [--tris N] [--layers L] [--alu K] [--per-frame]
+ *   gl_bench [--size WxH] [--frames N] [--tris N] [--layers L] [--alu K] [--tex T] [--per-frame]
  *
  *   --tris N     N small triangles tiling the window (fixed-function, per-vertex colours, depth test on)
  *   --layers L   L full-window quads, back to front, no depth test (overdraw); with --alu K each has a GLSL fragment shader of K
  *                dependent multiply-adds (an unrolled chain, so the shader is straight-line code)
  *   --alu K      steps of that chain, two instructions each (default 0: a colour pass-through)
+ *   --tex T      each layer's fragment shader instead samples a T x T RGBA8 texture, bilinear, at a rotated mapping that steps about one
+ *                texel per pixel (the texel-rate comparison of docs/EVALUATION_GL_VULKAN.md)
  *
  * Prints "ms/frame" and FPS over the timed frames (after 5 warm-up frames).
  */
@@ -30,14 +32,20 @@ static double now_ms(void)
    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
 }
 
-static GLuint make_program(int alu)
+static GLuint make_program(int alu, int tex, int w)
 {
    const char *vs = "#version 120\nvarying vec2 uv;\nvoid main(){ uv = gl_Vertex.xy * 0.5 + 0.5; gl_Position = gl_Vertex; }\n";
    char *fs = malloc(64 * 1024);
    int n = snprintf(fs, 4096, "#version 120\nvarying vec2 uv;\nvoid main(){\n float x = uv.x;\n");
    for (int i = 0; i < alu; i++)
       n += snprintf(fs + n, 128, " x = fract(x * 1.37 + uv.y);\n");   /* two instructions a step; the fract keeps the GLSL optimizer from folding the chain */
-   snprintf(fs + n, 256, " gl_FragColor = vec4(x, x * 0.5, uv.y, 1.0);\n}\n");
+   if (tex)
+      snprintf(fs, 4096,
+               "#version 120\nvarying vec2 uv;\nuniform sampler2D t;\nvoid main(){\n"
+               " vec2 st = vec2(uv.x * 0.8 + uv.y * 0.6, uv.y * 0.8 - uv.x * 0.6) * %f;\n gl_FragColor = texture2D(t, st);\n}\n",
+               (double)w / tex);
+   else
+      snprintf(fs + n, 256, " gl_FragColor = vec4(x, x * 0.5, uv.y, 1.0);\n}\n");
    GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER), p = glCreateProgram();
    glShaderSource(v, 1, &vs, NULL);
    glCompileShader(v);
@@ -66,13 +74,14 @@ static GLuint make_program(int alu)
 
 int main(int argc, char **argv)
 {
-   int w = 1920, h = 1080, frames = 100, tris = 0, layers = 0, alu = 0, per_frame = 0;
+   int w = 1920, h = 1080, frames = 100, tris = 0, layers = 0, alu = 0, per_frame = 0, tex = 0;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &w, &h);
       else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--tris") && i + 1 < argc) tris = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--layers") && i + 1 < argc) layers = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--alu") && i + 1 < argc) alu = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--tex") && i + 1 < argc) tex = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--per-frame")) per_frame = 1;
    }
    if (!tris && !layers) layers = 1;
@@ -90,7 +99,20 @@ int main(int argc, char **argv)
    glViewport(0, 0, w, h);
    fprintf(stderr, "GL_RENDERER = %s\n", (const char *)glGetString(GL_RENDERER));
 
-   GLuint prog = layers ? make_program(alu) : 0;
+   GLuint prog = layers ? make_program(alu, tex, w) : 0;
+   if (tex) {
+      unsigned *texels = malloc((size_t)tex * tex * 4);
+      for (long i = 0; i < (long)tex * tex; i++) texels[i] = (unsigned)((i + 1) * 2654435761u);
+      GLuint tid;
+      glGenTextures(1, &tid);
+      glBindTexture(GL_TEXTURE_2D, tid);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tex, tex, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+      free(texels);
+   }
    /* Triangle soup: a grid of cells, two triangles each, per-vertex colours, spread in depth so the depth test works. */
    float *verts = NULL, *cols = NULL;
    int ntri = tris;
@@ -147,7 +169,9 @@ int main(int argc, char **argv)
       if (per_frame) printf("frame %d: %.1f ms\n", f, now_ms() - tf);
    }
    double ms = (now_ms() - t0) / frames;
-   printf("%dx%d tris=%d layers=%d alu=%d: %.2f ms/frame, %.1f FPS\n", w, h, ntri, layers, alu, ms, 1000.0 / ms);
+   printf("%dx%d tris=%d layers=%d alu=%d tex=%d: %.2f ms/frame, %.1f FPS", w, h, ntri, layers, alu, tex, ms, 1000.0 / ms);
+   if (tex) printf(", %.0f Mpixel/s", (double)w * h * layers / (ms * 1e3));
+   printf("\n");
    glXMakeCurrent(dpy, None, NULL);
    glXDestroyContext(dpy, ctx);
    XCloseDisplay(dpy);

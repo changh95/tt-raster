@@ -102,13 +102,29 @@ The crossover is at about 8 layers (about 1,000 shader instructions per pixel), 
 
 Wired since the first version of this section: `gl_FragCoord` (llvmpipe's NIR flips `y` itself with a driver constant loaded from the buffer, so the translator must not flip it again), uniforms loaded with `LOAD` from constant buffer 0, and `discard` (`DEMOTE`); `stripes`, `fog`, `cond`, `loop`, `discard` and `uniform` are in `scripts/test_lp.sh` (37 comparisons pass on the CPU backend and on a chip). Not done in this offload (each is refused and runs on the CPU path): other system values, textures (needs the software texture unit), blending beyond five factor pairs, MSAA, stencil, render areas smaller than the image, several colour attachments, push constants and uniform buffers other than constant buffer 0 (untested through lavapipe), and presenting through a swapchain (the offload is tested with a headless render target and vkcube-style X11 swapchains were not run with it). Depth is written eagerly, converted on the host thread pool into the surface's format with the colour copy (`ttr_frame_end_depth`: Vulkan frames at 1080p, 1,000 triangles 7.1 ms, 20,000 triangles 12.6 ms on the chip against 2.2 and 8.0 for 64 CPU threads); a lazy depth plane (as in `api/gl`) was tried through a resource hook and deadlocked, because llvmpipe's rasterizer threads map the depth surface of every scene (documented here instead of fixed).
 
+## Texture unit: the kill-gate number (spike F, measured)
+
+The plan's workstream 2 (a software texture unit: data-movement cores fetch texels, the SFPU filters) has a kill gate in `docs/FULL_COVERAGE_PLAN.md`: "textured frames worth offloading", decided by texel-rate numbers. `core/spikes/f_texel` measures what a data-movement RISC-V core of the chip can do per pixel with a 2D RGBA8 texture and an affine mapping of about one texel per pixel (the best case for caching; 12 x 10 = 120 worker cores, 1.35 GHz, one chip):
+
+| What one core does per pixel | cycles | per core | 120 cores |
+| --- | --- | --- | --- |
+| texture in L1 (256 x 256, 256 KB), nearest: 1 load | 18 | 75 Mpixel/s | 9.0 Gpixel/s |
+| L1, gather of the 4 bilinear texels and the 2 weights into an L1 ring (for the SFPU to filter) | 75 | 18 Mpixel/s | 2.1 Gpixel/s |
+| L1, bilinear filtered on the RISC-V (3 packed RGBA8 lerps) | 91 | 15 Mpixel/s | 1.8 Gpixel/s |
+| DRAM texture (2048 x 2048), one 64-byte NoC read per pixel, 32 in flight | 53 (1 core) | 25 Mpixel/s | 0.53 Gpixel/s (305 cycles each with all cores: the NoC and DRAM are the limit) |
+| DRAM, four reads per pixel (footprint crosses a page corner) | 147 (1 core) | 9 Mpixel/s | 0.12 Gpixel/s |
+
+Against it, llvmpipe on the same host (`gl_bench --layers 8 --tex 256`, 1920 x 1080, bilinear, one texel per pixel, GL_REPEAT; the numbers include the frame's clear and read-back): 64 threads 3.0 Gpixel/s, 8 threads 1.1 to 1.2, one thread 0.2 (256 x 256 and 1024 x 1024 textures alike).
+
+Reading: a loads-and-stores RISC-V core spends about 8 cycles on every L1 access, so the gather alone costs 75 cycles a pixel and a chip tops out near 2 Gpixel/s with the whole texture in every core's L1, before the SFPU has filtered anything or the shader has run. That is about two thirds of 64 llvmpipe threads, 2 times 8 threads, and the DRAM-fed variant (textures larger than an L1, or any texture that is not resident) is 6 to 25 times slower than the CPU. **The gate is not met on this host: textured frames stay on the CPU path** (what the offload does today: it refuses them). It would flip only with several chips on one frame (a tray of eight is about 17 Gpixel/s in the best case, if the other stages scale, which they do not yet), a host with far fewer cores, or a faster texel path in silicon (the plan's own fallback: "raise texture units as a silicon request").
+
 ## Against a GPU
 
 An entry-level discrete GPU is in the 5 to 10 TFLOP/s FP32 class (spec sheets), that is 2.5 to 5 T fused lane-operations per second: a compiled Tensix chip (1.9 T on simple operations, less on shaders with `floor`, `fract` or transcendentals) is within a factor of two to ten of that for pure ALU work. Everything else is where a GPU is far ahead, and no kernel work changes it:
 
 | Feature | GPU | Tensix here |
 | --- | --- | --- |
-| Texture sampling | dedicated units | none; the SFPU cannot gather per-lane addresses; a software unit (data-movement cores fetch texels into L1, the SFPU filters) is the plan's workstream 2 and is not started |
+| Texture sampling | dedicated units | none; the SFPU cannot gather per-lane addresses; the fetch rate of a software unit is measured below (spike F): below 64-thread llvmpipe on this host even in the best case, so texturing stays on the CPU |
 | Rasterizer, ROPs, blending, depth | fixed function | software: about 230 M triangles per second per chip for tiny triangles (324,000 in 1.4 ms), blending in the SFPU |
 | Frame latency | well under 1 ms | 2 to 5 ms fixed (host stages, upload, read-back over PCIe); not hidden for presenting windows (see PERF.md, overlap rejected) |
 | Compute, memory model, atomics | native | needs the plan's workstream 4; none exists |
