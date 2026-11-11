@@ -6,16 +6,16 @@
 find_package(ZLIB REQUIRED)
 
 add_library(ttraster_core STATIC
-    core/src/ttraster/frame.cpp
-    core/src/ttraster/shader.cpp
-    core/src/ttraster/setup.cpp
-    core/src/ttraster/tile.cpp
-    core/src/ttraster/reference.cpp
-    core/src/ttraster/backend.cpp
-    core/src/ttraster/oracle.cpp
-    core/src/ttraster/scenes.cpp
-    core/src/ttraster/image.cpp
-    core/src/ttraster/parallel.cpp)
+    src/ttraster/frame.cpp
+    src/ttraster/shader.cpp
+    src/ttraster/setup.cpp
+    src/ttraster/tile.cpp
+    src/ttraster/reference.cpp
+    src/ttraster/backend.cpp
+    src/ttraster/oracle.cpp
+    src/ttraster/scenes.cpp
+    src/ttraster/image.cpp
+    src/ttraster/parallel.cpp)
 target_include_directories(ttraster_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(ttraster_core PUBLIC ZLIB::ZLIB)
 target_compile_features(ttraster_core PUBLIC cxx_std_20)
@@ -29,7 +29,7 @@ if(TT_RASTER_BUILD_DEVICE)
 endif()
 
 # C interface: libttraster.so (CPU reference backend; Tensix backend when built with tt-metal).
-add_library(ttraster SHARED core/src/capi/ttraster_capi.cpp)
+add_library(ttraster SHARED src/capi/ttraster_capi.cpp)
 target_link_libraries(ttraster PRIVATE ttraster_core)
 target_include_directories(ttraster PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(ttraster PROPERTIES POSITION_INDEPENDENT_CODE ON)
