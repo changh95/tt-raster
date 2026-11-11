@@ -55,6 +55,20 @@ else
 fi
 cp "$root/api/gl/softpipe_tensix/"sp_tensix*.[ch] "$root/core/include/ttraster/ttraster_isa.h" "$src/src/gallium/drivers/softpipe/"
 
+# The same for llvmpipe (and with it lavapipe): hooks in the setup stage, the offload file, and the shader translator, which is the
+# softpipe one with its names prefixed (both drivers end up in one library, and lavapipe links llvmpipe alone).
+patch2="$root/api/gl/patches/0002-llvmpipe-tensix-hooks.patch"
+if git -C "$src" apply --reverse --check "$patch2" 2>/dev/null; then
+    echo "llvmpipe patch already applied"
+else
+    git -C "$src" apply "$patch2"
+fi
+lpdir="$src/src/gallium/drivers/llvmpipe"
+cp "$root/api/gl/llvmpipe_tensix/"lp_tensix.[ch] "$root/core/include/ttraster/ttraster_isa.h" "$lpdir/"
+sed 's/ttr_prog/lp_ttr_prog/g; s/SP_TENSIX_SHADER_H/LP_TENSIX_SHADER_H/g; s/sp_tensix_shader\.h/lp_tensix_shader.h/g' \
+    "$root/api/gl/softpipe_tensix/sp_tensix_shader.h" > "$lpdir/lp_tensix_shader.h"
+sed 's/ttr_prog/lp_ttr_prog/g; s/sp_tensix_shader\.h/lp_tensix_shader.h/g' "$root/api/gl/softpipe_tensix/sp_tensix_shader.c" > "$lpdir/lp_tensix_shader.c"
+
 if [[ ! -d "$build" ]]; then
     common=(-Dbuildtype=release -Dplatforms=x11 -Dglx=dri -Degl=enabled -Dgbm=disabled -Dgles1=disabled -Dgles2=enabled
         -Dvideo-codecs= -Dlmsensors=disabled -Dvalgrind=disabled -Dzstd=disabled -Dgallium-rusticl=false -Dtools= -Dbuild-tests=false)

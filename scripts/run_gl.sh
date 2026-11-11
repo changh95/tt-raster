@@ -9,6 +9,7 @@
 #   scripts/run_gl.sh 5 glxgears -geometry 1920x1080
 #   scripts/run_gl.sh 5 --backend off glxgears        # the same Mesa, stock softpipe (for comparisons)
 #   scripts/run_gl.sh 5 --driver llvmpipe glxgears    # the conformant CPU driver (OpenGL 4.6) of the `build_mesa.sh --llvm` build
+#   scripts/run_gl.sh 5 --driver llvmpipe --backend tensix glxgears   # llvmpipe with the Tensix offload (TTR_LP)
 #
 # `node` is a device node 0-7 of the assigned tray (see scripts/run.sh). TTR_GL_DEBUG=1 prints the fast path's
 # decisions and per-frame timings.
@@ -23,12 +24,13 @@ node="${1:?usage: run_gl.sh <node> [--size WxH] [--backend tensix|reference|off]
 shift
 size="1920x1080"
 backend="tensix"
+backend_set=0
 driver=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --driver) driver="$2"; shift 2 ;;
         --size) size="$2"; shift 2 ;;
-        --backend) backend="$2"; shift 2 ;;
+        --backend) backend="$2"; backend_set=1; shift 2 ;;
         *) break ;;
     esac
 done
@@ -36,7 +38,7 @@ done
 
 if [[ "$driver" == "llvmpipe" ]]; then
     prefix="${TT_RASTER_MESA_LLVM_PREFIX:-$HOME/experiments/mesa-install-llvm}"
-    backend="off"
+    [[ $backend_set == 1 ]] || backend="off"   # llvmpipe alone, unless --backend tensix|reference asks for the Tensix offload (TTR_LP)
 elif [[ -n "$driver" ]]; then
     echo "run_gl.sh: unknown driver '$driver' (llvmpipe, or leave it out for the tensix/softpipe Mesa)" >&2; exit 2
 fi
@@ -49,7 +51,10 @@ export GALLIUM_DRIVER="${driver:-softpipe}"
 export TTR_GL_MIN_PIXELS="${TTR_GL_MIN_PIXELS:-300000}"
 export TTRASTER_LIB="${TTRASTER_LIB:-$build/core/libttraster.so}"
 if [[ "$backend" == "off" ]]; then
+    unset TTR_GL TTR_LP
+elif [[ "$driver" == "llvmpipe" ]]; then
     unset TTR_GL
+    export TTR_LP="$backend"
 else
     export TTR_GL="$backend"
 fi

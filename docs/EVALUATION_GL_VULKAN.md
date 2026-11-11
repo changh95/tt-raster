@@ -77,6 +77,31 @@ A compiled SFPU operation costs about 2 ns (2.7 cycles at 1.35 GHz): about 1.9 T
 
 So **one chip with compiled shaders (level 2) beats 64 llvmpipe threads from about 6 layers (about 800 shader instructions per pixel): 1.45x at 8 layers, 1.6x at 16 layers; it beats 16 threads from 4 layers**, and the interpreter never does. A layer costs about 1.0 ms on the chip (the all-local experiment above promised 0.9), against 1.5 to 1.9 ms for 64 threads. The fixed part of the frame (about 5 ms at 1080p) is what loses the one-layer cases. The estimate made before this measurement was a break-even at about five layers; it was optimistic by the register handling. First build of a new program set takes about 9 s for a 143-instruction shader (0.9 s when cached): the build is synchronous, so an application whose shaders change from frame to frame should not enable it. Building in the background while the interpreter renders was tried (`program_preparation::prepare` on a second thread, the same kernels, one core, nothing enqueued) and does not work in this tt-metal version: run beside a render in the same process it fails with "SubDeviceManagerTracker is not initialized on MeshDevice" (it worked only when the render thread was idle), so it is not in the tree. What would work: a warm-up at application start, an offline pre-warm of the cache (the cache directory is content-addressed), or tt-metal's remote compile server; none is built.
 
+## Vulkan on Tensix: the llvmpipe offload (done, measured)
+
+Order 3 of the plan below is built: `api/gl/llvmpipe_tensix/` (patch `api/gl/patches/0002-llvmpipe-tensix-hooks.patch`, files copied by `scripts/build_mesa.sh`) hooks llvmpipe's set-up stage, so it serves OpenGL on llvmpipe and, because lavapipe is built on llvmpipe, Vulkan. Enabled by `TTR_LP=tensix|reference` (`scripts/run_vk.sh --backend tensix`, `scripts/run_gl.sh --driver llvmpipe --backend tensix`). The design is the softpipe fast path of `api/gl` moved to the right seam:
+
+- A full colour+depth clear (`lp_setup_clear`; lavapipe's render pass clear arrives there too) opens a frame; llvmpipe does not clear, the rasterizer frame starts at the first accepted triangle.
+- Triangles arrive from `retry_triangle_ccw`, after clipping, viewport transform and culling, as float window coordinates with 1/w (the same data softpipe's hook sees), and go to `libttraster`'s frame API per draw with the draw's depth and blend state.
+- The fragment shader is llvmpipe's NIR: cloned, its extra colour outputs removed (llvmpipe lowers `gl_FragColor` to eight outputs), converted with `nir_to_tgsi` and then through the existing TGSI translator to the shader instruction set (and, with `TTR_SHADER_COMPILE=1`, to compiled SFPI). A pass-through shader needs no program. Uniforms are read from constant buffer 0 at every draw.
+- The frame is rendered when llvmpipe flushes (a queue submit, a swap, a read-back) or when a draw the offload cannot do arrives (textures, images, storage buffers, stencil, alpha test, other blend factors, lines and points, scissor smaller than the framebuffer, an active query, `discard`, geometry/tessellation shaders): then the frame so far goes into the surfaces first and llvmpipe draws the rest, so the result is always right. The result is written straight into the colour surface (RGBA/BGRA, converted on the way) and the depth surface (Z24, Z32, Z32F, Z16) of llvmpipe.
+- Lavapipe rebinds the same framebuffer before every draw; the hook keeps the frame open when the surfaces are unchanged.
+
+`scripts/test_lp.sh` runs 11 OpenGL scenes and 3 Vulkan scenes on llvmpipe/lavapipe alone and with the offload (the CPU backend of the renderer, and a chip with compiled shaders) and compares the images: at most 0.2 % of the pixels differ by more than 4 levels (edge pixels; 0.5 % for 3,000 tiny Vulkan triangles); a scene the offload refuses (a shader reading `gl_FragCoord` through llvmpipe's NIR does not translate yet) is identical to llvmpipe. All pass on both backends.
+
+Vulkan, 1920 x 1080, `api/vulkan/tests/vk_offscreen`, full-screen quads with a 131-instruction fragment shader (64 steps of `fract(x * 0.5 + y * 0.3 + 0.123)`, chosen so that rounding differences between drivers do not grow; images identical to lavapipe's), depth test off, median of three runs of 20 frames, ms per frame:
+
+| Layers | lavapipe, 64 threads | lavapipe + one chip, compiled shaders |
+| --- | --- | --- |
+| 4 | 9.8 | 12.5 |
+| 8 | 18.1 | 17.5 |
+| 16 | 34.8 | 27.4 |
+| 32 | 67.4 | 47.9 |
+
+The crossover is at about 8 layers (about 1,000 shader instructions per pixel), as in OpenGL; at 32 layers the chip is 1.4x faster than 64 CPU threads. Geometry-heavy frames lose or tie, as before: 1,000 triangles 8.5 ms on the chip against 2.0 ms, 20,000 triangles 16.0 against 7.9, 100,000 triangles 29.3 against 27.8. The interpreter never wins (4 layers 35.8 ms, 16 layers 124 ms). This is the workload class where one chip is worth more than a 64-core host; it is the only one so far.
+
+Not done in this offload (each is refused and runs on the CPU path): `discard` (the translator supports it, the wiring for llvmpipe's NIR is not tested), `gl_FragCoord` and other system values, textures (needs the software texture unit), blending beyond five factor pairs, MSAA, stencil, render areas smaller than the image, several colour attachments, push constants and uniform buffers other than constant buffer 0 (untested through lavapipe), and presenting through a swapchain (the offload is tested with a headless render target and vkcube-style X11 swapchains were not run with it). Depth is written eagerly; a lazy depth plane (as in `api/gl`) was tried through a resource hook and deadlocked, because llvmpipe's rasterizer threads map the depth surface of every scene (documented here instead of fixed).
+
 ## Against a GPU
 
 An entry-level discrete GPU is in the 5 to 10 TFLOP/s FP32 class (spec sheets), that is 2.5 to 5 T fused lane-operations per second: a compiled Tensix chip (1.9 T on simple operations, less on shaders with `floor`, `fract` or transcendentals) is within a factor of two to ten of that for pure ALU work. Everything else is where a GPU is far ahead, and no kernel work changes it:
@@ -94,7 +119,7 @@ An entry-level discrete GPU is in the 5 to 10 TFLOP/s FP32 class (spec sheets), 
 
 | Requirement | Reachable | Route |
 | --- | --- | --- |
-| Vulkan 1.3/1.4 conformance | yes, inherited | lavapipe on the CPU; Tensix frames must equal its output |
+| Vulkan 1.3/1.4 conformance | yes, inherited | lavapipe on the CPU; Tensix frames must equal its output (`scripts/test_lp.sh` compares them) |
 | OpenGL 4.5/4.6 conformance | yes, inherited | llvmpipe on the CPU (or Zink on lavapipe) |
 | Tensix executes whole frames of untextured geometry with ALU shaders | yes, partly done | OpenGL subset exists on softpipe; same subset on llvmpipe's seam for both APIs |
 | Beats llvmpipe at 64 threads | **measured:** shader-heavy untextured frames (from about 1,000 shader instructions per pixel at 1080p), with the compiler of this change; more chips would lower it | shader compiler, first version done (`shader_codegen.cpp`), NIR front end and better register handling to do |
@@ -106,7 +131,7 @@ An entry-level discrete GPU is in the 5 to 10 TFLOP/s FP32 class (spec sheets), 
 
 1. **Keep the conformant baseline integrated** (done here): one Mesa with llvmpipe, lavapipe and our `tensix` driver, scripts and a test that checks the baseline.
 2. **Shader compiler** (the decisive piece). Done: ISA program to SFPI, bit-identical, cached, with fallback (above). Left: compile without stalling the first frame (see above: not possible beside a render with this tt-metal; needs a warm-up or an offline pre-warm), a NIR front end so that lavapipe and llvmpipe shaders reach the same instruction set (today the OpenGL fast path translates TGSI), a size model calibrated on kernel ELFs. Gate (met for the case measured above): a workload beats llvmpipe at 64 threads on this host.
-3. **Frame-level offload at llvmpipe's seam** (`lp_setup`: post-clip triangles with float vertices, the fragment shader's NIR, the state in the variant key; translate it with a NIR front end for the existing instruction set). Gate from the plan: a target workload beats llvmpipe on the same host. Until then Vulkan stays on lavapipe.
+3. **Frame-level offload at llvmpipe's seam** (`lp_setup`: post-clip triangles with float vertices, the fragment shader's NIR through `nir_to_tgsi` and the existing translator). Done (section above); the gate (a workload beats llvmpipe on the same host) is met for shader-heavy untextured frames in both OpenGL and Vulkan.
 4. **Texture unit**, **compute**, **device server** (several processes at once), **CTS farm**: as in `docs/FULL_COVERAGE_PLAN.md`, in that order, each behind its own gate.
 
 Until step 2 passes its gate there is no reason to promise GPU-like results. What can be promised today: complete API coverage on the CPU, a Tensix path for the OpenGL subset, and a measured route to making Tensix worth using for ALU-heavy untextured work.

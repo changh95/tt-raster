@@ -4,7 +4,10 @@
  * PPM and times the frames. It is the smallest program that exercises what the Tensix path will have to accelerate first (vertex
  * buffers, a render pass with clear, a graphics pipeline with depth test, no textures), and the reference for comparing drivers.
  *
- *   vk_offscreen [--size WxH] [--tris N] [--frames N] [--out FILE.ppm]
+ *   vk_offscreen [--size WxH] [--tris N] [--frames N] [--out FILE.ppm] [--layers L]
+ *
+ *   --layers L   draw, after the triangles, L full-screen quads (depth test off) with a fragment shader of 64 dependent
+ *                fract(x * a + b) steps (131 instructions): the shader-heavy case of docs/EVALUATION_GL_VULKAN.md
  *
  * Needs the SPIR-V of the two shaders as headers (tests/build_shaders.sh generates them with glslangValidator).
  */
@@ -15,6 +18,8 @@
 #include <time.h>
 #include <vulkan/vulkan.h>
 
+#include "alu_frag.h"
+#include "alu_vert.h"
 #include "tri_frag.h"
 #include "tri_vert.h"
 
@@ -90,13 +95,14 @@ static VkShaderModule make_shader(const uint32_t *code, size_t bytes)
 int main(int argc, char **argv)
 {
    uint32_t w = 1920, h = 1080;
-   int tris = 1000, frames = 1;
+   int tris = 1000, frames = 1, layers = 0;
    const char *out = NULL;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%ux%u", &w, &h);
       else if (!strcmp(argv[i], "--tris") && i + 1 < argc) tris = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
+      else if (!strcmp(argv[i], "--layers") && i + 1 < argc) layers = atoi(argv[++i]);
    }
 
    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "vk_offscreen", .apiVersion = VK_API_VERSION_1_1};
@@ -177,9 +183,32 @@ int main(int argc, char **argv)
                                        .pDepthStencilState = &ds, .pColorBlendState = &cb, .layout = layout, .renderPass = rp, .subpass = 0};
    VkPipeline pipe;
    CHECK(vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipe));
+   /* The shader-heavy pipeline: full-screen quads with the ALU chain, depth test off, position and a varying only. */
+   VkShaderModule avs = make_shader(alu_vert, sizeof alu_vert), afs = make_shader(alu_frag, sizeof alu_frag);
+   VkPipelineShaderStageCreateInfo astages[2] = {
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = avs, .pName = "main"},
+      {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = afs, .pName = "main"}};
+   VkPipelineDepthStencilStateCreateInfo ads = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_FALSE,
+                                                .depthWriteEnable = VK_FALSE, .depthCompareOp = VK_COMPARE_OP_ALWAYS};
+   VkGraphicsPipelineCreateInfo agpi = gpi;
+   agpi.pStages = astages;
+   agpi.pDepthStencilState = &ads;
+   VkPipeline apipe;
+   CHECK(vkCreateGraphicsPipelines(g_dev, VK_NULL_HANDLE, 1, &agpi, NULL, &apipe));
+   VkBuffer qb;
+   VkDeviceMemory qmem;
+   float *qv;
+   make_buffer(6 * 6 * sizeof(float), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &qb, &qmem, (void **)&qv);
+   {
+      const float corner[6][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1}};
+      for (int i = 0; i < 6; i++) {
+         qv[6 * i + 0] = corner[i][0], qv[6 * i + 1] = corner[i][1], qv[6 * i + 2] = 0.5f;
+         qv[6 * i + 3] = (corner[i][0] + 1) * 0.5f, qv[6 * i + 4] = (corner[i][1] + 1) * 0.5f, qv[6 * i + 5] = 0;
+      }
+   }
 
    /* A grid of cells, two triangles each; colours from the position and a depth that varies from cell to cell. */
-   int cells = (tris + 1) / 2, g = 1;
+   int cells = (tris + 1) / 2 > 0 ? (tris + 1) / 2 : 1, g = 1;
    while (g * g < cells) g++;
    int ntri = 2 * g * g;
    VkBuffer vb;
@@ -221,7 +250,12 @@ int main(int argc, char **argv)
    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
    VkDeviceSize off = 0;
    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
-   vkCmdDraw(cmd, 3 * ntri, 1, 0, 0);
+   if (tris > 0) vkCmdDraw(cmd, 3 * ntri, 1, 0, 0);
+   if (layers > 0) {
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, apipe);
+      vkCmdBindVertexBuffers(cmd, 0, 1, &qb, &off);
+      for (int l = 0; l < layers; l++) vkCmdDraw(cmd, 6, 1, 0, 0);
+   }
    vkCmdEndRenderPass(cmd);
    VkBufferImageCopy bic = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
    vkCmdCopyImageToBuffer(cmd, color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb, 1, &bic);

@@ -6,8 +6,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="${1:-$(mktemp -d)}"
 mkdir -p "$out"
-for s in tri.vert tri.frag; do
-    glslangValidator -V "$here/$s" --vn "tri_${s#tri.}" -o "$out/tri_${s#tri.}.h" >/dev/null
+for s in tri.vert tri.frag alu.vert alu.frag; do
+    glslangValidator -V "$here/$s" --vn "${s%%.*}_${s#*.}" -o "$out/${s%%.*}_${s#*.}.h" >/dev/null
 done
 gcc -O2 -I"$out" -o "$out/vk_offscreen" "$here/vk_offscreen.c" -lvulkan
 echo "$out"

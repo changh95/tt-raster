@@ -1,0 +1,161 @@
+diff --git a/src/gallium/drivers/llvmpipe/lp_setup.c b/src/gallium/drivers/llvmpipe/lp_setup.c
+index 527d372..5ce9847 100644
+--- a/src/gallium/drivers/llvmpipe/lp_setup.c
++++ b/src/gallium/drivers/llvmpipe/lp_setup.c
+@@ -52,6 +52,7 @@
+ #include "lp_query.h"
+ #include "lp_rast.h"
+ #include "lp_setup_context.h"
++#include "lp_tensix.h"
+ #include "lp_screen.h"
+ #include "lp_state.h"
+ #include "lp_jit.h"
+@@ -412,6 +413,7 @@ void
+ lp_setup_flush(struct lp_setup_context *setup,
+                const char *reason)
+ {
++   lp_tensix_flush(setup->tensix);
+    set_scene_state(setup, SETUP_FLUSHED, reason);
+ }
+ 
+@@ -422,6 +424,9 @@ lp_setup_bind_framebuffer(struct lp_setup_context *setup,
+ {
+    LP_DBG(DEBUG_SETUP, "%s\n", __func__);
+ 
++   /* Render a frame the Tensix offload holds into the old framebuffer first (unless the new one is the same). */
++   lp_tensix_bind_framebuffer(setup->tensix, fb);
++
+    /* Flush any old scene.
+     */
+    set_scene_state(setup, SETUP_FLUSHED, __func__);
+@@ -586,6 +591,11 @@ lp_setup_clear(struct lp_setup_context *setup,
+                unsigned stencil,
+                unsigned flags)
+ {
++   /* A full colour+depth clear opens a frame of the Tensix offload; the rest (if any) is llvmpipe's. */
++   flags = lp_tensix_clear(setup->tensix, color, depth, stencil, flags);
++   if (!flags)
++      return;
++
+    /*
+     * Note any of these (max 9) clears could fail (but at most there should
+     * be just one failure!). This avoids doing the previous succeeded
+@@ -1024,6 +1034,10 @@ lp_setup_is_resource_referenced(const struct lp_setup_context *setup,
+       return LP_REFERENCED_FOR_READ | LP_REFERENCED_FOR_WRITE;
+    }
+ 
++   /* the frame the Tensix offload holds will write its render targets */
++   if (lp_tensix_references(setup->tensix, texture))
++      return LP_REFERENCED_FOR_READ | LP_REFERENCED_FOR_WRITE;
++
+    /* check resources referenced by active scenes */
+    for (unsigned i = 0; i < setup->num_active_scenes; i++) {
+       struct lp_scene *scene = setup->scenes[i];
+@@ -1295,6 +1309,9 @@ lp_setup_update_state(struct lp_setup_context *setup,
+ 
+       assert(lp->dirty == 0);
+ 
++      /* The state of the next draw is up to date: the Tensix offload decides where its triangles go. */
++      lp_tensix_update(setup->tensix);
++
+       assert(lp->cached_setup_key.size ==
+              setup->setup.variant->key.size);
+ 
+@@ -1344,6 +1361,10 @@ lp_setup_update_state(struct lp_setup_context *setup,
+ void
+ lp_setup_destroy(struct lp_setup_context *setup)
+ {
++   lp_tensix_flush(setup->tensix);
++   lp_tensix_destroy(setup->tensix);
++   setup->tensix = NULL;
++
+    lp_setup_reset(setup);
+ 
+    util_unreference_framebuffer_state(&setup->fb);
+@@ -1439,6 +1460,8 @@ lp_setup_create(struct pipe_context *pipe,
+    setup->framebuffer.x1 = -1;
+    setup->framebuffer.y1 = -1;
+ 
++   setup->tensix = lp_tensix_create(setup);
++
+    return setup;
+ 
+ no_scenes:
+diff --git a/src/gallium/drivers/llvmpipe/lp_setup_context.h b/src/gallium/drivers/llvmpipe/lp_setup_context.h
+index 044d865..2f1aca0 100644
+--- a/src/gallium/drivers/llvmpipe/lp_setup_context.h
++++ b/src/gallium/drivers/llvmpipe/lp_setup_context.h
+@@ -53,6 +53,7 @@
+ #define LP_SETUP_NEW_SSBOS       0x20
+ 
+ struct lp_setup_variant;
++struct lp_tensix;
+ 
+ 
+ /** Max number of scenes */
+@@ -75,6 +76,7 @@ struct lp_setup_context
+    struct vbuf_render base;
+ 
+    struct pipe_context *pipe;
++   struct lp_tensix *tensix;   /**< Tensix offload (tt-raster), NULL unless TTR_LP is set */
+    struct vertex_info *vertex_info;
+    uint view_index;
+    enum mesa_prim prim;
+diff --git a/src/gallium/drivers/llvmpipe/lp_setup_tri.c b/src/gallium/drivers/llvmpipe/lp_setup_tri.c
+index ae0fba4..a5be3ac 100644
+--- a/src/gallium/drivers/llvmpipe/lp_setup_tri.c
++++ b/src/gallium/drivers/llvmpipe/lp_setup_tri.c
+@@ -50,6 +50,7 @@ altivec.h inclusion in -std=c++98..11 causes bool to be redefined
+ #include "util/u_sse.h"
+ #include "lp_perf.h"
+ #include "lp_setup_context.h"
++#include "lp_tensix.h"
+ #include "lp_rast.h"
+ #include "lp_state_fs.h"
+ #include "lp_state_setup.h"
+@@ -996,6 +997,10 @@ retry_triangle_ccw(struct lp_setup_context *setup,
+    if (0)
+       lp_setup_print_triangle(setup, v0, v1, v2);
+ 
++   /* Triangles of draws the Tensix offload takes go to libttraster instead of the binner. */
++   if (lp_tensix_tri(setup->tensix, v0, v1, v2))
++      return;
++
+    if (lp_setup_zero_sample_mask(setup)) {
+       if (0) debug_printf("zero sample mask\n");
+       LP_COUNT(nr_culled_tris);
+diff --git a/src/gallium/drivers/llvmpipe/lp_setup_vbuf.c b/src/gallium/drivers/llvmpipe/lp_setup_vbuf.c
+index 38e170a..ba65bcf 100644
+--- a/src/gallium/drivers/llvmpipe/lp_setup_vbuf.c
++++ b/src/gallium/drivers/llvmpipe/lp_setup_vbuf.c
+@@ -37,6 +37,7 @@
+ 
+ 
+ #include "lp_setup_context.h"
++#include "lp_tensix.h"
+ #include "lp_context.h"
+ #include "draw/draw_vbuf.h"
+ #include "draw/draw_vertex.h"
+@@ -128,6 +129,7 @@ static void
+ lp_setup_set_primitive(struct vbuf_render *vbr, enum mesa_prim prim)
+ {
+    lp_setup_context(vbr)->prim = prim;
++   lp_tensix_set_prim(lp_setup_context(vbr)->tensix, prim);
+ }
+ 
+ 
+diff --git a/src/gallium/drivers/llvmpipe/meson.build b/src/gallium/drivers/llvmpipe/meson.build
+index e71eea2..6e4701d 100644
+--- a/src/gallium/drivers/llvmpipe/meson.build
++++ b/src/gallium/drivers/llvmpipe/meson.build
+@@ -63,6 +63,10 @@ files_llvmpipe = files(
+   'lp_setup_rect.c',
+   'lp_setup_tri.c',
+   'lp_setup_vbuf.c',
++  'lp_tensix.c',
++  'lp_tensix.h',
++  'lp_tensix_shader.c',
++  'lp_tensix_shader.h',
+   'lp_state_blend.c',
+   'lp_state_clip.c',
+   'lp_state_derived.c',
