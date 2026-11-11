@@ -134,6 +134,11 @@ struct sp_tensix {
     * rendered afterwards only when it is wanted (`depth_cached`: it is already in `depth`). */
    bool depth_pending;
    bool depth_cached;
+   /* An application that reads the depth buffer every frame would render every frame twice. Once a read had to render the frame
+    * again, frames end with their depth plane until it has gone unused (`depth_unused` frames in a row). */
+   bool depth_wanted;
+   unsigned depth_unused;
+   unsigned depth_rerenders;
    unsigned frames_fast, draws_fast, draws_slow, frames_fallback;
    double ms_render, ms_write, ms_depth;   /* accumulated time ending frames, in writing depth surfaces (ms_write; ms_depth is the same) */
    unsigned depth_writes;
@@ -222,8 +227,8 @@ sp_tensix_destroy(struct sp_tensix *t)
    if (!t)
       return;
    if (t->debug)
-      fprintf(stderr, "tensix: %u frames on the fast path, %u draws accepted, %u draws refused, %u mid-frame fallbacks\n",
-              t->frames_fast, t->draws_fast, t->draws_slow, t->frames_fallback);
+      fprintf(stderr, "tensix: %u frames on the fast path, %u draws accepted, %u draws refused, %u mid-frame fallbacks, %u depth planes rendered afterwards\n",
+              t->frames_fast, t->draws_fast, t->draws_slow, t->frames_fallback, t->depth_rerenders);
    t->api.context_destroy(t->ctx);
    FREE(t->verts);
    FREE(t->attrs);
@@ -590,6 +595,8 @@ fetch_depth(struct sp_tensix *t)
 {
    if (t->depth_cached)
       return true;
+   t->depth_wanted = true;
+   t->depth_rerenders++;
    const size_t px = (size_t)t->width * t->height;
    if (t->depth_px < px) {
       FREE(t->depth);
@@ -615,6 +622,7 @@ materialize_depth(struct sp_tensix *t)
    if (!t->depth_pending)
       return;
    t->depth_pending = false;
+   t->depth_unused = 0;
    const double t0 = now_ms();
    if (fetch_depth(t))
       write_depth(t);
@@ -678,7 +686,7 @@ void
 sp_tensix_flush(struct sp_tensix *t)
 {
    if (t)
-      flush_frame(t, false);
+      flush_frame(t, t->depth_wanted);
 }
 
 void
@@ -714,6 +722,8 @@ sp_tensix_clear(struct sp_tensix *t, unsigned buffers, const struct pipe_scissor
    }
    /* Everything drawn before this clear is overwritten by it: the pending frame is dropped, not rendered, and a
     * deferred depth buffer is never written. */
+   if (t->depth_pending && t->depth_cached && ++t->depth_unused >= 4)
+      t->depth_wanted = false;   /* the depth plane came with the frame and nobody wanted it, four times in a row */
    t->depth_pending = false;
    t->state = FRAME_CLEARED;
    for (int i = 0; i < 4; i++)
