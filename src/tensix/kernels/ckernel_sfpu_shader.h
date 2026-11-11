@@ -246,42 +246,47 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
         (void)in[1]; (void)in[2]; (void)in[3];
         continue;
 #endif
-        sfpi::vFloat a = sh_src(in[1], s.consts);
-        sfpi::vFloat b = sh_src(in[2], s.consts);   // unused operands are zero: they read register 0, harmlessly
-        sfpi::vFloat c = sh_src(in[3], s.consts);
-        sfpi::vFloat d = a;
+        // Every case fetches the operands it needs: a fetch is a runtime-indexed load that the RISC-V core assembles and issues
+        // (about 8 ns each), and most instructions have one or two sources. (A vector value that is defined on some paths only
+        // and used after the join crashes the compiler: d is defined first, a, b and c live inside their case.)
+#define SH_A sfpi::vFloat a = sh_src(in[1], s.consts);
+#define SH_B sfpi::vFloat b = sh_src(in[2], s.consts);
+#define SH_C sfpi::vFloat c = sh_src(in[3], s.consts);
+        sfpi::vFloat d = 0.0f;
         switch (op) {
-            case kOpMov: break;
-            case kOpAdd: d = a + b; break;
-            case kOpMul: d = a * b; break;
-            case kOpMad: d = a * b + c; break;
-            case kOpMin: v_if (b < a) { d = b; } v_endif; break;
-            case kOpMax: v_if (b > a) { d = b; } v_endif; break;
-            case kOpFrc: d = a - sh_floor_any(a); break;
-            case kOpFlr: d = sh_floor_any(a); break;
-            case kOpRcp: d = sh_rcp(a); break;
-            case kOpRsq: d = sh_rsq(sfpi::abs(a)); break;
+            case kOpMov: { SH_A d = a; break; }
+            case kOpAdd: { SH_A SH_B d = a + b; break; }
+            case kOpMul: { SH_A SH_B d = a * b; break; }
+            case kOpMad: { SH_A SH_B SH_C d = a * b + c; break; }
+            case kOpMin: { SH_A SH_B d = a; v_if (b < a) { d = b; } v_endif; break; }
+            case kOpMax: { SH_A SH_B d = a; v_if (b > a) { d = b; } v_endif; break; }
+            case kOpFrc: { SH_A d = a - sh_floor_any(a); break; }
+            case kOpFlr: { SH_A d = sh_floor_any(a); break; }
+            case kOpRcp: { SH_A d = sh_rcp(a); break; }
+            case kOpRsq: { SH_A d = sh_rsq(sfpi::abs(a)); break; }
             case kOpSqrt: {
+                SH_A
                 sfpi::vFloat x = sfpi::abs(a);
                 d = x * sh_rsq(x);
                 v_if (x == 0.0f) { d = 0.0f; }
                 v_endif;
                 break;
             }
-            case kOpEx2: d = sh_ex2(a); break;
-            case kOpLg2: d = sh_lg2(a); break;
-            case kOpSin: d = sh_sin_folded(sh_reduce(a)); break;
-            case kOpCos: d = sh_sin_folded(sh_reduce(a) + 1.57079633f); break;
+            case kOpEx2: { SH_A d = sh_ex2(a); break; }
+            case kOpLg2: { SH_A d = sh_lg2(a); break; }
+            case kOpSin: { SH_A d = sh_sin_folded(sh_reduce(a)); break; }
+            case kOpCos: { SH_A d = sh_sin_folded(sh_reduce(a) + 1.57079633f); break; }
             // The SFPU tests the sign bit (and the raw bits for != 0), so a real -0 (a product of a negative number and zero,
             // the negate modifier on +0) would compare as negative or non-zero. Adding +0 turns -0 into +0 (round to nearest)
             // and leaves everything else alone: the compares then agree with IEEE (-0 == +0).
-            case kOpSlt: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x < y) { d = 1.0f; } v_endif; break; }
-            case kOpSge: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x >= y) { d = 1.0f; } v_endif; break; }
-            case kOpSeq: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x == y) { d = 1.0f; } v_endif; break; }
-            case kOpSne: { sfpi::vFloat x = a + 0.0f, y = b + 0.0f; d = 0.0f; v_if (x != y) { d = 1.0f; } v_endif; break; }
-            case kOpCmp: { sfpi::vFloat x = a + 0.0f; d = c; v_if (x < 0.0f) { d = b; } v_endif; break; }
-            case kOpSel: { sfpi::vFloat x = a + 0.0f; d = c; v_if (x != 0.0f) { d = b; } v_endif; break; }
+            case kOpSlt: { SH_A SH_B sfpi::vFloat x = a + 0.0f, y = b + 0.0f; v_if (x < y) { d = 1.0f; } v_endif; break; }
+            case kOpSge: { SH_A SH_B sfpi::vFloat x = a + 0.0f, y = b + 0.0f; v_if (x >= y) { d = 1.0f; } v_endif; break; }
+            case kOpSeq: { SH_A SH_B sfpi::vFloat x = a + 0.0f, y = b + 0.0f; v_if (x == y) { d = 1.0f; } v_endif; break; }
+            case kOpSne: { SH_A SH_B sfpi::vFloat x = a + 0.0f, y = b + 0.0f; v_if (x != y) { d = 1.0f; } v_endif; break; }
+            case kOpCmp: { SH_A SH_B SH_C sfpi::vFloat x = a + 0.0f; d = c; v_if (x < 0.0f) { d = b; } v_endif; break; }
+            case kOpSel: { SH_A SH_B SH_C sfpi::vFloat x = a + 0.0f; d = c; v_if (x != 0.0f) { d = b; } v_endif; break; }
             case kOpKill: {
+                SH_A
                 sfpi::vFloat x = a + 0.0f;
                 v_if (x < 0.0f) { sfpi::dst_reg[kRegBase + kKillReg] = -1.0f; }
                 v_endif;
@@ -289,6 +294,9 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
             }
             default: break;
         }
+#undef SH_A
+#undef SH_B
+#undef SH_C
         if (instr_flags(w0) & kFlagSat) { d = sh_sat(d); }
 #ifndef RASTER_EXP_SH_NOSTORE
         sfpi::dst_reg[kRegBase + instr_dst(w0)] = d;

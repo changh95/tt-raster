@@ -258,16 +258,18 @@ Per-frame breakdown of the fast path at 1920 x 1080 (`TTR_GL_DEBUG=1`): 4.8 ms i
 
 The program is a chain of K instructions of one kind on one register; the device time rises linearly with K. Time per instruction and per pixel vector (32 lanes) on the busiest core (17 tiles of 2 triangles x 32 vectors):
 
-| instruction | K = 8 | K = 32 | K = 128 | device ms at K = 0 / 32 / 128 |
+| instruction | K = 32 | K = 128 | K = 128 before the change below | device ms at K = 32 / 128 |
 | --- | --- | --- | --- | --- |
-| Mad | 36.8 ns | 39.0 ns | 39.0 ns | 1.16 / 2.52 / 6.59 |
-| Mul | 45.6 | 41.8 | 40.1 | 1.07 / 2.52 / 6.65 |
-| Slt | 37.2 | 35.0 | 37.6 | 1.09 / 2.30 / 6.32 |
-| Rcp | 54.6 | 43.8 | 40.6 | 1.05 / 2.57 / 6.69 |
-| Ex2 | 42.6 | 49.1 | 48.1 | 1.00 / 2.71 / 7.71 |
-| Sin | 60.7 | 55.1 | 53.2 | 0.99 / 2.91 / 8.40 |
+| Mad (3 operands) | 43.4 ns | 44.6 ns | 39.0 ns | 2.84 / 7.53 |
+| Mul (2) | 35.1 | 34.1 | 40.1 | 2.80 / 6.32 |
+| Slt (2) | 32.9 | 30.2 | 37.6 | 2.85 / 5.90 |
+| Rcp (1) | 28.3 | 26.3 | 40.6 | 2.63 / 5.31 |
+| Ex2 (1) | 37.1 | 34.6 | 48.1 | 2.90 / 6.43 |
+| Sin (1) | 24.5 | 37.7 | 53.2 | 2.47 / 6.88 |
 
-About 40 ns (50 cycles) for any instruction: fetching and decoding the instruction word and its three operands on the RISC-V core, and issuing the SFPU operations through runtime-indexed `dst_reg`, cost far more than the arithmetic (the whole `sin` is only 14 ns more than a `mad`). A 1080p frame with a 32-instruction shader over the whole screen costs 2.5 ms on the device, a 128-instruction one 6.6 ms. The 1.0 ms at K = 0 is the fixed cost of a frame (clear, packed colour, read-back path). Decoding is the place to optimize (pre-decoded operand fields, superinstructions such as Mad with constant operands, dot products as one instruction).
+The first version fetched all three operands of every instruction (an unused operand reads register 0). Every case of the interpreter now fetches only the operands it uses: a fetch is a runtime-indexed load that the RISC-V core assembles and issues, so an instruction with one source saves two of them. One-source instructions got 25 to 35 % faster, two-source ones 10 to 15 %, Mad (three sources) is unchanged within the noise of the machine (+-10 % between runs; the Mad row above is from a run that was 10 % slower than another one of the same build, 40.8 / 41.9 ns).
+
+About 25 to 45 ns (30 to 55 cycles) for an instruction, depending on its operand count: fetching and decoding the instruction word and its three operands on the RISC-V core, and issuing the SFPU operations through runtime-indexed `dst_reg`, cost far more than the arithmetic (the whole `sin` is only 14 ns more than a `mad`). A 1080p frame with a 32-instruction shader over the whole screen costs 2.5 ms on the device, a 128-instruction one 6 to 7 ms. The 1.0 ms at K = 0 is the fixed cost of a frame (clear, packed colour, read-back path). Decoding is the place to optimize (pre-decoded operand fields, superinstructions such as Mad with constant operands, dot products as one instruction).
 
 Where the 40 ns go (Mad chain, K = 128, same benchmark with timing-experiment defines): reading the instruction words and looping without issuing anything costs 8.9 ns; dropping the result store saves only 3 ns (37.5 ns); a chain of independent Mads (no result is read back through Dest) costs the same 40 ns, so it is issue cost, not Dest read-after-write latency; with register operands only (no constant, which needs two `sfploadi` with a runtime immediate) it is 28 to 34 ns. The disassembly shows why: every operand access is a `dst_reg[...]` with a runtime index, which the compiler turns into building the SFPU instruction word on the RISC-V core (load the template from the stack, add the index, store it to the instruction buffer), about 6 to 8 RISC-V instructions and a store per access, and a constant is two of those plus a load. An interpreter on this core is therefore bound by pushing instructions, not by the SFPU; only compiling the shader to SFPI source (compile-time registers and addresses, values kept in LREGs across instructions) would remove it, at the price of a JIT build per shader set (tens of seconds, cached).
 
