@@ -89,7 +89,26 @@ std::vector<OpTest> make_tests() {
         v[1] = r.log_signed(-2, 2);
         v[2] = r.log_signed(-2, 2);
     };
+    // Frc and Flr over the whole float range: zeros of both signs, tiny values of both signs, near and exactly integer, the
+    // half-integers of [2^22, 2^23) (one fraction bit, where the round-by-magic-constant of the device runs out), and beyond.
+    auto frgen = [maybe_zero](Rng& r, double v[3]) {
+        const double u = r.uniform(), sign = r.uniform() < 0.5 ? -1.0 : 1.0;
+        double x;
+        if (u < 0.2) x = sign * (std::floor(r.range(4194304.0, 8388607.0)) + (r.uniform() < 0.5 ? 0.5 : 0.0));
+        else if (u < 0.3) x = sign * r.range(4194304.0, 8388608.0);
+        else if (u < 0.45) x = sign * r.log_pos(6.9, 10);
+        else if (u < 0.6) x = sign * r.log_pos(-30, -5);
+        else if (u < 0.75) x = sign * std::floor(r.range(0, 1000));                    // exact integers
+        else if (u < 0.85) x = sign * (std::floor(r.range(1, 1000)) + (r.uniform() < 0.5 ? -1 : 1) * std::ldexp(1.0, -23) * 0.5);   // next to an integer
+        else x = sign * r.range(0, 100);
+        v[0] = maybe_zero(r, x);
+        v[1] = v[2] = 0;
+    };
     return {
+        {"Frc-0", kOpFrc, 0.0, frgen, [](const double* v) { const double x = -static_cast<double>(f32(v[0])); return x - std::floor(x); }, nullptr, true},
+        {"Flr-0", kOpFlr, 0.0, frgen, [](const double* v) { return std::floor(-static_cast<double>(f32(v[0]))); }, nullptr, true},
+        {"FrcX", kOpFrc, 0.0, frgen, [](const double* v) { const double x = f32(v[0]); return x - std::floor(x); }},
+        {"FlrX", kOpFlr, 0.0, frgen, [](const double* v) { return std::floor(static_cast<double>(f32(v[0]))); }},
         {"Mov", kOpMov, 0.0, first, [](const double* v) { return v[0]; }},
         {"Add", kOpAdd, 0.0, any, [](const double* v) { return static_cast<double>(f32(v[0] + v[1])); }},
         {"Mul", kOpMul, 0.0, any, [](const double* v) { return static_cast<double>(f32(v[0] * v[1])); }},

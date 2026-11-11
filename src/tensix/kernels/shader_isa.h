@@ -24,7 +24,7 @@
 //   Mov  d = a                        Add  d = a + b                  Mul  d = a * b
 //   Mad  d = fma(a, b, c)  (single rounding)
 //   Min  d = b < a ? b : a            Max  d = b > a ? b : a
-//   Frc  d = a - floor(a)             Flr  d = floor(a)
+//   Frc  d = a - floor(a)             Flr  d = floor(a)              (every finite a; the device returns +0 for floor(-0))
 //   Rcp  d = 1 / a                    Rsq  d = 1 / sqrt(|a|)          Sqrt d = sqrt(|a|)
 //   Ex2  d = 2^a                      Lg2  d = log2(|a|)
 //   Sin  d = sin(a)                   Cos  d = cos(a)                 (radians)

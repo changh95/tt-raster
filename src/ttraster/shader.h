@@ -41,8 +41,12 @@ struct ShaderResult {
 };
 
 // Run `p` for one pixel. `inputs` holds num_inputs interpolated components, `fragcoord` x, y, z, 1/w (ignored unless the
-// program uses it). `scratch` must hold p.num_regs floats. The program must have passed validate_shader().
-ShaderResult run_shader(const ShaderProgram& p, const float* inputs, const float* fragcoord, float* scratch);
+// program uses it). `scratch` must hold p.num_regs floats. The program must have passed validate_shader(). If `hazard` is
+// given, it is set when an instruction produces a NaN, an infinity or a subnormal: values on which the device is allowed to
+// differ from this interpreter (it flushes subnormals and its NaN handling is its own), so a test that needs exact agreement
+// can discard such programs.
+ShaderResult run_shader(const ShaderProgram& p, const float* inputs, const float* fragcoord, float* scratch,
+                        bool* hazard = nullptr);
 
 // Register-allocation-free builder: every instruction result goes to a register chosen by the caller.
 class ShaderBuilder {

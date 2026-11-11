@@ -27,4 +27,7 @@ if(TT_RASTER_BUILD_DEVICE)
 
     add_executable(ttr_shader_bench ttr_shader_bench.cpp)
     target_link_libraries(ttr_shader_bench PRIVATE ttraster_tensix)
+
+    add_executable(ttr_shader_fuzz ttr_shader_fuzz.cpp)
+    target_link_libraries(ttr_shader_fuzz PRIVATE ttraster_tensix)
 endif()

@@ -2,6 +2,7 @@
 
 #include "ttraster/shader.h"
 
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 
@@ -71,7 +72,7 @@ inline float apply_sat(float v) { return v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f
 
 }  // namespace
 
-ShaderResult run_shader(const ShaderProgram& p, const float* inputs, const float* fragcoord, float* r) {
+ShaderResult run_shader(const ShaderProgram& p, const float* inputs, const float* fragcoord, float* r, bool* hazard) {
     for (uint32_t k = 0; k < p.num_inputs; k++) r[k] = inputs[k];
     if (p.fragcoord_reg >= 0) {
         for (int k = 0; k < 4; k++) r[p.fragcoord_reg + k] = fragcoord[k];
@@ -116,6 +117,7 @@ ShaderResult run_shader(const ShaderProgram& p, const float* inputs, const float
             default: break;
         }
         if (instr_flags(in.w[0]) & kFlagSat) d = apply_sat(d);
+        if (hazard && (!std::isfinite(d) || (d != 0.0f && std::fabs(d) < FLT_MIN))) *hazard = true;
         r[instr_dst(in.w[0])] = d;
     }
     ShaderResult out;

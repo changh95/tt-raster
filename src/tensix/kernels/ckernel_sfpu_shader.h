@@ -105,6 +105,27 @@ __attribute__((always_inline)) inline sfpi::vFloat sh_floor(sfpi::vFloat x) {
     return r;
 }
 
+// floor for every finite x (the Frc and Flr instructions). sh_floor needs |x| < 2^22 and a +0 in place of -0: the magic
+// constant sum loses the fraction beyond that, and the compare `r > x` reads the sign bit, so with x = -0 it is true and the
+// result would be -1 (found by the random-program test, Frc(-0) was 1). From 2^22 on x has at most one fraction bit, 0.5, the
+// lowest mantissa bit below 2^23, and none from 2^23 on.
+__attribute__((always_inline)) inline sfpi::vFloat sh_floor_any(sfpi::vFloat x) {
+    x = x + 0.0f;
+    sfpi::vFloat r = sh_floor(x);
+    sfpi::vFloat ax = sfpi::abs(x);
+    v_if (ax >= 4194304.0f) {
+        r = x;
+        v_if (ax < 8388608.0f) {
+            sfpi::vInt low = sfpi::as<sfpi::vInt>(x) << 31;   // the lowest mantissa bit as the sign
+            v_if (low < 0) { r = x - 0.5f; }
+            v_endif;
+        }
+        v_endif;
+    }
+    v_endif;
+    return r;
+}
+
 // 1/x for any non-zero x: the sign is handled here, the magnitude by the Newton-refined reciprocal estimate.
 __attribute__((always_inline)) inline sfpi::vFloat sh_rcp(sfpi::vFloat x) {
     sfpi::vFloat ax = sfpi::abs(x);
@@ -236,8 +257,8 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
             case kOpMad: d = a * b + c; break;
             case kOpMin: v_if (b < a) { d = b; } v_endif; break;
             case kOpMax: v_if (b > a) { d = b; } v_endif; break;
-            case kOpFrc: d = a - sh_floor(a); break;
-            case kOpFlr: d = sh_floor(a); break;
+            case kOpFrc: d = a - sh_floor_any(a); break;
+            case kOpFlr: d = sh_floor_any(a); break;
             case kOpRcp: d = sh_rcp(a); break;
             case kOpRsq: d = sh_rsq(sfpi::abs(a)); break;
             case kOpSqrt: {
