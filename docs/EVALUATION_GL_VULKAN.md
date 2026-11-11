@@ -15,7 +15,7 @@ Two separate questions hide in "full OpenGL and Vulkan support":
 | --- | --- | --- |
 | 100 % API coverage, conformant | **Yes, as a hybrid: the CPU path is always correct and Tensix runs the frames it can match.** It cannot be "100 % on Tensix". | Mesa's llvmpipe (OpenGL 4.6 compatibility here, conformant for 4.5 upstream) and lavapipe (Vulkan, `conformanceVersion = 1.3.1.1`, API 1.4) already exist, build on this host and run (measured below). Tensix work then only has to be pixel-identical to them, frame by frame, with whole-frame fallback. |
 | GPU-class speed and features | **No, not in general.** Only for a narrow class: untextured, shader-ALU-heavy rendering, and only with a shader compiler instead of the current interpreter. | No texture units, no ROPs, no hardware rasterizer; a fixed cost of about 2 to 5 ms per frame; today's shader interpreter is 6 to 40 times slower than the compiled code the same hardware can run (measured). |
-| Beats a CPU renderer on this host | **Not today** at 64 threads; **plausible** for shader-heavy untextured frames once shaders are compiled, and already true against few CPU threads. | Measured crossover below. |
+| Beats a CPU renderer on this host | **Yes, for shader-heavy untextured frames, with compiled shaders (measured: one chip beats 64-thread llvmpipe from about 8 layers of a 131-instruction shader at 1080p, by 1.3x at 16 layers); no for geometry-heavy and small frames.** Interpreted shaders never get there. | Measured crossover below. |
 
 ## What exists
 
@@ -61,7 +61,21 @@ The shader interpreter issues every instruction through runtime-indexed register
 
 A compiled SFPU operation costs about 2 ns (2.7 cycles at 1.35 GHz): about 1.9 T lane-operations per second per chip for simple operations, against 0.05 T lane-instructions per second for the interpreter. On the benchmark shader the compiled chip reaches about 0.3 T lane-instructions per second, which is about 60 llvmpipe threads (one thread did 5 G per second: 50.6 ms for 2 M pixels x 131 instructions), against about 10 threads for the interpreter.
 
-**Estimate** (from the table above and the compiled/interpreted ratio of the Mad/Frc chain): with a compiled shader the chip frame would be the 4.5 ms fixed part plus about 0.9 ms per 131-instruction layer, against 1.5 ms per layer for 64 llvmpipe threads. The break-even is then about five such layers (about 650 shader instructions per pixel at 1080p); beyond that one chip wins, and eight chips split the frame. Below it the fixed cost loses.
+### Measured with a first shader compiler
+
+`core/src/tensix/shader_codegen.cpp` turns a shader program into straight SFPI (`TTR_SHADER_COMPILE=1`, or `DeviceOptions::compile_shaders`): the generated header is built into the compute kernel for the frame's set of programs, cached by content (tt-metal caches the binaries), the interpreter stays as the fallback for programs that were not compiled and for kernels that do not build. Every case is the interpreter's own code, so results are bit-identical: the random-program fuzz (`ttr_shader_fuzz`, which compares with the CPU reference) gives 0 differing pixels in exact mode (20 + 8 + 2 frames, 1.2 M + 0.3 M + 4.2 M pixels, with blending, at 1920 x 1088), smooth mode and the random GLSL fuzz are unchanged, and the `shader` golden scene has no mismatch. This first version is simple on purpose: register values live in Dest rows with compile-time addresses, and only the previous instruction's result is kept in a local variable, because the compiler cannot spill a vector value (8 local registers: "too few lregs to hold live values" when whole programs were kept local, which is what the 40x experiment above did). Code size is the other limit: the kernel text of a core is 70,656 bytes, the interpreter takes about 12 KB, so programs are compiled in order while an estimated 36 KB are not exceeded; the rest run interpreted.
+
+1920 x 1080 `gl_bench`, ms per frame (shader: 2 instructions per step, 131 instructions for `--alu 64`; layers are full-screen quads, no depth test):
+
+| Workload | Chip, interpreter | Chip, compiled | llvmpipe 1 | 4 | 16 | 64 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 layer, 34 instructions | 6.6 | 5.6 | 11.0 | 5.6 | 1.6 | 1.0 |
+| 1 layer, 131 instructions | 10.8 | 7.2 | 50.6 | 15.0 | 4.0 | 2.9 |
+| 4 layers | 29.6 | 14.0 | 198.8 | 52.1 | 13.2 | 7.4 |
+| 8 layers | 51.5 | 17.8 | | 103.5 | 28.7 | 19.1 |
+| 16 layers | | 26.0 | | | | 34.4 |
+
+So **one chip with compiled shaders beats 64 llvmpipe threads from about 8 layers (about 1,000 shader instructions per pixel), by 1.3x at 16 layers; it beats 16 threads from 4 to 8 layers**, and the interpreter never does. A layer costs about 1.0 to 1.5 ms on the chip (the all-local experiment above promised 0.9; the Dest-backed code is slower), against 1.5 to 1.9 ms for 64 threads. The fixed part of the frame (about 5 ms at 1080p) is what loses the one-layer cases. The estimate made before this measurement was a break-even at about five layers; it was optimistic by the register handling. First build of a new program set takes about 9 s for a 143-instruction shader (0.9 s when cached): the build is synchronous today, so an application whose shaders change from frame to frame should not enable it yet (compiling in the background while the interpreter renders is the next step).
 
 ## Against a GPU
 
@@ -83,7 +97,7 @@ An entry-level discrete GPU is in the 5 to 10 TFLOP/s FP32 class (spec sheets), 
 | Vulkan 1.3/1.4 conformance | yes, inherited | lavapipe on the CPU; Tensix frames must equal its output |
 | OpenGL 4.5/4.6 conformance | yes, inherited | llvmpipe on the CPU (or Zink on lavapipe) |
 | Tensix executes whole frames of untextured geometry with ALU shaders | yes, partly done | OpenGL subset exists on softpipe; same subset on llvmpipe's seam for both APIs |
-| Beats llvmpipe at 64 threads | only for shader-heavy untextured frames, with a shader compiler, estimated break-even about 650 instructions per pixel; more chips lower it | NIR to SFPI compiler (workstream 1) |
+| Beats llvmpipe at 64 threads | **measured:** shader-heavy untextured frames (from about 1,000 shader instructions per pixel at 1080p), with the compiler of this change; more chips would lower it | shader compiler, first version done (`shader_codegen.cpp`), NIR front end and better register handling to do |
 | Textured frames faster than the CPU | unproven; needs the software texture unit and then a measurement; the plan itself marks it a kill gate | workstream 2 |
 | Compute shaders on Tensix | long-term | workstream 4 |
 | GPU-class performance on general workloads | no | structural |
@@ -91,7 +105,7 @@ An entry-level discrete GPU is in the 5 to 10 TFLOP/s FP32 class (spec sheets), 
 ## What to build, in this order
 
 1. **Keep the conformant baseline integrated** (done here): one Mesa with llvmpipe, lavapipe and our `tensix` driver, scripts and a test that checks the baseline.
-2. **Shader compiler, NIR to SFPI** (the decisive piece: 6x to 39x on measured programs; JIT build time per shader is tens of seconds, so interpret first and compile in the background, cache by shader hash). Gate: the 131-instruction case above reaches the break-even estimate, measured, not projected.
+2. **Shader compiler** (the decisive piece). Done: ISA program to SFPI, bit-identical, cached, with fallback (above). Left: keep more values in the 8 local registers with a real allocator (the all-local experiment was 2x faster per layer), compile in the background while the interpreter renders, a NIR front end so that lavapipe and llvmpipe shaders reach the same instruction set (today the OpenGL fast path translates TGSI), a size model calibrated on kernel ELFs. Gate (met for the case measured above): a workload beats llvmpipe at 64 threads on this host.
 3. **Frame-level offload at llvmpipe's seam** (`lp_setup`: post-clip triangles with float vertices, the fragment shader's NIR, the state in the variant key; translate it with a NIR front end for the existing instruction set). Gate from the plan: a target workload beats llvmpipe on the same host. Until then Vulkan stays on lavapipe.
 4. **Texture unit**, **compute**, **device server** (several processes at once), **CTS farm**: as in `docs/FULL_COVERAGE_PLAN.md`, in that order, each behind its own gate.
 

@@ -22,8 +22,9 @@ shares with OpenGL on llvmpipe.
 
 ## Plan (each step has a gate, `docs/EVALUATION_GL_VULKAN.md`)
 
-1. A shader compiler from NIR to SFPI. Measured: compiled code is about 40 times faster than the interpreter on a Mad chain and 6.3
-   times on a Mad/Frc chain; without it one chip is worth 4 to 8 CPU threads of llvmpipe.
+1. The shader compiler (first version done: `core/src/tensix/shader_codegen.cpp`, programs of the instruction set to straight SFPI, bit-identical;
+   with it one chip beats 64-thread llvmpipe from about 8 layers of a 131-instruction shader at 1080p, without it never). Left: a NIR front
+   end so that lavapipe's shaders reach that instruction set, a real register allocator, background compilation.
 2. Frame-level offload at llvmpipe's seam: whole frames of untextured triangles with ALU shaders to the core's frame API
    (`core/include/ttraster/ttraster.h`), everything else on the CPU path. Gate: a target workload beats llvmpipe on the same host.
 3. Texture unit, compute, a device server for several processes, a CTS farm.

@@ -41,6 +41,12 @@ struct DeviceOptions {
     // kernel). 0 = derive from debug_planes / float_planes. Planes not requested are not computed or
     // transferred: a depth-and-id request skips colour entirely.
     uint32_t plane_mask = 0;
+    // Compile the fragment shader programs of the frame to straight SFPI code instead of interpreting them (shader_codegen.h). The
+    // kernel is built for the set of programs (about a minute the first time, then cached by tt-metal); also switched on by the
+    // environment variable TTR_SHADER_COMPILE=1.
+    bool compile_shaders = false;
+    // Never compile (set when a kernel with compiled shaders failed to build and the frame is run again with the interpreter).
+    bool no_compile = false;
     // Extra compile-time defines for the kernels, for experiments (name -> value).
     std::map<std::string, std::string> defines;
     // Host threads used to encode the work lists; 0 = one per hardware thread.
@@ -86,6 +92,9 @@ public:
         const DeviceOptions& opt = {}, Framebuffer* target = nullptr);
 
 private:
+    DeviceFrame render_impl(
+        const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan, const DeviceOptions& opt,
+        Framebuffer* target);
     std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_;
     // Scratch reused from frame to frame: fresh multi-megabyte allocations cost page faults, which
     // serialize badly when several chips are driven from one process.

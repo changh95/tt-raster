@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "tensix/tensix_renderer.h"
+#include "tensix/shader_codegen.h"
 
 #include "ttraster/parallel.h"
 #include "ttraster/trace.h"
@@ -11,11 +12,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+
+#include <unistd.h>
 
 #include <tt-metalium/tensor_accessor_args.hpp>
 
@@ -233,7 +239,68 @@ std::vector<CorePlan> plan_balanced(
     return plan;
 }
 
+namespace {
+
+bool env_flag(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+// A copy of the kernel directory plus the generated shader header, in a cache directory named after the contents (tt-metal caches the
+// kernel binaries by their source, so a program set that was built before costs nothing). TT_RASTER_SHADER_CACHE overrides the
+// location (default ~/.cache/tt-raster/shader-kernels).
+std::string prepare_kernel_dir(const std::string& kernel_dir, const std::string& header) {
+    namespace fs = std::filesystem;
+    uint64_t h = 1469598103934665603ull;   // FNV-1a over the header and the kernel directory name
+    for (char c : header + kernel_dir) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+    // The kernel sources are part of the key too: an edit of a kernel must not reuse an old copy.
+    for (const auto& e : fs::directory_iterator(kernel_dir)) {
+        if (!e.is_regular_file()) continue;
+        std::ifstream f(e.path(), std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        for (char c : text) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+    }
+    const char* root_env = std::getenv("TT_RASTER_SHADER_CACHE");
+    const fs::path root = root_env != nullptr ? fs::path(root_env)
+                                              : fs::path(std::getenv("HOME") != nullptr ? std::getenv("HOME") : "/tmp") / ".cache" / "tt-raster" / "shader-kernels";
+    char name[32];
+    std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(h));
+    const fs::path dir = root / name;
+    if (!fs::exists(dir / "shader_compiled.h")) {
+        const fs::path tmp = root / (std::string(name) + ".tmp" + std::to_string(::getpid()));
+        fs::create_directories(tmp);
+        for (const auto& e : fs::directory_iterator(kernel_dir)) {
+            if (e.is_regular_file()) fs::copy_file(e.path(), tmp / e.path().filename(), fs::copy_options::overwrite_existing);
+        }
+        std::ofstream(tmp / "shader_compiled.h") << header;
+        std::error_code ec;
+        fs::rename(tmp, dir, ec);   // another process may have won the race: then its copy is as good as ours
+        if (ec) fs::remove_all(tmp);
+    }
+    return dir.string() + "/";
+}
+
+}  // namespace
+
 DeviceFrame TensixRenderer::render(
+    const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
+    const DeviceOptions& opt, Framebuffer* target) {
+    const bool compiling = !frame.shaders.empty() && !opt.no_compile && (opt.compile_shaders || env_flag("TTR_SHADER_COMPILE"));
+    if (!compiling) return render_impl(frame, setup, bins, plan, opt, target);
+    try {
+        return render_impl(frame, setup, bins, plan, opt, target);
+    } catch (const std::runtime_error& e) {
+        // The kernel with compiled shaders did not build (e.g. its code does not fit the core's kernel text): the interpreter always does.
+        std::string why = e.what();
+        why = why.substr(0, why.find('\n'));
+        std::fprintf(stderr, "tensix: kernel with compiled shaders failed (%s); running the interpreter\n", why.c_str());
+        DeviceOptions plain = opt;
+        plain.no_compile = true;
+        return render_impl(frame, setup, bins, plan, plain, target);
+    }
+}
+
+DeviceFrame TensixRenderer::render_impl(
     const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
     const DeviceOptions& opt, Framebuffer* target) {
     using namespace layout;
@@ -434,8 +501,23 @@ DeviceFrame TensixRenderer::render(
     if (opt.cover_count) {
         defines["RASTER_COVER_COUNT"] = "1";
     }
+    std::string compute_dir = kdir;
+    if (shaded && !opt.no_compile && (opt.compile_shaders || env_flag("TTR_SHADER_COMPILE"))) {
+        uint32_t n_compiled = 0;
+        CodegenOptions copt;
+        if (const char* v = std::getenv("TTR_SHADER_COMPILE_BYTES")) copt.max_code_bytes = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));   // tests
+        if (const char* v = std::getenv("TTR_SHADER_COMPILE_PROGRAMS")) copt.max_programs = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+        const std::string header = generate_shader_header(frame.shaders, copt, &n_compiled);
+        if (n_compiled > 0) {
+            compute_dir = prepare_kernel_dir(kdir, header);
+            defines["RASTER_COMPILED_SHADERS"] = "1";
+            if (const char* v = std::getenv("TTR_SHADER_COMPILE"); v != nullptr && v[0] == '2') {
+                std::fprintf(stderr, "tensix: compiled %u of %zu shader programs, kernels in %s\n", n_compiled, frame.shaders.size(), compute_dir.c_str());
+            }
+        }
+    }
     auto compute = CreateKernel(
-        program, kdir + "compute.cpp", core_set,
+        program, compute_dir + "compute.cpp", core_set,
         ComputeConfig{.fp32_dest_acc_en = true, .dst_full_sync_en = true, .defines = defines});
 
     for (size_t c = 0; c < plan.size(); c++) {

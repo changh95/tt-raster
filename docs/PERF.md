@@ -284,6 +284,10 @@ Per-frame breakdown of the fast path at 1920 x 1080 (`TTR_GL_DEBUG=1`): 3.9 ms i
 
 ## Fragment shaders (G.6)
 
+### Compiled shaders (`TTR_SHADER_COMPILE=1`, `core/src/tensix/shader_codegen.cpp`)
+
+The interpreter below costs 60 to 115 cycles per instruction. Generated SFPI code (registers and constant indices known at compile time, bit-identical results) is 2 to 3 times faster per frame on the benchmark shader in this first version and up to 40 times on a Mad chain in the timing experiment (`ttr_shader_bench --compiled`). Measured against llvmpipe in `docs/EVALUATION_GL_VULKAN.md`: 1920 x 1080, 131-instruction shader, 1 / 4 / 8 / 16 full-screen layers: interpreter 10.8 / 29.6 / 51.5 ms, compiled 7.2 / 14.0 / 17.8 / 26.0 ms, llvmpipe at 64 threads 2.9 / 7.4 / 19.1 / 34.4 ms. A new program set builds in about 9 s (0.9 s from the cache).
+
 ### Interpreter cost (`core/tools/ttr_shader_bench`, node 5, 1920 x 1088, one full-screen quad, 120 cores, median of 20 warm runs)
 
 The program is a chain of K instructions of one kind on one register; the device time rises linearly with K. Time per instruction and per pixel vector (32 lanes) on the busiest core (18 triangle-tile records of 32 vectors: 17 tiles, one on the quad's diagonal with two records; 2132 records for 2040 tiles). **Correction (2026-11-11):** this section first divided by two records per tile, which is wrong, so every nanosecond figure here was 1.9 times too small; the device times in ms never were. The table below is corrected, and the "before the change" column too.

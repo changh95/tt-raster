@@ -44,6 +44,7 @@ struct ShTri {
     const volatile uint32_t* code;
     const volatile float* consts;
     uint32_t n_instr, n_in, out_reg, uses_kill;
+    uint32_t prog;                                  // index of the program in the frame (selects compiled code), ~0 for fixed function
     int32_t fc_reg;
 };
 
@@ -79,6 +80,7 @@ inline void load_shader_tri(ShTri& s, const volatile float* rec, const volatile 
         s.fc_reg = static_cast<int32_t>(dir[4]) - 1;
         s.out_reg = dir[5];
         s.uses_kill = dir[6];
+        s.prog = u[kProgramId];
     } else {
         s.code = nullptr;
         s.consts = nullptr;
@@ -87,6 +89,7 @@ inline void load_shader_tri(ShTri& s, const volatile float* rec, const volatile 
         s.fc_reg = -1;
         s.out_reg = 0;
         s.uses_kill = 0;
+        s.prog = 0xFFFFFFFFu;
     }
 }
 
@@ -306,6 +309,14 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
     }
 }
 
+// Shaders compiled to straight SFPI (core/src/tensix/shader_codegen.cpp): the generated header defines sh_dispatch(), which runs the
+// compiled program the triangle record names and the interpreter for programs that were not compiled. Without it, the interpreter.
+#ifdef RASTER_COMPILED_SHADERS
+#include "shader_compiled.h"
+#else
+__attribute__((always_inline)) inline void sh_dispatch(const ShTri& s) { sh_run(s); }
+#endif
+
 // Quantize like core/src/ttraster/frame.cpp (see raster_quantize) and pack R in the low byte.
 __attribute__((always_inline)) inline sfpi::vUInt sh_pack(sfpi::vFloat r, sfpi::vFloat g, sfpi::vFloat b, sfpi::vFloat a) {
     sfpi::vUInt qr = raster_quantize(r);
@@ -431,7 +442,7 @@ __attribute__((always_inline)) inline void sh_shade(const ShTri& s) {
         sfpi::dst_reg[kRegBase + 5] = 1.0f;
     }
 #else
-    sh_run(s);
+    sh_dispatch(s);
 #endif
     sfpi::vFloat active = sfpi::dst_reg[kRegBase + kKillReg];
     v_if (active >= 0.0f) {

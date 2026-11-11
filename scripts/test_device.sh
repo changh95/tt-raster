@@ -27,4 +27,9 @@ scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 30 --seed 1000 --blend
 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --mode smooth --iters 30 --seed 2000 --blend
 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 4 --seed 3000 --size 1920 1088 --tris 1500
 scripts/run.sh "$mc_nodes" "$bin/ttr_shader_fuzz" --chips 8 --iters 20 --seed 4000 --blend
+# The same programs compiled to straight SFPI (core/src/tensix/shader_codegen.cpp) must stay bit-identical to the CPU reference; each frame
+# builds a kernel for its program set (about ten seconds each), so fewer iterations. Includes frames whose code does not fit and falls back.
+TTR_SHADER_COMPILE=1 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 12 --seed 1
+TTR_SHADER_COMPILE=1 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 6 --seed 1000 --blend
+TTR_SHADER_COMPILE=1 TTR_SHADER_COMPILE_BYTES=2000000 TTR_SHADER_COMPILE_PROGRAMS=100 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 8 --seed 1000 --blend
 scripts/run.sh "$mc_nodes" "$bin/ttr_multichip" all --chips "$mc_chips" --bench 5
