@@ -46,9 +46,11 @@ Regenerate: `scripts/run.sh 0 build/tools/ttr_device all --mode grid --colour-on
 
 `libttraster` (`include/ttraster/ttraster.h`, Python binding in `python/ttraster`) renders one camera per environment, all environments in one rasterizer run, and returns depth, shape ids, albedo, shaded RGB and normals with the conventions of Isaac Lab and Newton's Warp renderer. `validation/` renders the same cartpole-like scene with Newton's own ray tracer (on the CPU, through Warp) and with libttraster on a Tensix chip and compares them.
 
-Top to bottom, for four environments (96 x 96, the Isaac Lab cartpole camera): Newton RGB, libttraster RGB, Newton depth, libttraster depth, Newton normals, libttraster normals, absolute depth error (red; almost nothing to see):
+A simulated cartpole, two environments side by side: the physics is MuJoCo Warp (through Newton's `SolverMuJoCo`, on the CPU), and every frame is rendered from the same body transforms by Newton's Warp ray tracer (left of each pair) and by libttraster on a Tensix chip (right): RGB, depth and normals, 96 x 96 pixels, Isaac Lab background colour:
 
-![Newton Warp (CPU) against libttraster (Tensix)](docs/images/isaac_cartpole_compare.png)
+![cartpole simulated with MuJoCo Warp, rendered by Newton Warp (CPU) and by libttraster (Tensix chip)](docs/images/cartpole_newton_vs_tensix.gif)
+
+(`scripts/run.sh 5 venv-newton/bin/python validation/cartpole_gif.py OUT.gif` records it; the numbers against Newton are in the table below.)
 
 | Metric against Newton Warp | Value |
 | --- | --- |
@@ -71,8 +73,6 @@ scripts/test_gl.sh      # image comparisons: stock softpipe, the fast path on th
 ![glxgears recorded side by side: stock softpipe on the CPU and the Tensix fast path on a Blackhole chip (800 x 800 window)](docs/images/glxgears_stock_vs_tensix.gif)
 
 (`mesa/tests/record_gears.py` records it; the FPS in the labels are glxgears' own, measured while both ran.)
-
-![glxgears: stock softpipe and the Tensix fast path](docs/images/gl_gears_softpipe_vs_tensix.png)
 
 ![a test scene: softpipe, Tensix, and the difference x16](docs/images/gl_scene_softpipe_vs_tensix.png)
 
