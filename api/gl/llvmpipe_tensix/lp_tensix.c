@@ -359,7 +359,7 @@ get_program(struct lp_tensix *t, const struct lp_fragment_shader *fs, const char
          if (passthrough_input(tok) >= 0) {
             reason = "passthrough";
          } else {
-            prog = lp_ttr_prog_translate(tok, &reason);
+            prog = lp_ttr_prog_translate_ex(tok, &reason, true);
             DBG(t, "fragment shader %u %s%s", fs->no, prog ? "translated" : "not translated: ", prog ? "" : reason);
          }
          FREE((void *)tok);
@@ -458,8 +458,6 @@ state_refused(struct lp_tensix *t)
    const nir_shader *nir = fs->base.ir.nir;
    if (!nir || BITSET_LAST_BIT(nir->info.textures_used) || BITSET_LAST_BIT(nir->info.images_used) || nir->info.num_ssbos)
       return "textures, images or storage buffers";
-   if (fs->info.base.uses_kill)
-      return "discard (not wired yet)";
    const char *why = NULL;
    const struct lp_ttr_prog *prog = get_program(t, fs, &why);
    t->shaded = false;
@@ -742,6 +740,15 @@ register_shader(struct lp_tensix *t)
    }
    if (!lp_ttr_prog_constants(p, (const float *)data, size, t->lp->framebuffer.height, consts))
       return "uniform outside the constant buffer";
+   if (t->debug_tgsi) {
+      fprintf(stderr, "tensix: constant buffer %u bytes at %p, program constants:", size, (const void *)data);
+      for (unsigned i = 0; i < p->n_consts && i < 16; i++)
+         fprintf(stderr, " %g", consts[i]);
+      fprintf(stderr, " | buffer floats:");
+      for (unsigned i = 0; data && i < size / 4 && i < 8; i++)
+         fprintf(stderr, " %g", ((const float *)data)[i]);
+      fprintf(stderr, " | fragcoord_reg %d\n", p->fragcoord_reg);
+   }
    const ttr_shader_desc desc = {p->code, p->n_instr, consts, p->n_consts, p->num_inputs, p->num_regs, p->out_reg, p->fragcoord_reg};
    t->shader_id = t->api.frame_shader(t->ctx, &desc);
    if (!t->shader_id)

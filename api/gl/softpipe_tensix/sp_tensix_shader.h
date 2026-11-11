@@ -43,6 +43,9 @@ struct ttr_prog {
 
 /* Translate a fragment shader. Returns NULL and sets *why to a static string if the shader is out of reach. */
 struct ttr_prog *ttr_prog_translate(const struct tgsi_token *tokens, const char **why);
+/* The same; origin_in_shader: the shader flips gl_FragCoord.y itself (llvmpipe's NIR does, with a constant of the driver state), so the
+ * FS_COORD_ORIGIN property must not flip it a second time. */
+struct ttr_prog *ttr_prog_translate_ex(const struct tgsi_token *tokens, const char **why, bool origin_in_shader);
 void ttr_prog_free(struct ttr_prog *p);
 
 /* The constant table of the program for the current constants: immediates, then uniforms read from `cbuf` (constant

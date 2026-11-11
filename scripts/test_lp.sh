@@ -70,7 +70,12 @@ for be in "${backends[@]}"; do
     cmp_gl phong "$be" --fs phong --sphere
     cmp_gl lambert "$be" --fs lambert
     cmp_gl smooth "$be" --fs smooth
-    cmp_gl stripes_refused "$be" --fs stripes   # refused (gl_FragCoord is not wired for llvmpipe's NIR yet): must still be right
+    cmp_gl stripes "$be" --fs stripes     # gl_FragCoord (which llvmpipe's NIR flips itself) and a uniform loaded from the buffer
+    cmp_gl discard "$be" --fs discard     # DEMOTE
+    cmp_gl fog "$be" --fs fog
+    cmp_gl cond "$be" --fs cond
+    cmp_gl loop "$be" --fs loop
+    cmp_gl uniform "$be" --fs uniform --continue --frames 3
     MAX_BAD=0.005 cmp_vk triangles "$be" --size 320x240 --tris 3000   # 3000 triangles of about 25 pixels: edge pixels are a larger share
     cmp_vk shader "$be" --size 320x240 --tris 0 --layers 2
 done

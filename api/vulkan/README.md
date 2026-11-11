@@ -31,8 +31,8 @@ The softpipe fast path hooks softpipe. Lavapipe cannot sit on softpipe: it creat
 
 ## Next
 
-1. A NIR front end of our own (today llvmpipe's NIR goes through `nir_to_tgsi`; `gl_FragCoord`, `discard` and push constants are not
-   wired for it), a lazy depth plane, a swapchain test (vkcube with the offload), uniform buffers and push constants.
+1. A NIR front end of our own (today llvmpipe's NIR goes through `nir_to_tgsi`; push constants, uniform buffers and other system values are
+   not wired for it), a lazy depth plane, a swapchain test (vkcube with the offload), uniform buffers and push constants.
 2. The software texture unit, then compute, a device server for several processes, a CTS farm (docs/FULL_COVERAGE_PLAN.md), each behind its gate.
 
 ## Files

@@ -401,6 +401,25 @@ typedef bool (*lane_fn)(struct xl *x, const struct tgsi_full_instruction *inst, 
       return true;                                                                                                \
    }
 
+/* LOAD from constant buffer 0 with an immediate byte offset: what NIR's load_ubo becomes in nir_to_tgsi for screens (llvmpipe) that
+ * lower uniforms to a buffer. Component `lane` of the result is the float at (offset / 4 + lane) of the buffer, that is a uniform. */
+static bool
+f_load(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)
+{
+   const struct tgsi_full_src_register *b = &inst->Src[0], *o = &inst->Src[1];
+   if (b->Register.File != TGSI_FILE_CONSTANT || b->Register.Indirect || b->Register.Index != 0 ||
+       (b->Register.Dimension && (b->Dimension.Index != 0 || b->Dimension.Indirect)))
+      return fail(x, "buffer load other than constant buffer 0");
+   if (o->Register.File != TGSI_FILE_IMMEDIATE || o->Register.Indirect || o->Register.Index < 0 || (unsigned)o->Register.Index >= x->n_timm)
+      return fail(x, "constant load with a run-time offset");
+   const unsigned swz4[4] = {o->Register.SwizzleX, o->Register.SwizzleY, o->Register.SwizzleZ, o->Register.SwizzleW};
+   const uint32_t bytes = x->timm[o->Register.Index][swz4[lane]];
+   if (bytes % 4)
+      return fail(x, "unaligned constant load");
+   emit(x, TTR_OP_MOV, dst, uni_op(x, bytes / 4 + lane), none(), none(), sat);
+   return true;
+}
+
 /* A move keeps the comparison-result property of its source. */
 static bool
 f_mov(struct xl *x, const struct tgsi_full_instruction *inst, unsigned lane, int dst, bool sat)
@@ -804,6 +823,7 @@ translate_inst(struct xl *x, const struct tgsi_full_instruction *inst)
 {
    switch (inst->Instruction.Opcode) {
    case TGSI_OPCODE_MOV: return tr_lanes(x, inst, f_mov);
+   case TGSI_OPCODE_LOAD: return tr_lanes(x, inst, f_load);
    case TGSI_OPCODE_ADD: return tr_lanes(x, inst, f_add);
    case TGSI_OPCODE_MUL: return tr_lanes(x, inst, f_mul);
    case TGSI_OPCODE_MAD:
@@ -854,6 +874,7 @@ translate_inst(struct xl *x, const struct tgsi_full_instruction *inst)
       return true;
    case TGSI_OPCODE_KILL_IF: return tr_kill_if(x, inst);
    case TGSI_OPCODE_KILL:
+   case TGSI_OPCODE_DEMOTE:   /* discard as llvmpipe's NIR writes it: the pixel stays a helper only for derivatives, which the rasterizer has none of */
       kill_value(x, imm_f(x, -1.0f));
       return !x->why;
    case TGSI_OPCODE_NOP:
@@ -1075,6 +1096,12 @@ bad:
 struct ttr_prog *
 ttr_prog_translate(const struct tgsi_token *tokens, const char **why)
 {
+   return ttr_prog_translate_ex(tokens, why, false);
+}
+
+struct ttr_prog *
+ttr_prog_translate_ex(const struct tgsi_token *tokens, const char **why, bool origin_in_shader)
+{
    static const char *oom = "out of memory";
    struct xl *x = CALLOC_STRUCT(xl);
    if (!x) {
@@ -1156,7 +1183,7 @@ ttr_prog_translate(const struct tgsi_token *tokens, const char **why)
       case TGSI_TOKEN_TYPE_PROPERTY: {
          const struct tgsi_full_property *pr = &parse.FullToken.FullProperty;
          if (pr->Property.PropertyName == TGSI_PROPERTY_FS_COORD_ORIGIN)
-            x->origin_lower_left = pr->u[0].Data == TGSI_FS_COORD_ORIGIN_LOWER_LEFT;
+            x->origin_lower_left = !origin_in_shader && pr->u[0].Data == TGSI_FS_COORD_ORIGIN_LOWER_LEFT;
          else if (pr->Property.PropertyName == TGSI_PROPERTY_FS_COORD_PIXEL_CENTER)
             x->pixel_center_integer = pr->u[0].Data == TGSI_FS_COORD_PIXEL_CENTER_INTEGER;
          break;
