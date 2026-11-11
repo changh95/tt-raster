@@ -4,10 +4,11 @@
 # Run an OpenGL program (X11/GLX) on the Mesa built by scripts/build_mesa.sh, rasterized by the Tensix fast path,
 # inside a virtual X server.
 #
-#   scripts/run_gl.sh <node> [--size WxH] [--backend tensix|reference|off] <program> [args...]
+#   scripts/run_gl.sh <node> [--size WxH] [--backend tensix|reference|off] [--driver llvmpipe] <program> [args...]
 #
 #   scripts/run_gl.sh 5 glxgears -geometry 1920x1080
 #   scripts/run_gl.sh 5 --backend off glxgears        # the same Mesa, stock softpipe (for comparisons)
+#   scripts/run_gl.sh 5 --driver llvmpipe glxgears    # the conformant CPU driver (OpenGL 4.6) of the `build_mesa.sh --llvm` build
 #
 # `node` is a device node 0-7 of the assigned tray (see scripts/run.sh). TTR_GL_DEBUG=1 prints the fast path's
 # decisions and per-frame timings.
@@ -22,8 +23,10 @@ node="${1:?usage: run_gl.sh <node> [--size WxH] [--backend tensix|reference|off]
 shift
 size="1920x1080"
 backend="tensix"
+driver=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --driver) driver="$2"; shift 2 ;;
         --size) size="$2"; shift 2 ;;
         --backend) backend="$2"; shift 2 ;;
         *) break ;;
@@ -31,11 +34,17 @@ while [[ $# -gt 0 ]]; do
 done
 [[ $# -gt 0 ]] || { echo "run_gl.sh: no program given" >&2; exit 2; }
 
+if [[ "$driver" == "llvmpipe" ]]; then
+    prefix="${TT_RASTER_MESA_LLVM_PREFIX:-$HOME/experiments/mesa-install-llvm}"
+    backend="off"
+elif [[ -n "$driver" ]]; then
+    echo "run_gl.sh: unknown driver '$driver' (llvmpipe, or leave it out for the tensix/softpipe Mesa)" >&2; exit 2
+fi
 lib="$prefix/lib/x86_64-linux-gnu"
 export LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LIBGL_DRIVERS_PATH="$lib/dri"
 export LIBGL_ALWAYS_SOFTWARE=1
-export GALLIUM_DRIVER=softpipe
+export GALLIUM_DRIVER="${driver:-softpipe}"
 # Below about 300,000 pixels (550 x 550) stock softpipe is faster than a chip frame (api/gl/README.md); set 0 to always use the chip.
 export TTR_GL_MIN_PIXELS="${TTR_GL_MIN_PIXELS:-300000}"
 export TTRASTER_LIB="${TTRASTER_LIB:-$build/core/libttraster.so}"

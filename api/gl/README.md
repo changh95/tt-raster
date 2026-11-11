@@ -5,6 +5,10 @@ of whole frames to tt-raster: a Blackhole chip, or the CPU reference backend of 
 everything else: the OpenGL frontend (GL 3.3 compatibility profile as built here), GLSL and fixed-function state
 to shaders, vertex shading, clipping, viewport transform and culling (Gallium's `draw` module on the host).
 
+Next to it, `scripts/build_mesa.sh --llvm` builds llvmpipe (OpenGL 4.6, conformant upstream) and lavapipe (Vulkan) into the same Mesa;
+`scripts/run_gl.sh --driver llvmpipe` runs a program on llvmpipe and without `--driver` on the `tensix` fast path, so any GL program can be
+run on either. Measurements of the two against each other, and the plan, are in `docs/EVALUATION_GL_VULKAN.md`; Vulkan is `api/vulkan`.
+
 This is not a new driver and not Vulkan. It makes a subset of OpenGL fast, and everything outside the subset runs on
 softpipe, unchanged and correct.
 

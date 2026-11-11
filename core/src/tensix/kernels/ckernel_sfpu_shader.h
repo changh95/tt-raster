@@ -408,7 +408,31 @@ __attribute__((always_inline)) inline void sh_shade(const ShTri& s) {
         sfpi::dst_reg[f + 2] = z;
         sfpi::dst_reg[f + 3] = wv;
     }
+#ifdef RASTER_EXP_SH_COMPILED_K
+    // Timing experiment (docs/EVALUATION_GL_VULKAN.md): the chain program of ttr_shader_bench written as straight SFPI, with registers and
+    // constants known at compile time, the way a shader compiler would emit it, instead of the interpreter. KIND 0: K dependent Mads;
+    // KIND 1: K / 2 steps of Mad then Frc. The program's inputs are r0 (u) and r1 (v), its colour is r2..r5 (ttr_shader_bench make_chain).
+    {
+        sfpi::vFloat in1 = sfpi::dst_reg[kRegBase + 1];
+        sfpi::vFloat acc = sfpi::dst_reg[kRegBase + 0];
+#if RASTER_EXP_SH_COMPILED_KIND == 1
+#pragma GCC unroll 64
+        for (uint32_t i = 0; i < RASTER_EXP_SH_COMPILED_K / 2; i++) {
+            acc = acc * 1.37f + in1;
+            acc = acc - sh_floor_any(acc);
+        }
+#else
+#pragma GCC unroll 128
+        for (uint32_t i = 0; i < RASTER_EXP_SH_COMPILED_K; i++) { acc = acc * 0.9f + in1; }
+#endif
+        sfpi::dst_reg[kRegBase + 2] = sh_sat(acc);
+        sfpi::dst_reg[kRegBase + 3] = in1;
+        sfpi::dst_reg[kRegBase + 4] = 0.2f;
+        sfpi::dst_reg[kRegBase + 5] = 1.0f;
+    }
+#else
     sh_run(s);
+#endif
     sfpi::vFloat active = sfpi::dst_reg[kRegBase + kKillReg];
     v_if (active >= 0.0f) {
         if (s.depth_write) { sfpi::dst_reg[kSlotZ * kVectors] = z; }

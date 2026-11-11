@@ -2,7 +2,9 @@
 //
 // Cost of the shader interpreter on the device (docs/PERF.md): a full-screen quad at 1920 x 1088 with a straight-line program
 // of K instructions of one kind, K = 0, 8, 32, 128; reports the device time of the frame and what that is per instruction and
-// pixel vector. Instruction kinds: Mad (the common one), Mul, Rcp, Ex2, Sin, Slt.
+// pixel vector. Instruction kinds: Mad (the common one), Mul, Rcp, Ex2, Sin, Slt, and Frc (the number of the opcode: a Mad/Frc chain).
+// --compiled: for the Mad and Mad/Frc chains, run the same program as straight SFPI built into the kernel instead of the interpreter
+// (a timing experiment: what a shader compiler could gain, docs/EVALUATION_GL_VULKAN.md).
 //
 //   scripts/run.sh <node> build/tools/ttr_shader_bench [--runs N]
 
@@ -25,6 +27,7 @@ using namespace ttr::shader;
 namespace {
 
 bool g_regs_only = false;     // --regs: the independent Mad has register operands only (no constant: SFPLOADI with a runtime immediate)
+bool g_compiled = false;      // --compiled: the chain is compiled into the kernel (RASTER_EXP_SH_COMPILED_K), not interpreted
 bool g_independent = false;   // --indep: instruction i reads only the inputs and writes one of 8 registers (no dependency chain)
 
 ShaderProgram make_chain(uint32_t op, int k) {
@@ -50,6 +53,10 @@ ShaderProgram make_chain(uint32_t op, int k) {
             case kOpEx2: sb.emit_to(kOpEx2, acc, sb.reg(acc)); break;
             case kOpSin: sb.emit_to(kOpSin, acc, sb.reg(acc)); break;
             case kOpSlt: sb.emit_to(kOpSlt, acc, sb.reg(acc), sb.in(1)); break;
+            case kOpFrc:   // Mad, Frc, Mad, Frc ... (the chain of the OpenGL benchmark, api/gl/tests/gl_bench.c): k counts instructions
+                if (i % 2 == 0) sb.emit_to(kOpMad, acc, sb.reg(acc), sb.constant(1.37f), sb.in(1));
+                else sb.emit_to(kOpFrc, acc, sb.reg(acc));
+                break;
             default: break;
         }
     }
@@ -71,6 +78,7 @@ int main(int argc, char** argv) {
         if (a == "--runs" && i + 1 < argc) runs = std::atoi(argv[++i]);
         else if (a == "--op" && i + 1 < argc) only = argv[++i];
         else if (a == "--indep") g_independent = true;
+        else if (a == "--compiled") g_compiled = true;
         else if (a == "--regs") g_independent = g_regs_only = true;
         else if (a == "--define" && i + 1 < argc) {
             const std::string kv = argv[++i];
@@ -83,7 +91,7 @@ int main(int argc, char** argv) {
     const auto cores = renderer.worker_cores();
     const uint32_t W = 1920, H = 1088;
     std::printf("%-5s %5s %12s %12s %20s\n", "op", "K", "device ms", "ms vs K=0", "ns per instr per vector (busiest core)");
-    for (uint32_t op : {kOpMad, kOpMul, kOpRcp, kOpEx2, kOpSin, kOpSlt}) {
+    for (uint32_t op : {kOpMad, kOpMul, kOpRcp, kOpEx2, kOpSin, kOpSlt, kOpFrc}) {
         if (!only.empty() && std::to_string(op) != only) continue;
         double base = 0.0;
         for (int k : {0, 8, 32, 128}) {
@@ -111,19 +119,25 @@ int main(int argc, char** argv) {
             const SetupResult setup = setup_frame(f);
             const TileBins bins = bin_triangles(setup, f.tiles_x(), f.tiles_y());
             const auto plan = plan_row_major(cores, f.tiles_x(), f.tiles_y());
+            if (k == 0) std::printf("(%zu tiles, %llu triangle-tile records)\n", static_cast<size_t>(f.tiles_x()) * f.tiles_y(), static_cast<unsigned long long>(bins.entries));
             DeviceOptions opt;
             opt.debug_planes = false;
             opt.defines = defines;
+            if (g_compiled) {
+                opt.defines["RASTER_EXP_SH_COMPILED_K"] = std::to_string(k);
+                opt.defines["RASTER_EXP_SH_COMPILED_KIND"] = op == kOpFrc ? "1" : "0";
+            }
             renderer.render(f, setup, bins, plan, opt);   // warm-up (kernel build)
             std::vector<double> t;
             for (int r = 0; r < runs; r++) t.push_back(renderer.render(f, setup, bins, plan, opt).times.device_ms);
             std::sort(t.begin(), t.end());
             const double med = t[t.size() / 2];
             if (k == 0) base = med;
-            // 2040 tiles over 120 cores: the busiest core draws 17 tiles; every tile has one record per triangle (2), and a record is
-            // 32 vectors, all full.
-            const double tiles_per_core = 17.0;
-            const double per = k > 0 ? (med - base) * 1e6 / (tiles_per_core * 2 * 32 * k) : 0.0;
+            // 2040 tiles over 120 cores: the busiest core draws 17 tiles, one of them on the diagonal of the quad (two records, one per
+            // triangle; every other tile has one record, 2132 records for 2040 tiles, printed above), and a record is 32 vectors, all full.
+            // (Until 2026-11-11 this assumed two records per tile and so reported times 1.9 times too small.)
+            const double records_per_core = 18.0;
+            const double per = k > 0 ? (med - base) * 1e6 / (records_per_core * 32 * k) : 0.0;
             std::printf("%-5u %5d %12.3f %12.3f %20.1f\n", op, k, med, med - base, per);
         }
     }
