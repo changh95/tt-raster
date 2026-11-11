@@ -21,8 +21,8 @@
 //                      interpreter (operand decode, register file, lane predicate, constants, program table, extension
 //                      records), not rounding.
 //   smooth             Varyings that really vary (linear and perspective), fragcoord z and 1/w readable, but only the continuous
-//                      instructions (Mov, Add, Mul, Min, Max), so that one ulp of input stays one ulp; a pixel may differ by
-//                      one level (counted), never more.
+//                      instructions (Mov, Add, Mul, Mad, Min, Max), so that one ulp of input stays one ulp; a pixel may differ
+//                      by one level (counted), never more.
 // Programs that produce a NaN, an infinity or a subnormal on sampled inputs are discarded, because there the device may
 // legitimately differ (shader.h, run_shader). Pixels whose depth test is ambiguous in the reference (docs/FINDINGS.md, V10)
 // are skipped; depth must agree within 4 ulp or 2e-6 (the same multiply-add). Blending uses multiply-adds that are not exactly fused,
@@ -64,8 +64,9 @@ struct Rng {
 constexpr uint32_t kExactOps[] = {kOpMov, kOpAdd, kOpMul, kOpMin, kOpMax, kOpFrc, kOpFlr, kOpSlt, kOpSge, kOpSeq, kOpSne, kOpCmp, kOpSel};
 // Relative weights of kExactOps: arithmetic and the bounded functions (Frc, Min, Max) dominate so that values stay finite.
 constexpr uint32_t kOpWeights[] = {6, 14, 14, 6, 6, 8, 3, 3, 3, 2, 2, 6, 6};
-// The continuous subset used by the smooth mode: Mov, Add, Mul, Min, Max.
-constexpr uint32_t kSmoothOps = 5;
+// The continuous subset used by the smooth mode: Mov, Add, Mul, Mad, Min, Max.
+constexpr uint32_t kSmoothOps[] = {kOpMov, kOpAdd, kOpMul, kOpMad, kOpMin, kOpMax};
+constexpr uint32_t kSmoothWeights[] = {6, 14, 14, 10, 6, 6};
 
 float random_constant(Rng& rng) {
     static const float special[] = {0.0f, -0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 0.25f, 2.0f, 3.0f, -3.0f, 0.1f, 0.7f, 1.5f, 7.5f, 100.0f, 0.001f, 0.33333334f};
@@ -143,12 +144,14 @@ struct ProgramBuilder {
                 emit(kOpKill, 0, false);
                 continue;
             }
-            const uint32_t count = smooth ? kSmoothOps : sizeof kExactOps / sizeof kExactOps[0];
+            const uint32_t* ops = smooth ? kSmoothOps : kExactOps;
+            const uint32_t* weights = smooth ? kSmoothWeights : kOpWeights;
+            const uint32_t count = smooth ? sizeof kSmoothOps / sizeof kSmoothOps[0] : sizeof kExactOps / sizeof kExactOps[0];
             uint32_t total = 0;
-            for (uint32_t i = 0; i < count; i++) total += kOpWeights[i];
+            for (uint32_t i = 0; i < count; i++) total += weights[i];
             uint32_t pick = rng.below(total), k = 0;
-            while (pick >= kOpWeights[k]) pick -= kOpWeights[k++];
-            emit(kExactOps[k], rng.below(p.num_regs), rng.chance(0.1));
+            while (pick >= weights[k]) pick -= weights[k++];
+            emit(ops[k], rng.below(p.num_regs), rng.chance(0.1));
         }
         // The colour: every channel from some register, mostly through Frc so that it is not just 0 or 1.
         for (uint32_t k = 0; k < 4; k++) {
