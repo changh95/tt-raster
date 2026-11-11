@@ -25,4 +25,6 @@ scripts/run.sh "$node" "$bin/ttr_shader_ops" all
 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 60 --seed 1
 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 30 --seed 1000 --blend
 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --mode smooth --iters 30 --seed 2000 --blend
+scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 4 --seed 3000 --size 1920 1088 --tris 1500
+scripts/run.sh "$mc_nodes" "$bin/ttr_shader_fuzz" --chips 8 --iters 20 --seed 4000 --blend
 scripts/run.sh "$mc_nodes" "$bin/ttr_multichip" all --chips "$mc_chips" --bench 5

@@ -2,7 +2,7 @@
 //
 // Random-program test of the shader interpreter on the Tensix device (docs/FINDINGS.md, "Fragment shaders").
 //
-//   scripts/run.sh <node> build/tools/ttr_shader_fuzz [--mode exact|smooth] [--iters N] [--seed S] [--tris M] [--blend] [--verbose]
+//   scripts/run.sh <node> build/tools/ttr_shader_fuzz [--mode exact|smooth] [--iters N] [--seed S] [--tris M] [--size W H] [--chips N] [--blend] [--verbose]
 //
 // Each iteration builds one frame of random triangles (large, small, slivers, partly off screen, perspective and linear
 // varyings, random depth so that triangles overlap, optional own depth and blend state, a few fixed-function triangles
@@ -38,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "tensix/multichip.h"
 #include "tensix/tensix_renderer.h"
 #include "ttraster/reference.h"
 
@@ -267,7 +268,8 @@ struct Stats {
 }  // namespace
 
 int main(int argc, char** argv) {
-    uint32_t iters = 40, tris = 220;
+    uint32_t iters = 40, tris = 220, fixed_width = 0, fixed_height = 0;
+    size_t chips = 1;
     uint64_t seed0 = 1;
     bool blend = false, verbose = false, smooth = false, dump = false;
     for (int i = 1; i < argc; i++) {
@@ -282,16 +284,27 @@ int main(int argc, char** argv) {
         else if (a == "--seed" && i + 1 < argc) seed0 = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--tris" && i + 1 < argc) tris = static_cast<uint32_t>(std::atoi(argv[++i]));
         else if (a == "--blend") blend = true;
+        else if (a == "--chips" && i + 1 < argc) chips = static_cast<size_t>(std::atoi(argv[++i]));
+        else if (a == "--size" && i + 2 < argc) { fixed_width = static_cast<uint32_t>(std::atoi(argv[++i])); fixed_height = static_cast<uint32_t>(std::atoi(argv[++i])); }
         else if (a == "--verbose") verbose = true;
         else if (a == "--dump") dump = true;
         else {
-            std::fprintf(stderr, "usage: ttr_shader_fuzz [--mode exact|smooth] [--iters N] [--seed S] [--tris M] [--blend] [--verbose]\n");
+            std::fprintf(stderr, "usage: ttr_shader_fuzz [--mode exact|smooth] [--iters N] [--seed S] [--tris M] [--size W H] [--chips N] [--blend] [--verbose]\n");
             return 2;
         }
     }
-    auto mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
-    TensixRenderer renderer(mesh);
-    const auto cores = renderer.worker_cores();
+    // One chip drives the renderer directly (with the balanced plan over its cores); --chips N splits every frame over N chips.
+    std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh;
+    std::unique_ptr<TensixRenderer> renderer;
+    std::unique_ptr<MultiChipRenderer> multi;
+    std::vector<tt::tt_metal::CoreCoord> cores;
+    if (chips > 1) {
+        multi = std::make_unique<MultiChipRenderer>(chips);
+    } else {
+        mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
+        renderer = std::make_unique<TensixRenderer>(mesh);
+        cores = renderer->worker_cores();
+    }
 
     Stats total;
     uint32_t failed_frames = 0;
@@ -302,6 +315,7 @@ int main(int argc, char** argv) {
         Frame f;
         f.width = 32 * (4 + rng.below(9));    // 128 .. 384
         f.height = 32 * (3 + rng.below(6));   // 96 .. 224
+        if (fixed_width) { f.width = fixed_width; f.height = fixed_height; }
         f.clear_color[0] = static_cast<float>(rng.uniform());
         f.clear_color[1] = static_cast<float>(rng.uniform());
         f.clear_color[2] = static_cast<float>(rng.uniform());
@@ -390,10 +404,17 @@ int main(int argc, char** argv) {
         const SetupResult setup = setup_frame(f);
         const TileBins bins = bin_triangles(setup, f.tiles_x(), f.tiles_y());
         const Framebuffer cpu = render_reference(f, setup, bins);
-        const auto plan = plan_balanced(cores, all_tiles(f.tiles_x(), f.tiles_y()), bins);
         DeviceOptions opt;
         opt.debug_planes = true;
-        const DeviceFrame dev = renderer.render(f, setup, bins, plan, opt);
+        DeviceFrame single_frame;
+        const Framebuffer* dev_fb;
+        if (multi) {
+            dev_fb = multi->render(f, setup, bins, opt).fb;
+        } else {
+            single_frame = renderer->render(f, setup, bins, plan_balanced(cores, all_tiles(f.tiles_x(), f.tiles_y()), bins), opt);
+            dev_fb = &single_frame.fb;
+        }
+        const Framebuffer& dev_fb_ref = *dev_fb;
 
         // The depth plane is evaluated relative to the tile centre with a multiply-add that is not exactly fused: the error is about an
         // ulp of the largest term, 16 pixels times the gradient, so a steep sliver (gradient 10 per pixel) is allowed more than 2e-6.
@@ -412,7 +433,7 @@ int main(int argc, char** argv) {
                 }
                 int worst = 0;
                 for (int ch = 0; ch < 4; ch++) {
-                    const int a = static_cast<int>((cpu.color[i] >> (8 * ch)) & 255u), b = static_cast<int>((dev.fb.color[i] >> (8 * ch)) & 255u);
+                    const int a = static_cast<int>((cpu.color[i] >> (8 * ch)) & 255u), b = static_cast<int>((dev_fb_ref.color[i] >> (8 * ch)) & 255u);
                     worst = std::max(worst, std::abs(a - b));
                 }
                 if (worst == 0) s.exact++;
@@ -421,23 +442,23 @@ int main(int argc, char** argv) {
                     s.bad++;
                     if (!have_bad) { have_bad = true; first_bad_x = x; first_bad_y = y; }
                 }
-                if (dev.fb.id[i] != cpu.id[i]) s.id_bad++;
-                if (dev.fb.id[i] == cpu.id[i] && dev.fb.id[i] != 0) {
+                if (dev_fb_ref.id[i] != cpu.id[i]) s.id_bad++;
+                if (dev_fb_ref.id[i] == cpu.id[i] && dev_fb_ref.id[i] != 0) {
                     uint32_t da, db;
                     std::memcpy(&da, &cpu.depth[i], 4);
-                    std::memcpy(&db, &dev.fb.depth[i], 4);
+                    std::memcpy(&db, &dev_fb_ref.depth[i], 4);
                     // The plane is evaluated with a multiply-add that is not exactly fused: an error of an ulp of the largest term
                     // (about 1.2e-7 for depth in [0, 1], several times that on the steep planes of slivers), which is many ulps of a depth close to 0. Accept 4 ulp or 2e-6 plus a share of the rounding of a term that large (the largest difference seen: 3.6e-6 on a plane with a gradient of 11 per pixel).
                     const bool close_ulp = (da > db ? da - db : db - da) <= 4;
-                    s.max_depth_err = std::max(s.max_depth_err, std::fabs(cpu.depth[i] - dev.fb.depth[i]));
-                    const double tolerance = 2e-6 + 0.25 * 1.19e-7 * 16.0 * steepness[dev.fb.id[i] - 1];
-                    if (!close_ulp && std::fabs(cpu.depth[i] - dev.fb.depth[i]) > tolerance) {
+                    s.max_depth_err = std::max(s.max_depth_err, std::fabs(cpu.depth[i] - dev_fb_ref.depth[i]));
+                    const double tolerance = 2e-6 + 0.25 * 1.19e-7 * 16.0 * steepness[dev_fb_ref.id[i] - 1];
+                    if (!close_ulp && std::fabs(cpu.depth[i] - dev_fb_ref.depth[i]) > tolerance) {
                         if (!s.depth_bad++) {
                             double gx = 0, gy = 0;
                             for (const SetupTriangle& st : setup.tris)
                                 if (cpu.id[i] && st.source == cpu.id[i] - 1) { gx = st.depth.gx; gy = st.depth.gy; break; }
                             std::printf("   first depth difference at (%u, %u): cpu %.9g device %.9g, triangle %u, depth gradient %.3g, %.3g per pixel\n", x, y,
-                                        static_cast<double>(cpu.depth[i]), static_cast<double>(dev.fb.depth[i]), cpu.id[i], gx, gy);
+                                        static_cast<double>(cpu.depth[i]), static_cast<double>(dev_fb_ref.depth[i]), cpu.id[i], gx, gy);
                         }
                     }
                 }
@@ -453,7 +474,7 @@ int main(int argc, char** argv) {
                 const size_t i = cpu.index(first_bad_x, first_bad_y);
                 const uint32_t tri_id = cpu.id[i];
                 std::printf("   first bad pixel (%u, %u): cpu %08x device %08x, cpu id %u device id %u", first_bad_x, first_bad_y, cpu.color[i],
-                            dev.fb.color[i], tri_id, dev.fb.id[i]);
+                            dev_fb_ref.color[i], tri_id, dev_fb_ref.id[i]);
                 if (tri_id != 0 && tri_id <= f.triangles.size()) std::printf(" (program %u of %zu)", f.triangles[tri_id - 1].shader, f.shaders.size());
                 std::printf("\n");
                 if (dump && tri_id != 0 && f.triangles[tri_id - 1].shader != 0) {
@@ -476,7 +497,7 @@ int main(int argc, char** argv) {
         total.max_depth_err = std::max(total.max_depth_err, s.max_depth_err);
         if (verbose) std::fflush(stdout);
     }
-    mesh->close();
+    if (mesh) mesh->close();
     std::printf("total: %llu pixels, %llu ambiguous skipped, %llu exact, %llu off by one level, %llu bad colour, %llu depth, %llu id; %u of %u frames failed\n",
                 static_cast<unsigned long long>(total.pixels), static_cast<unsigned long long>(total.ambiguous), static_cast<unsigned long long>(total.exact),
                 static_cast<unsigned long long>(total.off_by_one), static_cast<unsigned long long>(total.bad), static_cast<unsigned long long>(total.depth_bad),
