@@ -58,7 +58,7 @@ Compare compare(
             }
             const size_t i = ref.index(x, y);
             c.pixels++;
-            c.cover_bad += dev_cover.fb.cover[i] != ref.cover[i];
+            if (!dev_cover.fb.cover.empty()) c.cover_bad += dev_cover.fb.cover[i] != ref.cover[i];   // not run for shader frames
             if (ref.ambiguous[i] && !strict) {
                 c.skipped++;
                 continue;
@@ -160,10 +160,6 @@ int main(int argc, char** argv) {
     for (const std::string& name : names) {
         Frame frame;
         make_scene(name, w, h, frame);
-        if (!frame.shaders.empty()) {
-            std::printf("%-18s skipped: fragment shaders are not on the device yet\n", name.c_str());
-            continue;
-        }
         const SetupResult setup = setup_frame(frame);
         const TileBins bins = bin_triangles(setup, frame.tiles_x(), frame.tiles_y());
         const Framebuffer ref = render_reference(frame, setup, bins);
@@ -204,7 +200,7 @@ int main(int argc, char** argv) {
         opt.defines = defines;
         opt.debug_planes = !colour_only;
         // Coverage check needs the id plane; in colour-only mode it is skipped.
-        const DeviceFrame dev_cover = colour_only ? DeviceFrame{} : renderer.render(frame, setup, bins, plan, cover_opt);
+        const DeviceFrame dev_cover = (colour_only || !frame.shaders.empty()) ? DeviceFrame{} : renderer.render(frame, setup, bins, plan, cover_opt);   // the coverage count is a fixed-function debug mode
         const DeviceFrame dev = renderer.render(frame, setup, bins, plan, opt);
         const Compare c = colour_only ? compare_colour(frame, ref, dev) : compare(frame, ref, dev, dev_cover, strict);
         const bool ok = c.cover_bad == 0 && c.id_bad == 0 && c.depth_bad == 0 && c.color_bad == 0 && c.pixels > 0;
@@ -236,7 +232,7 @@ int main(int argc, char** argv) {
                 // partially fused multiply-add) can differ from the reference in the last float bit: one colour level is then
                 // allowed (and counted).
                 bool perspective = false;
-                for (const Triangle& t : frame.triangles) perspective |= (t.perspective && !t.flat) || t.blend != BlendMode::None;
+                for (const Triangle& t : frame.triangles) perspective |= (t.perspective && !t.flat) || t.blend != BlendMode::None || t.shader != 0;
                 uint64_t bad = 0, off_by_one = 0;
                 for (uint32_t y = 0; y < h; y++)
                     for (uint32_t x = 0; x < w; x++) {

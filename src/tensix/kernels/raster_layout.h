@@ -43,6 +43,30 @@ constexpr uint32_t kWPlane = 29;    // rhw plane (c, gx, gy), words 29..31, pers
 constexpr uint32_t kFlatPacked = 28;  // flat colour as packed RGBA8 (host-computed), for the packed-colour variant
 constexpr uint32_t kVecClass = 26;  // 2 words, 2 bits per SFPU vector: 0 reject (skip), 1 partial (edge tests), 2 full
 
+// Fragment shaders (frames with shader triangles only; docs/FINDINGS.md, "Fragment shaders"). Every record of such a frame
+// carries its depth and blend state in the stateful bits. A shader record has kFlagShader and
+//   * words 12..23: the planes (c, gx, gy) of varying components 0..3 (where fixed-function records have their colour),
+//   * word 28: the program index (kProgramId), words 29..31: the rhw plane (c, gx, gy),
+//   * kExtSlots(flags) extension slots after it (32 words each, 3 words per further varying component, component 4 first),
+//     so a record takes 1 + ext slots in the page; a record never straddles a page.
+// Fixed-function records of such a frame have no kFlagShader: their four colour planes are the inputs of a built-in
+// program that returns them. The first unused slot of a page that the next record does not fit in holds kPageEnd in its
+// flags word.
+constexpr uint32_t kFlagShader = 1u << 10;
+constexpr uint32_t kExtShift = 11;           // 2 bits: extension slots (0..3)
+constexpr uint32_t kProgramId = 28;
+constexpr uint32_t kPageEnd = 0xFFFFFFFFu;
+constexpr uint32_t kInputsInRecord = 4;
+constexpr uint32_t ext_slots(uint32_t n_inputs) {
+    return n_inputs > kInputsInRecord ? (3 * (n_inputs - kInputsInRecord) + kRecordWords - 1) / kRecordWords : 0;
+}
+// Program table (read once into L1): word 0 = number of programs, then 8-word directory entries from word 1:
+//   code offset (words from the table start), instruction count, constants offset, inputs, fragcoord register + 1 (0: none),
+//   output register, uses kill, reserved. Code and constants follow the directory.
+constexpr uint32_t kMaxTablePages = 16;   // 64 KiB of programs and constants per frame
+constexpr uint32_t kTabDirectory = 1;
+constexpr uint32_t kTabEntryWords = 8;
+
 // Header word offsets (inside record slot 0 of the block's first page).
 // Blend of one channel (src s, src alpha sa, dst d), the same chain on host and device:
 //   A = sa * ka_sa + ka_c;  B = s * kb_s + (sa * kb_sa + kb_c);  r = clamp01(s * A + d * B)
@@ -60,6 +84,9 @@ constexpr float kBlendCoef[6][5] = {
 constexpr uint32_t kHdrRecords = 0;
 constexpr uint32_t kHdrTileX = 1;
 constexpr uint32_t kHdrTileY = 2;
+constexpr uint32_t kHdrPages = 3;   // pages of the block (in shader frames the pages are not derived from the record count)
+constexpr uint32_t kHdrCx = 4;      // shader frames: centre of the tile in window pixels, as float bits (tx * 32 + 16)
+constexpr uint32_t kHdrCy = 5;
 
 // Output planes per tile block.
 constexpr uint32_t kPlaneColor = 0;

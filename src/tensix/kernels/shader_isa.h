@@ -41,7 +41,8 @@
 
 namespace ttr::shader {
 
-constexpr uint32_t kMaxRegs = 96;          // vector registers: three Dest tiles of 32 vectors on the device
+constexpr uint32_t kMaxRegs = 61;          // vector registers: rows of the three scratch Dest tiles; the device keeps a kill flag
+                                           // and two blend coefficients above them (ckernel_sfpu_shader.h)
 constexpr uint32_t kMaxConsts = 1024;      // scalars in the constant table
 constexpr uint32_t kMaxInstructions = 1024;
 constexpr uint32_t kMaxInputs = 32;        // varying components (eight vec4)

@@ -39,10 +39,59 @@ uint32_t float_bits(float f) {
 
 void put_float(std::vector<uint32_t>& w, size_t at, float f) { w[at] = float_bits(f); }
 
-// Encode one (tile, triangle) record at word offset `at` of `w`.
+// Slots a (tile, triangle) record takes in a page: one, plus the extension slots of a shader triangle's varyings.
+uint32_t record_slots(const Frame& frame, const SetupTriangle& tri) {
+    return tri.shader != 0 ? 1 + layout::ext_slots(frame.shaders[tri.shader - 1].num_inputs) : 1;
+}
+
+// Where the records of a tile go in a shader frame: slot positions (page * kRecordsPerPage + slot, the header taking slot 0
+// of page 0), padding so that no record straddles a page. Returns the pages of the block.
+uint32_t layout_shader_block(const Frame& frame, const SetupResult& setup, const std::vector<BinEntry>& entries,
+                             std::vector<uint32_t>* position) {
+    using namespace layout;
+    uint32_t page = 0, slot = 1;
+    if (position != nullptr) position->resize(entries.size());
+    for (size_t i = 0; i < entries.size(); i++) {
+        const uint32_t n = record_slots(frame, setup.tris[entries[i].tri]);
+        if (slot + n > kRecordsPerPage) {
+            page++;
+            slot = 0;
+        }
+        if (position != nullptr) (*position)[i] = page * kRecordsPerPage + slot;
+        slot += n;
+    }
+    return page + 1;
+}
+
+// The program table of a frame (raster_layout.h): directory, then code and constants of every program.
+std::vector<uint32_t> build_program_table(const Frame& frame) {
+    using namespace layout;
+    const size_t n = frame.shaders.size();
+    std::vector<uint32_t> t(kTabDirectory + n * kTabEntryWords, 0);
+    t[0] = static_cast<uint32_t>(n);
+    for (size_t k = 0; k < n; k++) {
+        const ShaderProgram& p = frame.shaders[k];
+        const size_t dir = kTabDirectory + k * kTabEntryWords;
+        t[dir + 0] = static_cast<uint32_t>(t.size());
+        t[dir + 1] = static_cast<uint32_t>(p.code.size());
+        for (const ShaderInstr& in : p.code) {
+            for (uint32_t w : in.w) t.push_back(w);
+        }
+        t[dir + 2] = static_cast<uint32_t>(t.size());
+        for (float c : p.consts) t.push_back(float_bits(c));
+        t[dir + 3] = p.num_inputs;
+        t[dir + 4] = static_cast<uint32_t>(p.fragcoord_reg + 1);
+        t[dir + 5] = p.out_reg;
+        t[dir + 6] = p.uses_kill() ? 1u : 0u;
+    }
+    return t;
+}
+
+// Encode one (tile, triangle) record at word offset `at` of `w`. `shaded`: the frame has shader triangles, so every record
+// carries its depth and blend state in the flags and the kernel's shader path draws it.
 void encode_record(
-    std::vector<uint32_t>& w, size_t at, const SetupTriangle& tri, const TileParams& p, TileCoverage cov, int tx, int ty,
-    DepthFunc frame_depth, uint64_t* vec_counts = nullptr) {
+    std::vector<uint32_t>& w, size_t at, const Frame& frame, const SetupResult& setup, const SetupTriangle& tri,
+    const TileParams& p, TileCoverage cov, int tx, int ty, DepthFunc frame_depth, bool shaded, uint64_t* vec_counts = nullptr) {
     using namespace layout;
     for (int e = 0; e < 3; e++) {
         put_float(w, at + kEdge + 3 * e + 0, p.edge[e].a);
@@ -65,7 +114,25 @@ void encode_record(
     put_float(w, at + kId, static_cast<float>(tri.source + 1));
     w[at + kFlatPacked] = pack_rgba8(p.color_c);  // meaningful for flat triangles (gradients are zero)
     uint32_t flags = (tri.flat ? kFlagFlat : 0u) | (cov == TileCoverage::Full ? kFlagFull : 0u) | (p.perspective ? kFlagPersp : 0u);
-    if (tri.depth_func != frame_depth || !tri.depth_write || tri.blend != BlendMode::None) {
+    if (tri.shader != 0) {
+        // Varyings: the first four planes where the colour planes are, the rest in the extension slots; the rhw plane
+        // (always: gl_FragCoord.w and the perspective divisor) in its usual place.
+        const ShaderProgram& prog = frame.shaders[tri.shader - 1];
+        for (uint32_t k = 0; k < prog.num_inputs; k++) {
+            const TilePlane tp = make_tile_plane(setup.attr_planes[tri.plane_base + k], tx, ty);
+            const size_t o = k < kInputsInRecord ? at + kColor + 3 * k : at + kRecordWords + 3 * (k - kInputsInRecord);
+            put_float(w, o, tp.c);
+            put_float(w, o + 1, tp.gx);
+            put_float(w, o + 2, tp.gy);
+        }
+        const TilePlane wp = make_tile_plane(tri.inv_w, tx, ty);
+        put_float(w, at + kWPlane + 0, wp.c);
+        put_float(w, at + kWPlane + 1, wp.gx);
+        put_float(w, at + kWPlane + 2, wp.gy);
+        w[at + kProgramId] = tri.shader - 1;
+        flags |= kFlagShader | (ext_slots(prog.num_inputs) << kExtShift);
+    }
+    if (shaded || tri.depth_func != frame_depth || !tri.depth_write || tri.blend != BlendMode::None) {
         // Own depth/blend state: the kernel's general path decodes it (the common case keeps the specialized path).
         flags |= kFlagStateful | (static_cast<uint32_t>(tri.depth_func) << kDepthFuncShift) |
                  (tri.depth_write ? kFlagDepthWrite : 0u) | (static_cast<uint32_t>(tri.blend) << kBlendShift);
@@ -170,8 +237,13 @@ DeviceFrame TensixRenderer::render(
     const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
     const DeviceOptions& opt, Framebuffer* target) {
     using namespace layout;
-    if (!frame.shaders.empty()) {
-        throw std::runtime_error("fragment shaders are not supported by the Tensix renderer yet (CPU reference only)");
+    const bool shaded = !frame.shaders.empty();
+    if (shaded) {
+        const uint32_t m = effective_plane_mask(opt);
+        if (opt.float_planes || !(m & 1) || opt.cover_count) {
+            throw std::runtime_error("frames with fragment shaders need the colour plane, no float planes and no coverage count");
+        }
+        if (frame.shaders.size() > 65535) throw std::runtime_error("too many shader programs");
     }
     DeviceFrame out;
     const uint32_t pw = frame.padded_width(), ph = frame.padded_height();
@@ -205,13 +277,24 @@ DeviceFrame TensixRenderer::render(
     // Page counts are known from the bins alone, so every core's slice of the final buffer has a
     // fixed offset and the cores are encoded in parallel straight into it.
     auto t0 = Clock::now();
+    std::vector<uint32_t> table;   // shader frames: the program table goes first in the buffer, cores' pages after it
+    uint32_t table_pages = 0;
+    if (shaded) {
+        table = build_program_table(frame);
+        table_pages = static_cast<uint32_t>((table.size() + kTileWords - 1) / kTileWords);
+        if (table_pages > kMaxTablePages) {
+            throw std::runtime_error("the shader programs of the frame do not fit the program table (" + std::to_string(kMaxTablePages) + " pages)");
+        }
+    }
     std::vector<uint32_t> first_page(plan.size()), n_pages(plan.size()), first_block(plan.size());
-    uint32_t blocks_total = 0, pages_total = 0;
+    uint32_t blocks_total = 0, pages_total = table_pages;
     for (size_t c = 0; c < plan.size(); c++) {
         first_page[c] = pages_total;
         first_block[c] = blocks_total;
         for (const auto& [tx, ty] : plan[c].tiles) {
-            pages_total += pages_for_records(static_cast<uint32_t>(bins.tile(tx, ty).size()));
+            const auto& entries = bins.tile(tx, ty);
+            pages_total += shaded ? layout_shader_block(frame, setup, entries, nullptr)
+                                  : pages_for_records(static_cast<uint32_t>(entries.size()));
             out.tile_rendered[static_cast<size_t>(ty) * frame.tiles_x() + tx] = 1;
         }
         n_pages[c] = pages_total - first_page[c];
@@ -222,6 +305,7 @@ DeviceFrame TensixRenderer::render(
     // buffer is not cleared between frames.
     std::vector<uint32_t>& words = words_[opt.slot];
     words.resize(static_cast<size_t>(pages_total) * (kPageBytes / 4));
+    std::copy(table.begin(), table.end(), words.begin());
     // The specialized kernel path compares with LESS, or LESS_EQUAL when the frame says so (RASTER_LESS_EQUAL);
     // a triangle with any other depth function takes the general path.
     const DepthFunc kernel_depth = frame.depth_func == DepthFunc::LessEqual ? DepthFunc::LessEqual : DepthFunc::Less;
@@ -232,21 +316,36 @@ DeviceFrame TensixRenderer::render(
     auto encode_core = [&](size_t c) {
         CoreCounts& cc = counts[c];
         size_t base = static_cast<size_t>(first_page[c]) * (kPageBytes / 4);
+        std::vector<uint32_t> position;
         for (const auto& [tx, ty] : plan[c].tiles) {
             const auto& entries = bins.tile(static_cast<uint32_t>(tx), static_cast<uint32_t>(ty));
+            const uint32_t block_pages = shaded ? layout_shader_block(frame, setup, entries, &position)
+                                                : pages_for_records(static_cast<uint32_t>(entries.size()));
             words[base + kHdrRecords] = static_cast<uint32_t>(entries.size());
             words[base + kHdrTileX] = static_cast<uint32_t>(tx);
             words[base + kHdrTileY] = static_cast<uint32_t>(ty);
+            words[base + kHdrPages] = block_pages;
+            put_float(words, base + kHdrCx, static_cast<float>(tx * kTileSize + kTileSize / 2));
+            put_float(words, base + kHdrCy, static_cast<float>(ty * kTileSize + kTileSize / 2));
             for (size_t i = 0; i < entries.size(); i++) {
                 const SetupTriangle& tri = setup.tris[entries[i].tri];
                 const TileParams p = make_tile_params(tri, tx, ty);
                 uint64_t vc[2] = {0, 0};
-                encode_record(words, base + (i + 1) * kRecordWords, tri, p, entries[i].coverage, tx, ty, kernel_depth, vc);
+                const size_t at = shaded ? base + static_cast<size_t>(position[i]) * kRecordWords : base + (i + 1) * kRecordWords;
+                encode_record(words, at, frame, setup, tri, p, entries[i].coverage, tx, ty, kernel_depth, shaded, vc);
+                if (shaded) {
+                    // The next record starts on the next page: mark the unused tail of this one.
+                    const uint32_t slot_end = position[i] % kRecordsPerPage + record_slots(frame, tri);
+                    if (i + 1 < entries.size() && position[i + 1] / kRecordsPerPage != position[i] / kRecordsPerPage &&
+                        slot_end < kRecordsPerPage) {
+                        words[base + (position[i] - position[i] % kRecordsPerPage + slot_end) * kRecordWords + kFlags] = kPageEnd;
+                    }
+                }
                 cc.vec_partial += vc[0];
                 cc.vec_full += vc[1];
             }
             cc.records += entries.size();
-            base += static_cast<size_t>(pages_for_records(static_cast<uint32_t>(entries.size()))) * (kPageBytes / 4);
+            base += static_cast<size_t>(block_pages) * (kPageBytes / 4);
         }
     };
     parallel_for(plan.size(), opt.host_threads, [&](size_t c) { encode_core(c); });
@@ -292,6 +391,7 @@ DeviceFrame TensixRenderer::render(
             CircularBufferConfig(pages * kPageBytes, {{idx, tt::DataFormat::Float32}}).set_page_size(idx, kPageBytes));
     };
     make_cb(tt::CBIndex::c_0, 4);
+    if (shaded) make_cb(tt::CBIndex::c_1, kMaxTablePages);   // the program table; a fixed size keeps the kernels the same for every frame
     for (uint32_t bit = 0; bit < 5; bit++) {   // one output buffer per requested plane: c_16 + bit
         if (mask & (1u << bit)) {
             make_cb(static_cast<tt::CBIndex>(static_cast<uint32_t>(tt::CBIndex::c_16) + bit), 2);
@@ -304,11 +404,18 @@ DeviceFrame TensixRenderer::render(
     std::vector<uint32_t> reader_args, writer_args;
     TensorAccessorArgs(*in_buf->get_backing_buffer()).append_to(reader_args);
     TensorAccessorArgs(*out_buf->get_backing_buffer()).append_to(writer_args);
+    std::map<std::string, std::string> reader_defines;
+    if (shaded) reader_defines["RASTER_SHADERS"] = "1";
     auto reader = CreateKernel(
         program, kdir + "reader.cpp", core_set,
         DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = reader_args});
+            .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = reader_args,
+            .defines = reader_defines});
     std::map<std::string, std::string> defines = opt.defines;
+    if (shaded) {
+        defines["RASTER_SHADERS"] = "1";
+        defines["RASTER_PACKED_COLOUR"] = "1";   // colour in one Dest slot frees three tiles for shader registers
+    }
     defines["RASTER_PLANE_MASK"] = std::to_string(mask);
     if (opt.float_planes) {
         defines["RASTER_FLOAT_PLANES"] = "1";
@@ -333,7 +440,7 @@ DeviceFrame TensixRenderer::render(
 
     for (size_t c = 0; c < plan.size(); c++) {
         const CoreCoord core = plan[c].core;
-        SetRuntimeArgs(program, reader, core, {static_cast<uint32_t>(in_buf->address()), first_page[c], n_pages[c]});
+        SetRuntimeArgs(program, reader, core, {static_cast<uint32_t>(in_buf->address()), first_page[c], n_pages[c], table_pages});
         SetRuntimeArgs(
             program, writer, core,
             {static_cast<uint32_t>(out_buf->address()), first_block[c], static_cast<uint32_t>(plan[c].tiles.size())});
@@ -341,7 +448,7 @@ DeviceFrame TensixRenderer::render(
             program, compute, core,
             {static_cast<uint32_t>(plan[c].tiles.size()), float_bits(frame.clear_depth), float_bits(frame.clear_color[0]),
              float_bits(frame.clear_color[1]), float_bits(frame.clear_color[2]), float_bits(frame.clear_color[3]),
-             pack_rgba8(frame.clear_color)});
+             pack_rgba8(frame.clear_color), table_pages});
     }
     distributed::Finish(cq);  // the upload
     out.times.upload_ms = ms_since(t0);

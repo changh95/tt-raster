@@ -67,10 +67,6 @@ int main(int argc, char** argv) {
         if (which != "all" && which != info.name) continue;
         Frame frame;
         make_scene(info.name, w, h, frame);
-        if (!frame.shaders.empty()) {
-            std::printf("\n%s\n  skipped: fragment shaders are not on the device yet\n", info.name);
-            continue;
-        }
         const SetupResult setup = setup_frame(frame);
         const TileBins bins = bin_triangles(setup, frame.tiles_x(), frame.tiles_y());
         const Framebuffer ref = render_reference(frame, setup, bins);
@@ -86,7 +82,7 @@ int main(int argc, char** argv) {
             // Perspective colours (Newton-refined reciprocal) and blend chains (partially fused SFPU multiply-add) can differ
             // from the reference in the last float bit: one level is allowed for such scenes (the chips still have to agree with each other exactly).
             bool perspective = false;
-            for (const Triangle& t : frame.triangles) perspective |= (t.perspective && !t.flat) || t.blend != BlendMode::None;
+            for (const Triangle& t : frame.triangles) perspective |= (t.perspective && !t.flat) || t.blend != BlendMode::None || t.shader != 0;
             auto off_by_more = [&](uint32_t a, uint32_t b) {
                 if (a == b) return false;
                 if (!perspective) return true;
