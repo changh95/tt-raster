@@ -31,6 +31,11 @@ class TtRasterRendererCfg(RendererCfg):
     num_chips: int = 1
     """Number of chips for the ``"tensix"`` backend (frames are split into bands across them)."""
 
+    per_pixel_lighting: bool = False
+    """Light ``rgb`` per pixel with a fragment shader on interpolated normals instead of at the vertices. Against Newton's image the
+    shading of interior pixels improves from 49.4 to 50.8 dB PSNR and the whole image (dominated by silhouette pixels) not at all
+    (38.05 to 38.13 dB), while a 1,024-environment frame takes about three times as long on the device (docs/PERF.md). Off by default."""
+
     max_distance: float = 1000.0
     """Far clip [m] used when the camera spawn config carries no clipping range."""
 

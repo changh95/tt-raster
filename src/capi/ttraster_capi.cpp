@@ -34,6 +34,7 @@ struct ttr_scene {
     };
     Job jobs[ttr::kRenderSlots];
     int next_ticket = 0;
+    bool per_pixel_lighting = false;
     explicit ttr_scene(uint32_t worlds) : scene(worlds) {}
     bool in_flight() const {
         for (const Job& j : jobs) {
@@ -84,6 +85,7 @@ RenderArgs make_args(ttr_scene* s, const ttr_camera* camera, const float* camera
         std::memcpy(a.poses[w].rotation, camera_poses + 7 * w + 3, 4 * sizeof(float));
     }
     if (light_direction) std::memcpy(a.light.direction, light_direction, sizeof a.light.direction);
+    a.light.per_pixel = s->per_pixel_lighting;
     a.img.depth = out->depth;
     a.img.forward_depth = out->forward_depth;
     a.img.shape = out->shape;
@@ -175,6 +177,8 @@ int32_t ttr_add_instance(
         return -1;
     }
 }
+
+void ttr_set_lighting(ttr_scene* s, int per_pixel) { s->per_pixel_lighting = per_pixel != 0; }
 
 int ttr_set_instance_poses(ttr_scene* s, const float* poses) {
     for (size_t i = 0; i < s->scene.instances(); i++) {

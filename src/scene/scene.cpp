@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "ttraster/parallel.h"
+#include "ttraster/shader.h"
 #include "ttraster/trace.h"
 
 namespace ttr::scene {
@@ -84,6 +85,50 @@ float linear_to_srgb(float l) {
     l = std::min(1.0f, std::max(0.0f, l));
     return l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
 }
+
+namespace {
+
+// The per-pixel version of the vertex lighting below: inputs n (3, interpolated world normal) and the linear albedo (3);
+// colour = sRGB(albedo * (ambient(n.z) + max(0, n.L))), with the sRGB curve as a select between its linear segment and
+// 1.055 * l^(1/2.4) - 0.055. Constants: the light direction (towards the light).
+ShaderProgram make_lit_shader(const double L[3]) {
+    using shader::kOpAdd; using shader::kOpEx2; using shader::kOpLg2; using shader::kOpMad; using shader::kOpMax;
+    using shader::kOpMov; using shader::kOpMul; using shader::kOpRsq; using shader::kOpSel; using shader::kOpSge;
+    ShaderBuilder b(6);
+    auto K = [&](double v) { return b.constant(static_cast<float>(v)); };
+    const auto n0 = b.in(0), n1 = b.in(1), n2 = b.in(2);
+    uint32_t len2 = b.emit(kOpMul, n0, n0);
+    b.emit_to(kOpMad, len2, n1, n1, b.reg(len2));
+    b.emit_to(kOpMad, len2, n2, n2, b.reg(len2));
+    const uint32_t inv = b.emit(kOpRsq, b.reg(len2));
+    uint32_t ndl = b.emit(kOpMul, n0, K(L[0]));
+    b.emit_to(kOpMad, ndl, n1, K(L[1]), b.reg(ndl));
+    b.emit_to(kOpMad, ndl, n2, K(L[2]), b.reg(ndl));
+    b.emit_to(kOpMul, ndl, b.reg(ndl), b.reg(inv));
+    b.emit_to(kOpMax, ndl, b.reg(ndl), K(0.0));
+    const uint32_t h = b.emit(kOpMul, n2, b.reg(inv));                       // nz of the unit normal
+    b.emit_to(kOpMad, h, b.reg(h), K(0.5), K(0.5));                           // hemisphere weight
+    uint32_t amb_rg = b.emit(kOpMad, b.reg(h), K(0.15), K(0.05));           // (0.4 h + 0.1 (1 - h)) * 0.5
+    uint32_t amb_b = b.emit(kOpMad, b.reg(h), K(0.165), K(0.06));           // (0.45 h + 0.12 (1 - h)) * 0.5
+    b.emit_to(kOpAdd, amb_rg, b.reg(amb_rg), b.reg(ndl));
+    b.emit_to(kOpAdd, amb_b, b.reg(amb_b), b.reg(ndl));
+    const uint32_t out = b.alloc4();
+    for (uint32_t c = 0; c < 3; c++) {
+        const uint32_t lin = b.emit(kOpMul, b.in(3 + c), b.reg(c == 2 ? amb_b : amb_rg), {0}, true);   // clamped to [0, 1]
+        uint32_t pw = b.emit(kOpMax, b.reg(lin), K(1e-6));                    // keeps log2 finite; the linear branch wins below
+        b.emit_to(kOpLg2, pw, b.reg(pw));
+        b.emit_to(kOpMul, pw, b.reg(pw), K(1.0 / 2.4));
+        b.emit_to(kOpEx2, pw, b.reg(pw));
+        b.emit_to(kOpMad, pw, b.reg(pw), K(1.055), K(-0.055));
+        const uint32_t lo = b.emit(kOpMul, b.reg(lin), K(12.92));
+        const uint32_t use_lo = b.emit(kOpSge, K(0.0031308), b.reg(lin));
+        b.emit_to(kOpSel, out + c, b.reg(use_lo), b.reg(lo), b.reg(pw));
+    }
+    b.emit_to(kOpMov, out + 3, K(1.0));
+    return b.finish(out);
+}
+
+}  // namespace
 
 Mesh make_box(float hx, float hy, float hz) {
     Mesh m;
@@ -300,6 +345,7 @@ void Scene::render_impl(
                 const V3 nw = normalize(rotate(iq, V3{mesh.normal[3 * v], mesh.normal[3 * v + 1], mesh.normal[3 * v + 2]}));
                 cv[v].pc = rotate(cqi, pw - cpos);
                 cv[v].n[0] = static_cast<float>(nw.x); cv[v].n[1] = static_cast<float>(nw.y); cv[v].n[2] = static_cast<float>(nw.z);
+                if (light.per_pixel) continue;   // lit per pixel by a shader instead
                 // Per-vertex shading (reference: Newton Warp): albedo * (ambient + n.L), linear, then sRGB.
                 const double h = 0.5 * (nw.z + 1.0);
                 const double amb[3] = {(0.4 * h + 0.1 * (1 - h)) * 0.5, (0.4 * h + 0.1 * (1 - h)) * 0.5, (0.45 * h + 0.12 * (1 - h)) * 0.5};
@@ -313,26 +359,27 @@ void Scene::render_impl(
                 if (!all_in) poly = clip_depth(std::move(poly), near_d, far_d);
                 if (poly.size() < 3) continue;
                 // Project, then fan.
-                struct P { float x, y, z; const CV* v; };
+                struct P { float x, y, z, rhw; const CV* v; };
                 std::vector<P> pr(poly.size());
                 for (size_t k = 0; k < poly.size(); k++) {
                     const double d = -poly[k].pc.z;
                     pr[k].x = static_cast<float>(vp.x + vp.width * 0.5 + poly[k].pc.x / d * fx);
                     pr[k].y = static_cast<float>(vp.y + vp.height * 0.5 - poly[k].pc.y / d * fy);
                     pr[k].z = static_cast<float>(far_d * (d - near_d) / (d * (far_d - near_d)));
+                    pr[k].rhw = static_cast<float>(1.0 / d);
                     pr[k].v = &poly[k];
                 }
                 for (size_t k = 1; k + 1 < pr.size(); k++) {
                     const P* tri[3] = {&pr[0], &pr[k], &pr[k + 1]};
                     detail::ScreenTri st;
                     for (int c = 0; c < 3; c++) {
-                        st.x[c] = tri[c]->x; st.y[c] = tri[c]->y; st.z[c] = tri[c]->z;
+                        st.x[c] = tri[c]->x; st.y[c] = tri[c]->y; st.z[c] = tri[c]->z; st.rhw[c] = tri[c]->rhw;
                         for (int a = 0; a < 3; a++) {
                             st.lit[c][a] = tri[c]->v->lit[a];
                             st.normal[c][a] = tri[c]->v->n[a];
                         }
                     }
-                    for (int a = 0; a < 3; a++) st.albedo[a] = inst.albedo[a];
+                    for (int a = 0; a < 3; a++) { st.albedo[a] = inst.albedo[a]; st.albedo_lin[a] = alb_lin[a]; }
                     st.shape = inst.shape_id;
                     tris.push_back(st);
                 }
@@ -369,20 +416,38 @@ void Scene::render_impl(
         f.cull = base.cull;
         f.viewports = base.viewports;
         f.triangles.resize(first_tri[worlds_]);
+        // The frame is reused between passes and frames: shader state from an earlier pass must not leak into this one.
+        f.shaders.clear();
+        f.attrs.clear();
+        const bool shaded = payload == kPLit && light.per_pixel;
+        constexpr size_t kAttrsPerTriangle = 18;   // normal (3) and linear albedo (3) at each of the three vertices
+        if (shaded) {
+            const double Lv[3] = {L.x, L.y, L.z};
+            f.shaders.push_back(make_lit_shader(Lv));
+            f.attrs.resize(first_tri[worlds_] * kAttrsPerTriangle);
+        }
         parallel_for(worlds_, threads, [&](uint32_t w) {
             size_t o = first_tri[w];
             for (const detail::ScreenTri& st : per_world[w]) {
-                Triangle& t = f.triangles[o++];
+                Triangle& t = f.triangles[o];
                 t.viewport = w;
                 t.flat = payload == kPAlbedo;
+                t.perspective = shaded;
+                t.shader = shaded ? 1 : 0;
+                t.attr_offset = shaded ? static_cast<uint32_t>(o * kAttrsPerTriangle) : 0;
                 for (int c = 0; c < 3; c++) {
                     Vertex& v = t.v[c];
-                    v.x = st.x[c]; v.y = st.y[c]; v.z = st.z[c]; v.rhw = 1.0f;
+                    v.x = st.x[c]; v.y = st.y[c]; v.z = st.z[c]; v.rhw = shaded ? st.rhw[c] : 1.0f;
                     for (int a = 0; a < 3; a++) {
                         v.color[a] = payload == kPAlbedo ? st.albedo[a] : payload == kPLit ? st.lit[c][a] : st.normal[c][a];
                     }
                     v.color[3] = 1.0f;
+                    if (shaded) {
+                        float* at = &f.attrs[o * kAttrsPerTriangle + 6 * static_cast<size_t>(c)];
+                        for (int a = 0; a < 3; a++) { at[a] = st.normal[c][a]; at[3 + a] = st.albedo_lin[a]; }
+                    }
                 }
+                o++;
             }
         });
         return f;

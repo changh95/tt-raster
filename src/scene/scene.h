@@ -59,6 +59,10 @@ struct Pose {                  // camera to world
 
 struct Light {
     float direction[3] = {-0.57735027f, 0.57735027f, -0.57735027f};  // the direction light travels
+    // false: the colour is lit at the vertices and interpolated (fast, one fixed-function pass). true: the normals are
+    // interpolated perspective-correctly and lit per pixel by a fragment shader (the shader path of the rasterizer;
+    // closer to a ray tracer on coarse meshes, but much more device time).
+    bool per_pixel = false;
 };
 
 enum Output : uint32_t {
@@ -128,7 +132,9 @@ struct RenderStats {
 namespace detail {
 struct ScreenTri {
     float x[3], y[3], z[3];
-    float albedo[3];      // constant per triangle (instance)
+    float albedo[3];      // constant per triangle (instance), sRGB
+    float albedo_lin[3];  // the same, linear (per-pixel lighting)
+    float rhw[3];         // 1 / camera-space depth per vertex (per-pixel lighting)
     float lit[3][3];      // per vertex
     float normal[3][3];   // per vertex
     uint32_t shape;

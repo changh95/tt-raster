@@ -196,6 +196,7 @@ class TtRasterRenderer(BaseRenderer):
             round_segments=cfg.round_segments,
             ground_half_extent=cfg.ground_half_extent,
         )
+        self._scene.scene.set_lighting(cfg.per_pixel_lighting)
         if self._scene.skipped:
             warnings.warn(f"ttraster: {len(self._scene.skipped)} shape(s) of unsupported type are not rendered", stacklevel=2)
 

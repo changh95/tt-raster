@@ -67,6 +67,10 @@ int32_t ttr_add_instance(
 
 /* poses: num_instances x 7, in instance id order. */
 int ttr_set_instance_poses(ttr_scene* s, const float* poses);
+/* Lighting of the `rgb` output. 0 (default): lit at the vertices and interpolated, one fixed-function pass. Nonzero: normals interpolated
+ * perspective-correctly and lit per pixel by a fragment shader on the rasterizer's shader path; it follows a ray tracer more closely on
+ * coarse meshes but costs much more device time (docs/PERF.md). Applies to frames rendered or submitted afterwards. */
+void ttr_set_lighting(ttr_scene* s, int per_pixel);
 
 /* camera_poses: num_worlds x 7 (camera to world). light_direction: 3 floats (the way the light
  * travels) or NULL for Newton's default (-1, 1, -1) / sqrt(3). Returns 0 on success. */

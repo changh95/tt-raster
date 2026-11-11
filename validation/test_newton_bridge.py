@@ -166,6 +166,33 @@ def main():
     check(float(ang.mean()) < 2.0, f"normals mean angle error {ang.mean():.3f} deg < 2")
     p = psnr(out["rgb"][..., :3][both], ref_img["color"][..., :3][both])
     check(p > 36.0, f"rgb PSNR over common hits {p:.1f} dB > 36")
+    # Per-pixel lighting (a fragment shader on perspective-interpolated normals) against the same Newton image.
+    scene.scene.set_lighting(True)
+    out_pp, _ = scene.render(cam, poses, ("rgb",))
+    scene.scene.set_lighting(False)
+    p_pp = psnr(out_pp["rgb"][..., :3][both], ref_img["color"][..., :3][both])
+    check(p_pp > 36.0 and p_pp >= p - 0.1, f"per-pixel lighting: rgb PSNR {p_pp:.1f} dB against Newton (per-vertex {p:.1f} dB)")
+    print(f"   rgb PSNR over common hits: per-vertex {p:.2f} dB, per-pixel {p_pp:.2f} dB")
+    # Interior pixels (same shape id in both images, and in the neighbourhood): the PSNR over the whole image is dominated by
+    # edge pixels where the two renderers disagree about coverage, so look at the shading where they agree.
+    same = (shape == ref_img["shape"]) & hit
+    inner = same.copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            inner &= np.roll(np.roll(same, dy, axis=1), dx, axis=2)
+    pi_v = psnr(out["rgb"][..., :3][inner], ref_img["color"][..., :3][inner])
+    pi_p = psnr(out_pp["rgb"][..., :3][inner], ref_img["color"][..., :3][inner])
+    check(pi_p > pi_v and pi_p > 45.0, f"interior pixels ({int(inner.sum())}): per-pixel {pi_p:.1f} dB against per-vertex {pi_v:.1f} dB")
+    if args.backend != "reference":
+        # The device's transcendentals differ from the CPU interpreter's in the last bits: within one level.
+        host = NB.NewtonScene(model, backend="reference")
+        host.update(body_q)
+        host.scene.set_lighting(True)
+        out_host, _ = host.render(cam, poses, ("rgb",))
+        diff = np.abs(out_pp["rgb"].astype(int) - out_host["rgb"].astype(int))
+        check(int(diff.max()) <= 1 and float((diff > 0).mean()) < 0.02,
+              f"per-pixel lighting on the device against the CPU interpreter: largest difference {int(diff.max())} level, {float((diff > 0).mean()):.4f} of the values differ")
+        host.close()
     print(f"   backend: {args.backend}")
     scene.close()
     if FAILS:

@@ -75,6 +75,8 @@ def _load():
     lib.ttr_add_instance.restype = C.c_int32
     lib.ttr_add_instance.argtypes = [C.c_void_p, C.c_uint32, C.c_uint32, C.c_uint32, C.c_void_p, C.c_void_p]
     lib.ttr_set_instance_poses.argtypes = [C.c_void_p, C.c_void_p]
+    lib.ttr_set_lighting.argtypes = [C.c_void_p, C.c_int]
+    lib.ttr_set_lighting.restype = None
     lib.ttr_render.argtypes = [C.c_void_p, C.POINTER(_Camera), C.c_void_p, C.c_void_p, C.POINTER(_Images), C.POINTER(_Stats)]
     lib.ttr_submit.argtypes = [C.c_void_p, C.POINTER(_Camera), C.c_void_p, C.c_void_p, C.POINTER(_Images)]
     lib.ttr_collect.argtypes = [C.c_void_p, C.c_int, C.POINTER(_Stats)]
@@ -146,6 +148,10 @@ class Scene:
     def set_instance_poses(self, poses):
         p = _f32(poses, 7 * self.num_instances)
         _check(_l().ttr_set_instance_poses(self._h, p.ctypes.data))
+
+    def set_lighting(self, per_pixel):
+        """Light the ``rgb`` output per pixel (True: a fragment shader on interpolated normals; False: at the vertices, the default)."""
+        _l().ttr_set_lighting(self._h, 1 if per_pixel else 0)
 
     def backend_report(self):
         return _l().ttr_backend_report(self._h).decode()

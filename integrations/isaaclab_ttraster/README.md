@@ -51,7 +51,8 @@ produces internally is Newton's global shape index.
 
 HDR colour, lens distortion, ISP pipelines, textures, shadows, deforming
 geometry (`geometry_offsets`), principal point offsets. Attribute interpolation is screen-linear and lighting
-per-vertex.
+per-vertex by default; `per_pixel_lighting=True` lights per pixel on perspective-interpolated normals (about 3 times the frame time on the
+device, almost no gain in image difference to Newton: `docs/PERF.md`).
 
 ## Asynchronous rendering
 
