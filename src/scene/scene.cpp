@@ -356,6 +356,11 @@ void Scene::render(
         f.width = base.width;
         f.height = base.height;
         std::memcpy(f.clear_color, base.clear_color, sizeof f.clear_color);
+        if (payload == kPLit) {
+            for (int c = 0; c < 4; c++) f.clear_color[c] = static_cast<float>((cam.background >> (8 * c)) & 0xFFu) / 255.0f;
+        } else if (payload == kPAlbedo) {
+            f.clear_color[0] = f.clear_color[1] = f.clear_color[2] = f.clear_color[3] = 0.0f;
+        }
         f.clear_depth = base.clear_depth;
         f.depth_func = base.depth_func;
         f.cull = base.cull;

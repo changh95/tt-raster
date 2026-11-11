@@ -23,6 +23,7 @@ typedef struct {
     uint32_t width, height;
     float focal_length, horizontal_aperture, vertical_aperture;
     float near_clip, far_clip;
+    uint32_t background; /* RGBA8, R in the low byte: colour of the rgb image where nothing is hit */
 } ttr_camera;
 
 /* Output images, one per world: [world][height][width][channels]. NULL = not wanted. */

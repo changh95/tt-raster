@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=70.0,<82.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "isaaclab_ttraster"
+version = "0.1.0"
+description = "Isaac Lab tiled-camera renderer backend that rasterizes on Tenstorrent Tensix cores (tt-raster)."
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+# The renderer itself needs the ttraster Python package (python/ttraster in the tt-raster repository) and its
+# libttraster.so, plus Isaac Lab with its Newton backend; none of them is installable from PyPI.
+dependencies = [
+    "numpy",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["isaaclab_ttraster", "isaaclab_ttraster.*"]

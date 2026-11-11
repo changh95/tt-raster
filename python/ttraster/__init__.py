@@ -17,7 +17,7 @@ import numpy as np
 class _Camera(C.Structure):
     _fields_ = [("width", C.c_uint32), ("height", C.c_uint32), ("focal_length", C.c_float),
                 ("horizontal_aperture", C.c_float), ("vertical_aperture", C.c_float),
-                ("near_clip", C.c_float), ("far_clip", C.c_float)]
+                ("near_clip", C.c_float), ("far_clip", C.c_float), ("background", C.c_uint32)]
 
 
 class _Images(C.Structure):
@@ -40,6 +40,7 @@ class Camera:
     vertical_aperture: float = 20.955
     near_clip: float = 0.1
     far_clip: float = 20.0
+    background: int = 0xFF000000  # RGBA8, R in the low byte: colour of the rgb image where nothing is hit
 
 
 _CHANNELS = {"depth": (np.float32, 1), "forward_depth": (np.float32, 1), "shape": (np.uint32, 1),
@@ -166,7 +167,7 @@ class Scene:
                 out[name] = np.zeros(shape, dtype=dt)
             setattr(ptrs, name, out[name].ctypes.data)
         cam = _Camera(camera.width, camera.height, camera.focal_length, camera.horizontal_aperture,
-                      camera.vertical_aperture, camera.near_clip, camera.far_clip)
+                      camera.vertical_aperture, camera.near_clip, camera.far_clip, camera.background)
         poses = _f32(camera_poses, 7 * W)
         light = None if light_direction is None else _f32(light_direction, 3)
         st = _Stats()

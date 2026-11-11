@@ -53,6 +53,23 @@ int main() {
         CHECK(std::fabs(normal[3 * c + 0] + 1.0f) < 1e-4f && std::fabs(normal[3 * c + 1]) < 1e-4f);  // faces the camera: -x
         CHECK(albedo[4 * c] == 255 && albedo[4 * c + 1] == 0 && albedo[4 * c + 3] == 255);
         CHECK(shape[0] == 0xFFFFFFFFu && depth[0] == 0.0f && fdepth[0] == 0.0f);                    // corner: background
+        // Misses: the shaded image holds the camera's background colour (default opaque black), the albedo
+        // image is transparent black, as in Newton.
+        CHECK(rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 0 && rgb[3] == 255);
+        CHECK(albedo[0] == 0 && albedo[1] == 0 && albedo[2] == 0 && albedo[3] == 0);
+        {
+            Camera grey = cam;
+            grey.background = 0xFFEEEEEEu;  // Isaac Lab's default clear colour
+            Camera odd = cam;
+            odd.background = 0x80FF7F01u;   // A, B, G, R = 0x80, 0xFF, 0x7F, 0x01: exercises every byte
+            ReferenceBackend be2;
+            s.render(grey, {forward_pose()}, Light{}, out, be2);
+            CHECK(rgb[0] == 0xEE && rgb[1] == 0xEE && rgb[2] == 0xEE && rgb[3] == 0xFF);
+            CHECK(rgb[4 * c] > 0 && rgb[4 * c + 1] == 0);  // pixels that are hit do not take the background
+            s.render(odd, {forward_pose()}, Light{}, out, be2);
+            CHECK_MSG(rgb[0] == 0x01 && rgb[1] == 0x7F && rgb[2] == 0xFF && rgb[3] == 0x80, "%02x %02x %02x %02x", rgb[0], rgb[1], rgb[2], rgb[3]);
+            s.render(cam, {forward_pose()}, Light{}, out, be2);
+        }
         // The ray distance equals the axis distance at the centre and exceeds it away from it.
         CHECK(std::fabs(depth[c] - fdepth[c]) < 2e-3f);
         const size_t edge = 32 * 64 + 36;  // 4 pixels to the right of centre, still on the box face (it spans about 5.8 px each way)

@@ -123,6 +123,7 @@ int ttr_render(
         cam.vertical_aperture = camera->vertical_aperture;
         cam.near_clip = camera->near_clip;
         cam.far_clip = camera->far_clip;
+        cam.background = camera->background;
         std::vector<ttr::scene::Pose> poses(s->scene.worlds());
         for (size_t w = 0; w < poses.size(); w++) {
             std::memcpy(poses[w].position, camera_poses + 7 * w, 3 * sizeof(float));

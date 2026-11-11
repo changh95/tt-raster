@@ -47,6 +47,9 @@ struct Camera {
     float horizontal_aperture = 20.955f;
     float vertical_aperture = 20.955f;
     float near_clip = 0.1f, far_clip = 20.0f;
+    // Colour of the pixels where nothing is hit in the shaded image, RGBA8 with R in the low byte (Newton's
+    // clear colour). The albedo image is cleared to transparent black, as Newton clears its albedo.
+    uint32_t background = 0xFF000000u;
 };
 
 struct Pose {                  // camera to world
