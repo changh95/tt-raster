@@ -18,7 +18,7 @@ scripts/build.sh                                  # host library, tools, tests
 scripts/test.sh                                   # all host tests, about 10 s
 TT_METAL_HOME=/path/to/tt-metal scripts/build.sh  # also the device spikes
 scripts/run.sh 0 build/spikes/a_lane_map/spike_a  # run a device program on node 0 only
-scripts/test_device.sh                            # Phase 2 acceptance: crops, full frame, 1/2/4/8 chips
+scripts/test_device.sh                            # on a chip: scenes against the reference, 1/2/4/8 chips, shader instruction accuracy, random shader programs
 ```
 
 The host part needs a C++20 compiler, CMake, Ninja and zlib.
@@ -69,7 +69,7 @@ Mesa's softpipe driver, patched (`mesa/`), hands the rasterization of whole fram
 
 ```
 scripts/build_mesa.sh && scripts/run_gl.sh 5 glxgears -geometry 1920x1080
-scripts/test_gl.sh      # image comparisons: stock softpipe, the fast path on the CPU backend, on a chip
+scripts/test_gl.sh      # image comparisons against stock softpipe, also random GLSL shaders and random GL frames (CPU backend, and a chip)
 ```
 
 ![glxgears recorded side by side: stock softpipe on the CPU and the Tensix fast path on a Blackhole chip (800 x 800 window)](docs/images/glxgears_stock_vs_tensix.gif)
