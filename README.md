@@ -68,6 +68,10 @@ scripts/build_mesa.sh && scripts/run_gl.sh 5 glxgears -geometry 1920x1080
 scripts/test_gl.sh      # image comparisons: stock softpipe, the fast path on the CPU backend, on a chip
 ```
 
+![glxgears recorded side by side: stock softpipe on the CPU and the Tensix fast path on a Blackhole chip (800 x 800 window)](docs/images/glxgears_stock_vs_tensix.gif)
+
+(`mesa/tests/record_gears.py` records it; the FPS in the labels are glxgears' own, measured while both ran.)
+
 ![glxgears: stock softpipe and the Tensix fast path](docs/images/gl_gears_softpipe_vs_tensix.png)
 
 ![a test scene: softpipe, Tensix, and the difference x16](docs/images/gl_scene_softpipe_vs_tensix.png)

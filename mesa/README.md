@@ -72,7 +72,7 @@ Speed (glxgears, Xvfb, one x8 chip, stock softpipe is single-threaded on this ho
 310 FPS on Tensix (a frame costs about 2 ms of fixed chip latency), 1024 x 1024 79 and 173 FPS, 1920 x 1080 31 and 126 FPS
 (`docs/PERF.md`).
 
-![glxgears, stock softpipe and Tensix](../docs/images/gl_gears_softpipe_vs_tensix.png)
+![glxgears, stock softpipe and Tensix, recorded side by side](../docs/images/glxgears_stock_vs_tensix.gif)
 
 ## Limits and what comes next
 
