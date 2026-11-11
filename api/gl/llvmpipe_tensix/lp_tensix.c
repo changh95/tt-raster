@@ -108,6 +108,9 @@ struct lp_tensix {
    struct pipe_resource *cbuf, *zbuf;       /* the surfaces the open frame writes */
    unsigned clevel, zlevel, cfirst, zfirst;
    enum pipe_format cformat, zformat;
+   bool loaded;             /* the frame was opened on the surfaces' uniform content (a load, not a clear) */
+   bool load_blocked;       /* a load was wasted (the draw was refused): no more until llvmpipe flushes */
+   unsigned load_attempts;  /* loads tried since llvmpipe last flushed */
 
    /* Translated fragment shaders, by llvmpipe's shader number (and a hash of the tokens). */
    struct {
@@ -140,7 +143,7 @@ struct lp_tensix {
    ttr_vertex *verts;
    size_t nverts, cap;
 
-   unsigned frames, draws_fast, draws_slow, fallbacks;
+   unsigned frames, draws_fast, draws_slow, fallbacks, clears_seen, clears_not_taken, tris_outside, loads, loads_not_uniform;
    bool logged_unsupported;
 };
 
@@ -181,11 +184,18 @@ load_api(struct lp_tensix *t, const char *path)
    return true;
 }
 
+bool
+lp_tensix_enabled(void)
+{
+   const char *mode = getenv("TTR_LP");
+   return mode && *mode && strcmp(mode, "0") != 0;
+}
+
 struct lp_tensix *
 lp_tensix_create(struct lp_setup_context *setup)
 {
    const char *mode = getenv("TTR_LP");
-   if (!mode || !*mode || !strcmp(mode, "0"))
+   if (!lp_tensix_enabled())
       return NULL;
    const char *lib = getenv("TTRASTER_LIB");
    struct lp_tensix *t = CALLOC_STRUCT(lp_tensix);
@@ -217,8 +227,9 @@ lp_tensix_destroy(struct lp_tensix *t)
    if (!t)
       return;
    if (t->debug)
-      fprintf(stderr, "tensix: %u frames offloaded, %u draws accepted, %u draws refused, %u mid-frame fallbacks\n", t->frames, t->draws_fast,
-              t->draws_slow, t->fallbacks);
+      fprintf(stderr, "tensix: %u frames offloaded, %u draws accepted, %u draws refused, %u mid-frame fallbacks; %u clears seen, %u not taken; %u frames opened on loaded content (%u surfaces not uniform); %u triangles outside a frame\n",
+              t->frames, t->draws_fast, t->draws_slow, t->fallbacks, t->clears_seen, t->clears_not_taken, t->loads, t->loads_not_uniform,
+              t->tris_outside);
    t->api.context_destroy(t->ctx);
    FREE(t->verts);
    FREE(t->attrs);
@@ -284,17 +295,17 @@ framebuffer_ok(const struct llvmpipe_context *lp)
    const struct pipe_framebuffer_state *fb = &lp->framebuffer;
    unsigned rs;
    bool ha;
-   if (fb->nr_cbufs != 1 || !fb->cbufs[0].texture || !fb->zsbuf.texture)
-      return false;
+   if (fb->nr_cbufs != 1 || !fb->cbufs[0].texture)
+      return false;   /* (a framebuffer without a depth buffer is fine: no depth test, no depth output) */
    if (fb->width == 0 || fb->height == 0 || fb->width > 2048 || fb->height > 2048)
       return false;
-   if (fb->cbufs[0].first_layer != fb->cbufs[0].last_layer || fb->zsbuf.first_layer != fb->zsbuf.last_layer)
+   if (fb->cbufs[0].first_layer != fb->cbufs[0].last_layer || (fb->zsbuf.texture && fb->zsbuf.first_layer != fb->zsbuf.last_layer))
       return false;
-   if (fb->cbufs[0].texture->nr_samples > 1 || fb->zsbuf.texture->nr_samples > 1 || fb->cbufs[0].nr_samples > 1)
+   if (fb->cbufs[0].texture->nr_samples > 1 || (fb->zsbuf.texture && fb->zsbuf.texture->nr_samples > 1) || fb->cbufs[0].nr_samples > 1)
       return false;
    if (fb->cbufs[0].texture->width0 != fb->width || fb->cbufs[0].texture->height0 != fb->height)
       return false;   /* a render area smaller than the image: not worth the care */
-   return color_format_ok(fb->cbufs[0].format, &rs, &ha) && depth_format_ok(fb->zsbuf.format);
+   return color_format_ok(fb->cbufs[0].format, &rs, &ha) && (!fb->zsbuf.texture || depth_format_ok(fb->zsbuf.format));
 }
 
 /* The fragment shader must be `MOV OUT[0], IN[k]` and nothing else. Returns the fragment input index k, or -1. */
@@ -406,8 +417,8 @@ state_refused(struct lp_tensix *t)
       return "polygon smoothing, multisample or rasterizer discard";
    if (r->light_twoside)
       return "two-sided colour";
-   if (r->offset_tri)
-      return "polygon offset";
+   if (r->offset_tri && (r->offset_units != 0.0f || r->offset_scale != 0.0f))
+      return "polygon offset";   /* (Vulkan applications enable depth bias with zero factors: nothing is added) */
    if (!r->half_pixel_center)
       return "pixel centres at integer coordinates";
    if (!r->depth_clip_near || !r->depth_clip_far)
@@ -436,6 +447,8 @@ state_refused(struct lp_tensix *t)
       default: return "depth function";
       }
    }
+   if (!lp->framebuffer.zsbuf.texture)
+      st.depth_func = TTR_DEPTH_ALWAYS, st.depth_write = 0;   /* nothing to test against or write */
    const struct pipe_rt_blend_state *rt = &b->rt[0];
    if (rt->blend_enable) {
       if (rt->rgb_func != PIPE_BLEND_ADD || rt->alpha_func != PIPE_BLEND_ADD || rt->rgb_src_factor != rt->alpha_src_factor ||
@@ -572,6 +585,8 @@ apply_clear(struct lp_tensix *t)
    if (t->state != FRAME_CLEARED)
       return;
    t->state = FRAME_NONE;
+   if (t->loaded)
+      return;   /* the surfaces already hold this content */
    union pipe_color_union c;
    for (int i = 0; i < 4; i++)
       c.f[i] = t->clear_color[i];
@@ -596,18 +611,18 @@ flush_frame(struct lp_tensix *t)
       submit_batch(t);
    unsigned rs;
    bool has_alpha;
-   const int dfmt = depth_target_format(t->zformat);
-   if (!color_format_ok(t->cformat, &rs, &has_alpha) || dfmt < 0) {
+   const int dfmt = t->zbuf ? depth_target_format(t->zformat) : -1;
+   if (!color_format_ok(t->cformat, &rs, &has_alpha) || (t->zbuf && dfmt < 0)) {
       fprintf(stderr, "tensix: the surface format is not supported; frame dropped\n");
       return;
    }
    wait_rasterizer(t);
    uint8_t *dst = llvmpipe_resource_map(t->cbuf, t->clevel, t->cfirst, LP_TEX_USAGE_WRITE_ALL);
-   uint8_t *zdst = llvmpipe_resource_map(t->zbuf, t->zlevel, t->zfirst, LP_TEX_USAGE_READ_WRITE);
-   if (dst && zdst) {
+   uint8_t *zdst = t->zbuf ? llvmpipe_resource_map(t->zbuf, t->zlevel, t->zfirst, LP_TEX_USAGE_READ_WRITE) : NULL;
+   if (dst && (zdst || !t->zbuf)) {
       const uint32_t flags = (rs != 0 ? TTR_OUT_SWAP_RB : 0) | (has_alpha ? 0 : TTR_OUT_OPAQUE);
-      const ttr_depth_target zt = {zdst, llvmpipe_resource_stride(t->zbuf, t->zlevel), dfmt};
-      if (t->api.frame_end_depth(t->ctx, dst, llvmpipe_resource_stride(t->cbuf, t->clevel), flags, &zt, 0) != 0)
+      const ttr_depth_target zt = {zdst, t->zbuf ? llvmpipe_resource_stride(t->zbuf, t->zlevel) : 0, dfmt};
+      if (t->api.frame_end_depth(t->ctx, dst, llvmpipe_resource_stride(t->cbuf, t->clevel), flags, zdst ? &zt : NULL, 0) != 0)
          fprintf(stderr, "tensix: frame failed: %s\n", t->api.last_error());
       else {
          t->frames++;
@@ -622,29 +637,18 @@ flush_frame(struct lp_tensix *t)
 
 /* ---- the hooks ----------------------------------------------------------------------------------------------- */
 
-unsigned
-lp_tensix_clear(struct lp_tensix *t, const union pipe_color_union *color, double depth, unsigned stencil, unsigned flags)
+/* The frame the next triangles go to starts with this content (`loaded`: the surfaces already hold it; otherwise a clear is pending). */
+static void
+begin_frame_state(struct lp_tensix *t, const float color[4], float depth, bool loaded)
 {
-   (void)stencil;
-   if (!t || t->busy)
-      return flags;
    struct llvmpipe_context *lp = t->lp;
-   const unsigned both = PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH;
-   const bool full = (flags & both) == both && !(flags & PIPE_CLEAR_STENCIL) && !(flags & ~(both | PIPE_CLEAR_STENCIL));
-   if (!full || !framebuffer_ok(lp)) {
-      DBG(t, "clear not taken (flags 0x%x%s)", flags, full ? ", framebuffer not supported" : "");
-      lp_tensix_flush(t);
-      return flags;
-   }
-   DBG(t, "clear taken: %ux%u, colour format %d, depth format %d", lp->framebuffer.width, lp->framebuffer.height,
-       (int)lp->framebuffer.cbufs[0].format, (int)lp->framebuffer.zsbuf.format);
-   /* Everything drawn before this clear is overwritten by it: an open frame is dropped, not rendered. */
    t->state = FRAME_CLEARED;
+   t->loaded = loaded;
    t->batch_open = false;
    t->nverts = 0;
    for (int i = 0; i < 4; i++)
-      t->clear_color[i] = color->f[i];
-   t->clear_depth = (float)depth;
+      t->clear_color[i] = color[i];
+   t->clear_depth = depth;
    t->width = lp->framebuffer.width;
    t->height = lp->framebuffer.height;
    t->cbuf = lp->framebuffer.cbufs[0].texture;
@@ -655,7 +659,165 @@ lp_tensix_clear(struct lp_tensix *t, const union pipe_color_union *color, double
    t->zlevel = lp->framebuffer.zsbuf.level;
    t->cfirst = lp->framebuffer.cbufs[0].first_layer;
    t->zfirst = lp->framebuffer.zsbuf.first_layer;
+}
+
+unsigned
+lp_tensix_clear(struct lp_tensix *t, const union pipe_color_union *color, double depth, unsigned stencil, unsigned flags)
+{
+   (void)stencil;
+   if (!t || t->busy)
+      return flags;
+   t->clears_seen++;
+   t->load_blocked = false;
+   t->load_attempts = 0;
+   struct llvmpipe_context *lp = t->lp;
+   const unsigned both = PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH;
+   const bool has_depth = lp->framebuffer.zsbuf.texture != NULL;
+   /* A clear of the colour buffer and, if there is a depth buffer, of the depth buffer (its stencil bits are not touched). */
+   const bool full = (flags & PIPE_CLEAR_COLOR0) && (!has_depth || (flags & PIPE_CLEAR_DEPTH)) && !(flags & PIPE_CLEAR_STENCIL) &&
+                     !(flags & ~(both | PIPE_CLEAR_STENCIL));
+   if (!full || !framebuffer_ok(lp)) {
+      t->clears_not_taken++;
+      DBG(t, "clear not taken (flags 0x%x%s; framebuffer %ux%u, %u colour buffers, depth buffer %s)", flags, full ? ", framebuffer not supported" : "",
+          lp->framebuffer.width, lp->framebuffer.height, lp->framebuffer.nr_cbufs, lp->framebuffer.zsbuf.texture ? "yes" : "no");
+      lp_tensix_flush(t);
+      return flags;
+   }
+   DBG(t, "clear taken: %ux%u, colour format %d, depth format %d", lp->framebuffer.width, lp->framebuffer.height,
+       (int)lp->framebuffer.cbufs[0].format, (int)lp->framebuffer.zsbuf.format);
+   /* Everything drawn before this clear is overwritten by it: an open frame is dropped, not rendered. */
+   begin_frame_state(t, color->f, has_depth ? (float)depth : 1.0f, false);
    return 0;
+}
+
+/* ---- frames that start from what the surfaces hold ----------------------------------------------------------- */
+
+/* True if every pixel's `(word & mask)` is the same (`bytes` is 2 or 4); *value is that word. */
+static bool
+uniform_surface(const uint8_t *base, size_t stride, unsigned width, unsigned height, unsigned bytes, uint32_t mask, uint32_t *value)
+{
+   uint32_t first = 0;
+   for (unsigned y = 0; y < height; y++) {
+      const uint8_t *row = base + (size_t)y * stride;
+      for (unsigned x = 0; x < width; x++) {
+         uint32_t w;
+         if (bytes == 4)
+            memcpy(&w, row + (size_t)x * 4, 4);
+         else {
+            uint16_t h;
+            memcpy(&h, row + (size_t)x * 2, 2);
+            w = h;
+         }
+         w &= mask;
+         if (x == 0 && y == 0)
+            first = w;
+         else if (w != first)
+            return false;
+      }
+   }
+   *value = first;
+   return true;
+}
+
+/* The depth (0..1) a surface word of this format means, if converting it back at the end of the frame gives the same word (so that
+ * pixels no triangle touches keep their value exactly). */
+static bool
+depth_from_word(int dfmt, uint32_t w, float *z)
+{
+   double max;
+   uint32_t v;
+   switch (dfmt) {
+   case TTR_DEPTH_F32: {
+      float f;
+      memcpy(&f, &w, 4);
+      if (!(f >= 0.0f && f <= 1.0f))
+         return false;
+      *z = f;
+      return true;
+   }
+   case TTR_DEPTH_U32: v = w, max = 4294967295.0; break;
+   case TTR_DEPTH_U16: v = w & 0xffffu, max = 65535.0; break;
+   case TTR_DEPTH_U24_LOW:
+   case TTR_DEPTH_U24_LOW_X: v = w & 0xffffffu, max = 16777215.0; break;
+   case TTR_DEPTH_U24_HIGH:
+   case TTR_DEPTH_U24_HIGH_X: v = w >> 8, max = 16777215.0; break;
+   default: return false;
+   }
+   const float f = (float)((double)v / max);
+   *z = f;
+   return (uint32_t)((double)f * max + 0.5) == v;
+}
+
+/* The draw about to be set up goes to a frame of its own that starts from what the colour (and depth) surfaces hold, if that is one value
+ * everywhere (what a clear leaves; an image clear of Vulkan with loadOp LOAD afterwards does not pass through lp_setup_clear). llvmpipe's
+ * own pending work on the surfaces is finished first. */
+static void
+open_loaded_frame(struct lp_tensix *t)
+{
+   struct llvmpipe_context *lp = t->lp;
+   if (t->load_blocked || t->load_attempts >= 4)
+      return;
+   t->why = state_refused(t);
+   t->state_ok = t->why == NULL;
+   if (!t->state_ok) {
+      DBG(t, "no frame opened: %s", t->why);
+      return;
+   }
+   unsigned rs;
+   bool has_alpha;
+   const struct pipe_framebuffer_state *fb = &lp->framebuffer;
+   if (!color_format_ok(fb->cbufs[0].format, &rs, &has_alpha))
+      return;
+   const int dfmt = fb->zsbuf.texture ? depth_target_format(fb->zsbuf.format) : -1;
+   if (fb->zsbuf.texture && dfmt < 0)
+      return;
+   t->load_attempts++;
+
+   const bool was_busy = t->busy;
+   t->busy = true;   /* llvmpipe calls back into our flush */
+   lp_setup_flush(t->setup, "tensix load");
+   wait_rasterizer(t);
+   t->busy = was_busy;
+
+   bool ok = false;
+   float color[4] = {0, 0, 0, 1}, depth = 1.0f;
+   const uint8_t *c = llvmpipe_resource_map(fb->cbufs[0].texture, fb->cbufs[0].level, fb->cbufs[0].first_layer, LP_TEX_USAGE_READ);
+   if (c) {
+      uint32_t w;
+      if (uniform_surface(c, llvmpipe_resource_stride(fb->cbufs[0].texture, fb->cbufs[0].level), fb->width, fb->height, 4,
+                          has_alpha ? 0xffffffffu : 0x00ffffffu, &w)) {
+         const uint32_t b[4] = {w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, (w >> 24) & 0xff};
+         color[0] = (float)b[rs == 0 ? 0 : 2] / 255.0f;
+         color[1] = (float)b[1] / 255.0f;
+         color[2] = (float)b[rs == 0 ? 2 : 0] / 255.0f;
+         color[3] = has_alpha ? (float)b[3] / 255.0f : 1.0f;
+         ok = true;
+      }
+      llvmpipe_resource_unmap(fb->cbufs[0].texture, fb->cbufs[0].level, fb->cbufs[0].first_layer);
+   }
+   if (ok && fb->zsbuf.texture) {
+      ok = false;
+      const uint8_t *z = llvmpipe_resource_map(fb->zsbuf.texture, fb->zsbuf.level, fb->zsbuf.first_layer, LP_TEX_USAGE_READ);
+      if (z) {
+         const unsigned bytes = dfmt == TTR_DEPTH_U16 ? 2 : 4;
+         const uint32_t mask = dfmt == TTR_DEPTH_U16 ? 0xffffu
+                               : dfmt == TTR_DEPTH_U24_LOW || dfmt == TTR_DEPTH_U24_LOW_X ? 0x00ffffffu
+                               : dfmt == TTR_DEPTH_U24_HIGH || dfmt == TTR_DEPTH_U24_HIGH_X ? 0xffffff00u
+                                                                                            : 0xffffffffu;
+         uint32_t w;
+         ok = uniform_surface(z, llvmpipe_resource_stride(fb->zsbuf.texture, fb->zsbuf.level), fb->width, fb->height, bytes, mask, &w) &&
+              depth_from_word(dfmt, w, &depth);
+         llvmpipe_resource_unmap(fb->zsbuf.texture, fb->zsbuf.level, fb->zsbuf.first_layer);
+      }
+   }
+   if (!ok) {
+      t->loads_not_uniform++;
+      DBG(t, "surfaces are not one value everywhere: llvmpipe draws");
+      return;
+   }
+   DBG(t, "frame opened on loaded content: colour %g %g %g %g, depth %g", color[0], color[1], color[2], color[3], depth);
+   begin_frame_state(t, color, depth, true);
+   t->loads++;
 }
 
 static void refuse(struct lp_tensix *t, const char *why);
@@ -675,13 +837,18 @@ lp_tensix_set_prim(struct lp_tensix *t, enum mesa_prim prim)
 void
 lp_tensix_update(struct lp_tensix *t)
 {
-   if (!t || t->busy || t->state == FRAME_NONE)
+   if (!t || t->busy)
       return;
+   if (t->state == FRAME_NONE) {
+      open_loaded_frame(t);
+      return;
+   }
    /* A new draw (or the next chunk of vertices of one): the batch of the previous one goes to the frame with the state it was drawn with. */
    if (t->batch_open)
       submit_batch(t);
    t->why = state_refused(t);
    t->state_ok = t->why == NULL;
+   DBG(t, "update: %s", t->why ? t->why : "draw acceptable");
 }
 
 /* The draw cannot be offloaded: what the frame holds so far goes into the surfaces first, llvmpipe draws the rest. */
@@ -694,6 +861,8 @@ refuse(struct lp_tensix *t, const char *why)
    }
    if (t->state == FRAME_OPEN)
       t->fallbacks++;
+   else if (t->state == FRAME_CLEARED && t->loaded)
+      t->load_blocked = true;   /* the load was for nothing: not again until llvmpipe flushes */
    flush_frame(t);   /* renders an open frame, or does the clear that nothing was drawn into */
    t->state = FRAME_NONE;
    t->draws_slow++;
@@ -735,8 +904,12 @@ register_shader(struct lp_tensix *t)
 bool
 lp_tensix_tri(struct lp_tensix *t, const float (*v0)[4], const float (*v1)[4], const float (*v2)[4])
 {
-   if (!t || t->busy || t->state == FRAME_NONE)
+   if (!t || t->busy)
       return false;
+   if (t->state == FRAME_NONE) {
+      t->tris_outside++;
+      return false;
+   }
    if (t->debug && !t->batch_open)
       DBG(t, "triangle: prim_ok %d state_ok %d (%s)", t->prim_ok, t->state_ok, t->why ? t->why : "ok");
    if (!t->prim_ok || !t->state_ok) {
@@ -812,6 +985,8 @@ lp_tensix_flush(struct lp_tensix *t)
 {
    if (!t || t->busy)
       return;
+   t->load_blocked = false;
+   t->load_attempts = 0;
    if (t->state != FRAME_NONE)
       DBG(t, "flush with the frame %s", t->state == FRAME_CLEARED ? "only cleared" : "open");
    t->busy = true;
@@ -822,8 +997,13 @@ lp_tensix_flush(struct lp_tensix *t)
 void
 lp_tensix_bind_framebuffer(struct lp_tensix *t, const struct pipe_framebuffer_state *fb)
 {
-   if (!t || t->busy || t->state == FRAME_NONE)
+   if (!t || t->busy)
       return;
+   if (t->state == FRAME_NONE) {
+      t->load_blocked = false;
+      t->load_attempts = 0;
+      return;
+   }
    if (fb->nr_cbufs == 1 && fb->cbufs[0].texture == t->cbuf && fb->zsbuf.texture == t->zbuf && fb->width == t->width &&
        fb->height == t->height && fb->cbufs[0].format == t->cformat && fb->zsbuf.format == t->zformat && fb->cbufs[0].level == t->clevel &&
        fb->zsbuf.level == t->zlevel && fb->cbufs[0].first_layer == t->cfirst && fb->zsbuf.first_layer == t->zfirst)

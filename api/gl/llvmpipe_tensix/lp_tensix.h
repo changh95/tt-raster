@@ -19,6 +19,10 @@
 struct lp_setup_context;
 struct lp_tensix;
 
+/** True if the offload is switched on (TTR_LP set and not "0"): llvmpipe's linear rasterizer, which sets up rectangles and takes
+ *  unclipped vertices without passing them through the triangle hook, is then not used. */
+bool lp_tensix_enabled(void);
+
 /** NULL when the offload is disabled (environment variable TTR_LP unset) or libttraster cannot be loaded. */
 struct lp_tensix *lp_tensix_create(struct lp_setup_context *setup);
 void lp_tensix_destroy(struct lp_tensix *t);
