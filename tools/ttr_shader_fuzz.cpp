@@ -6,7 +6,7 @@
 //
 // Each iteration builds one frame of random triangles (large, small, slivers, partly off screen, perspective and linear
 // varyings, random depth so that triangles overlap, optional own depth and blend state, a few fixed-function triangles
-// mixed in) that use up to a few dozen random shader programs, renders it on the device and with the CPU reference and
+// mixed in; on some frames viewports that clip every triangle against a rectangle, and face culling) that use up to a few dozen random shader programs, renders it on the device and with the CPU reference and
 // compares colour, depth and triangle id of every pixel.
 //
 // Two modes, because the device evaluates the interpolated planes with a multiply-add that is not exactly fused (an input can
@@ -25,7 +25,7 @@
 //                      by one level (counted), never more.
 // Programs that produce a NaN, an infinity or a subnormal on sampled inputs are discarded, because there the device may
 // legitimately differ (shader.h, run_shader). Pixels whose depth test is ambiguous in the reference (docs/FINDINGS.md, V10)
-// are skipped; depth must agree within 4 ulp or 2e-6 (the same multiply-add). Blending uses multiply-adds that are not exactly fused,
+// are skipped; depth must agree within 4 ulp or 2e-6 plus a quarter of the rounding of a term of 16 pixels times the plane's gradient (the same multiply-add). Blending uses multiply-adds that are not exactly fused,
 // so with --blend one level of difference in a channel is accepted (and counted) in both modes.
 //
 // Exit code 0 only if every pixel of every frame agrees. A failure prints the seed: --seed S --iters 1 repeats it.
@@ -307,6 +307,18 @@ int main(int argc, char** argv) {
         f.clear_color[2] = static_cast<float>(rng.uniform());
         f.clear_color[3] = 1.0f;
         f.depth_func = DepthFunc::Less;
+        if (rng.chance(0.2)) f.cull = rng.chance(0.5) ? CullMode::Positive : CullMode::Negative;
+        if (rng.chance(0.3)) {   // viewports: every triangle is confined to (clipped against) one rectangle
+            const uint32_t n = 2 + rng.below(5);
+            for (uint32_t k = 0; k < n; k++) {
+                Viewport vp;
+                vp.x = static_cast<int32_t>(rng.below(f.width - 8));
+                vp.y = static_cast<int32_t>(rng.below(f.height - 8));
+                vp.width = static_cast<int32_t>(8 + rng.below(f.width - vp.x - 7));
+                vp.height = static_cast<int32_t>(8 + rng.below(f.height - vp.y - 7));
+                f.viewports.push_back(vp);
+            }
+        }
 
         // Programs, up to the size of the program table (16 pages of 1024 words, the directory and one more page of margin).
         const uint32_t want = 1 + rng.below(rng.chance(0.2) ? 40 : 12);
@@ -371,6 +383,7 @@ int main(int argc, char** argv) {
                 tri.depth_write = rng.chance(0.7);
                 tri.blend = blend && rng.chance(0.6) ? static_cast<BlendMode>(1 + rng.below(5)) : BlendMode::None;
             }
+            if (!f.viewports.empty()) tri.viewport = rng.below(static_cast<uint32_t>(f.viewports.size()));
             f.triangles.push_back(tri);
         }
 
@@ -382,6 +395,10 @@ int main(int argc, char** argv) {
         opt.debug_planes = true;
         const DeviceFrame dev = renderer.render(f, setup, bins, plan, opt);
 
+        // The depth plane is evaluated relative to the tile centre with a multiply-add that is not exactly fused: the error is about an
+        // ulp of the largest term, 16 pixels times the gradient, so a steep sliver (gradient 10 per pixel) is allowed more than 2e-6.
+        std::vector<double> steepness(f.triangles.size(), 0.0);
+        for (const SetupTriangle& st : setup.tris) steepness[st.source] = std::max(steepness[st.source], std::fabs(st.depth.gx) + std::fabs(st.depth.gy));
         Stats s;
         uint32_t first_bad_x = 0, first_bad_y = 0;
         bool have_bad = false;
@@ -410,10 +427,19 @@ int main(int argc, char** argv) {
                     std::memcpy(&da, &cpu.depth[i], 4);
                     std::memcpy(&db, &dev.fb.depth[i], 4);
                     // The plane is evaluated with a multiply-add that is not exactly fused: an error of an ulp of the largest term
-                    // (about 1.2e-7 for depth in [0, 1], several times that on the steep planes of slivers), which is many ulps of a depth close to 0. Accept 4 ulp or 2e-6 (the largest seen over 40 million pixels: 1e-6).
+                    // (about 1.2e-7 for depth in [0, 1], several times that on the steep planes of slivers), which is many ulps of a depth close to 0. Accept 4 ulp or 2e-6 plus a share of the rounding of a term that large (the largest difference seen: 3.6e-6 on a plane with a gradient of 11 per pixel).
                     const bool close_ulp = (da > db ? da - db : db - da) <= 4;
                     s.max_depth_err = std::max(s.max_depth_err, std::fabs(cpu.depth[i] - dev.fb.depth[i]));
-                    if (!close_ulp && std::fabs(cpu.depth[i] - dev.fb.depth[i]) > 2e-6f) s.depth_bad++;
+                    const double tolerance = 2e-6 + 0.25 * 1.19e-7 * 16.0 * steepness[dev.fb.id[i] - 1];
+                    if (!close_ulp && std::fabs(cpu.depth[i] - dev.fb.depth[i]) > tolerance) {
+                        if (!s.depth_bad++) {
+                            double gx = 0, gy = 0;
+                            for (const SetupTriangle& st : setup.tris)
+                                if (cpu.id[i] && st.source == cpu.id[i] - 1) { gx = st.depth.gx; gy = st.depth.gy; break; }
+                            std::printf("   first depth difference at (%u, %u): cpu %.9g device %.9g, triangle %u, depth gradient %.3g, %.3g per pixel\n", x, y,
+                                        static_cast<double>(cpu.depth[i]), static_cast<double>(dev.fb.depth[i]), cpu.id[i], gx, gy);
+                        }
+                    }
                 }
             }
         }
