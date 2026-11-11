@@ -23,6 +23,10 @@ def check(cond, msg):
         FAILS.append(msg)
 
 
+class State(C.Structure):
+    _fields_ = [("depth_func", C.c_int), ("depth_write", C.c_int), ("blend", C.c_int)]
+
+
 class Vertex(C.Structure):
     _fields_ = [("x", C.c_float), ("y", C.c_float), ("z", C.c_float), ("rhw", C.c_float), ("color", C.c_float * 4)]
 
@@ -40,7 +44,7 @@ def main():
     lib.ttr_context_create.argtypes = [C.c_char_p, C.c_uint32]
     lib.ttr_context_destroy.argtypes = [C.c_void_p]
     lib.ttr_frame_begin.argtypes = [C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p, C.c_float, C.c_int]
-    lib.ttr_frame_triangles.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_int, C.c_int]
+    lib.ttr_frame_triangles.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_int, C.c_int, C.c_void_p]
     lib.ttr_frame_end.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_void_p, C.c_int]
     LESS, LEQUAL, ALWAYS = 0, 1, 2
     LINEAR, FLAT, PERSP = 0, 1, 2
@@ -48,13 +52,13 @@ def main():
     ctx = lib.ttr_context_create(args.backend.encode(), 1)
     check(bool(ctx), f"context created ({args.backend})")
 
-    def frame(tris, shading=LINEAR, cull=0, depth_func=LESS, clear=(0, 0, 0, 1), clear_depth=1.0, flip=0, want_depth=True):
+    def frame(tris, shading=LINEAR, cull=0, depth_func=LESS, clear=(0, 0, 0, 1), clear_depth=1.0, flip=0, want_depth=True, state=None):
         """tris: list of 3-tuples of Vertex. Returns (rgba [H, W, 4] uint8, depth [H, W] float32 or None)."""
         cc = (C.c_float * 4)(*clear)
         assert lib.ttr_frame_begin(ctx, W, H, cc, clear_depth, depth_func) == 0
         arr = (Vertex * (3 * len(tris)))(*[v for t in tris for v in t])
         if tris:
-            assert lib.ttr_frame_triangles(ctx, arr, len(tris), shading, cull) == 0, ttraster._l().ttr_last_error()
+            assert lib.ttr_frame_triangles(ctx, arr, len(tris), shading, cull, C.byref(state) if state else None) == 0, ttraster._l().ttr_last_error()
         rgba = np.zeros((H, W, 4), dtype=np.uint8)
         depth = np.zeros((H, W), dtype=np.float32) if want_depth else None
         assert lib.ttr_frame_end(ctx, rgba.ctypes.data, 0, depth.ctypes.data if want_depth else None, flip) == 0
@@ -100,14 +104,38 @@ def main():
     eq = [(vert(4, 4, c=cols[0], w=2), vert(60, 8, c=cols[1], w=2), vert(30, 44, c=cols[2], w=2))]
     check(int(np.abs(frame(eq, shading=LINEAR)[0].astype(int) - frame(eq, shading=PERSP)[0].astype(int)).max()) <= 1,
           "with equal w the two agree")
+    # Own state: depth writes off, blending, depth test off without depth writes (GL semantics).
+    half_red = (1.0, 0.0, 0.0, 0.5)
+    base = [(vert(8, 4, z=0.6, c=green), vert(40, 4, z=0.6, c=green), vert(40, 20, z=0.6, c=green))]
+    over = [(vert(8, 4, z=0.3, c=half_red), vert(40, 4, z=0.3, c=half_red), vert(40, 20, z=0.3, c=half_red))]
+    BLEND_ALPHA = 1
+
+    def two_batches(state):
+        """The green triangle with the default state, then the half-red one with `state`."""
+        cc = (C.c_float * 4)(0, 0, 0, 1)
+        assert lib.ttr_frame_begin(ctx, W, H, cc, 1.0, LESS) == 0
+        for tris, st in ((base, None), (over, state)):
+            arr = (Vertex * (3 * len(tris)))(*[v for t in tris for v in t])
+            assert lib.ttr_frame_triangles(ctx, arr, len(tris), LINEAR, 0, C.byref(st) if st else None) == 0
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        depth = np.zeros((H, W), dtype=np.float32)
+        assert lib.ttr_frame_end(ctx, rgba.ctypes.data, 0, depth.ctypes.data, 0) == 0
+        return rgba, depth
+
+    img, z = two_batches(State(LESS, 0, BLEND_ALPHA))
+    check(abs(int(img[8, 30][0]) - 128) <= 1 and abs(int(img[8, 30][1]) - 128) <= 1, "alpha blending over the green triangle")
+    check(abs(float(z[8, 30]) - 0.6) < 1e-6, "a blended batch with depth writes off leaves the depth alone")
+    img, z = two_batches(State(ALWAYS, 0, 0))
+    check(abs(int(img[8, 30][0]) - 255) <= 0 and int(img[8, 30][1]) == 0, "depth test off: the later triangle is drawn over")
+    check(abs(float(z[8, 30]) - 0.6) < 1e-6, "depth test off does not write depth")
     # Errors and misuse.
     cc = (C.c_float * 4)(0, 0, 0, 1)
     check(lib.ttr_frame_begin(ctx, 4096, 16, cc, 1.0, LESS) != 0, "a target above 2048 pixels is refused")
     arr = (Vertex * 3)(*tri[0])
-    check(lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 0) != 0, "triangles outside a frame are refused")
+    check(lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 0, None) != 0, "triangles outside a frame are refused")
     lib.ttr_frame_begin(ctx, W, H, cc, 1.0, LESS)
-    lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 1)
-    check(lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 2) != 0, "mixed cull modes in one frame are refused")
+    lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 1, None)
+    check(lib.ttr_frame_triangles(ctx, arr, 1, LINEAR, 2, None) != 0, "mixed cull modes in one frame are refused")
     lib.ttr_context_destroy(ctx)
     print(f"   backend: {args.backend}")
     if FAILS:

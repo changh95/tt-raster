@@ -50,7 +50,10 @@ cases=(
     "swap|--swap --frames 3|1"
     "glsl|--glsl --depth --continue --frames 3|1"
     "glsl_alu_fallback|--glsl-alu --frames 2|0"
-    "blend_fallback|--blend --frames 2|0"
+    "blend|--blend --depth --frames 2|1"
+    "depthmask|--depthmask --depth --continue --frames 2|1"
+    "nodepth|--nodepth --depth --frames 2|1"
+    "blend_separate_fallback|--blend-sep --frames 2|0"
 )
 for c in "${cases[@]}"; do
     IFS='|' read -r name args strict <<<"$c"

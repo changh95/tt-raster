@@ -79,10 +79,10 @@ int main(int argc, char** argv) {
             const MultiChipFrame f = mc.render(frame, setup, bins, opt);
             if (n == chip_counts.front()) single = f.fb->color;
             // Crop to the viewport for the comparisons.
-            // Perspective colours divide by a Newton-refined reciprocal on the device: one level of difference from the
-            // reference's IEEE division is allowed for such scenes (the chips still have to agree with each other exactly).
+            // Perspective colours (Newton-refined reciprocal) and blend chains (partially fused SFPU multiply-add) can differ
+            // from the reference in the last float bit: one level is allowed for such scenes (the chips still have to agree with each other exactly).
             bool perspective = false;
-            for (const Triangle& t : frame.triangles) perspective |= t.perspective && !t.flat;
+            for (const Triangle& t : frame.triangles) perspective |= (t.perspective && !t.flat) || t.blend != BlendMode::None;
             auto off_by_more = [&](uint32_t a, uint32_t b) {
                 if (a == b) return false;
                 if (!perspective) return true;

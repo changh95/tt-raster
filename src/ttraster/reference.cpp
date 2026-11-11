@@ -26,7 +26,18 @@ Framebuffer render_reference(
     }
 
     ReferenceStats local;
-    const bool less = frame.depth_func == DepthFunc::Less;
+
+    // Blending reads the colour already in the target. The device keeps unquantized FP32 colour planes while it
+    // draws and quantizes at the end, so a frame with blended triangles keeps the same floats here.
+    bool any_blend = false;
+    for (const SetupTriangle& t : setup.tris) any_blend |= t.blend != BlendMode::None;
+    std::vector<float> cf;
+    if (any_blend) {
+        cf.resize(n * 4);
+        for (size_t i = 0; i < n; i++) {
+            for (int ch = 0; ch < 4; ch++) cf[4 * i + ch] = frame.clear_color[ch];
+        }
+    }
 
     for (uint32_t ty = 0; ty < bins.tiles_y; ty++) {
         for (uint32_t tx = 0; tx < bins.tiles_x; tx++) {
@@ -34,6 +45,7 @@ Framebuffer render_reference(
                 const SetupTriangle& tri = setup.tris[entry.tri];
                 const TileParams p = make_tile_params(tri, static_cast<int>(tx), static_cast<int>(ty));
                 const bool skip_tests = opt.trust_full_tiles && entry.coverage == TileCoverage::Full;
+                const DepthFunc df = tri.depth_func;
                 local.tile_triangle_pairs++;
                 local.full_pairs += entry.coverage == TileCoverage::Full;
 
@@ -52,12 +64,14 @@ Framebuffer render_reference(
 
                         const float z = std::fmaf(p.depth_gx, ddx, std::fmaf(p.depth_gy, ddy, p.depth_c));
                         const float zo = fb.depth[idx];
-                        const float diff = std::fabs(z - zo);
-                        if (diff <= kDepthAmbiguity * std::max(std::fabs(z), std::fabs(zo))) {
-                            fb.ambiguous[idx] = 1;
-                        }
-                        if (less ? !(z < zo) : !(z <= zo)) {
-                            continue;
+                        if (df != DepthFunc::Always) {
+                            const float diff = std::fabs(z - zo);
+                            if (diff <= kDepthAmbiguity * std::max(std::fabs(z), std::fabs(zo))) {
+                                fb.ambiguous[idx] = 1;
+                            }
+                            if (df == DepthFunc::Less ? !(z < zo) : !(z <= zo)) {
+                                continue;
+                            }
                         }
                         float rgba[4];
                         for (int ch = 0; ch < 4; ch++) {
@@ -71,7 +85,20 @@ Framebuffer render_reference(
                                 rgba[ch] *= q;
                             }
                         }
-                        fb.depth[idx] = z;
+                        if (tri.blend != BlendMode::None) {
+                            const float sa = clamp01(rgba[3]);
+                            float out[4];
+                            for (int ch = 0; ch < 4; ch++) {
+                                out[ch] = blend_channel(tri.blend, clamp01(rgba[ch]), sa, cf[4 * idx + ch]);
+                            }
+                            for (int ch = 0; ch < 4; ch++) rgba[ch] = out[ch];
+                        }
+                        if (any_blend) {
+                            for (int ch = 0; ch < 4; ch++) cf[4 * idx + ch] = rgba[ch];
+                        }
+                        if (tri.depth_write) {
+                            fb.depth[idx] = z;
+                        }
                         if (opt.float_planes) {
                             for (int ch = 0; ch < 4; ch++) {
                                 fb.plane[ch][idx] = rgba[ch];

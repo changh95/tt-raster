@@ -249,7 +249,6 @@ struct ttr_context {
     std::unique_ptr<ttr::scene::Backend> backend;
     ttr::Frame frame;
     bool open = false;
-    int depth_func = TTR_DEPTH_LESS;
     std::string report;
 };
 
@@ -290,8 +289,9 @@ int ttr_frame_begin(
     ctx->frame.height = height;
     std::memcpy(ctx->frame.clear_color, clear_color, 4 * sizeof(float));
     ctx->frame.clear_depth = clear_depth;
-    ctx->depth_func = depth_func;
-    ctx->frame.depth_func = depth_func == TTR_DEPTH_LESS ? ttr::DepthFunc::Less : ttr::DepthFunc::LessEqual;
+    ctx->frame.depth_func = depth_func == TTR_DEPTH_LESS      ? ttr::DepthFunc::Less
+                            : depth_func == TTR_DEPTH_ALWAYS ? ttr::DepthFunc::Always
+                                                             : ttr::DepthFunc::LessEqual;
     ctx->frame.cull = ttr::CullMode::None;
     ctx->frame.triangles.clear();   // keeps the capacity
     ctx->frame.viewports.clear();
@@ -299,7 +299,8 @@ int ttr_frame_begin(
     return 0;
 }
 
-int ttr_frame_triangles(ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull) {
+int ttr_frame_triangles(
+    ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull, const ttr_state* state) {
     if (!ctx->open) {
         g_error = "ttr_frame_triangles outside a frame";
         return -1;
@@ -320,11 +321,19 @@ int ttr_frame_triangles(ttr_context* ctx, const ttr_vertex* verts, uint32_t n_tr
         tri.viewport = 0;
         tri.flat = shading == TTR_SHADE_FLAT;
         tri.perspective = shading == TTR_SHADE_PERSPECTIVE;
+        if (state) {
+            tri.own_state = true;
+            tri.depth_func = state->depth_func == TTR_DEPTH_LESS      ? ttr::DepthFunc::Less
+                             : state->depth_func == TTR_DEPTH_ALWAYS ? ttr::DepthFunc::Always
+                                                                     : ttr::DepthFunc::LessEqual;
+            tri.depth_write = state->depth_write != 0;
+            tri.blend = static_cast<ttr::BlendMode>(state->blend >= 0 && state->blend <= TTR_BLEND_ALPHA_ADD ? state->blend : 0);
+        }
         for (int k = 0; k < 3; k++) {
             const ttr_vertex& v = verts[3 * t + k];
             tri.v[k].x = v.x;
             tri.v[k].y = v.y;
-            tri.v[k].z = ctx->depth_func == TTR_DEPTH_ALWAYS ? 0.0f : v.z;
+            tri.v[k].z = v.z;
             tri.v[k].rhw = v.rhw;
             std::memcpy(tri.v[k].color, v.color, sizeof v.color);
         }

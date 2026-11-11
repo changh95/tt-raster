@@ -53,6 +53,9 @@ struct SetupTriangle {
     bool clipped = false;
     bool flat = false;
     bool perspective = false;      // colour planes hold colour * rhw; `inv_w` is the plane of rhw
+    DepthFunc depth_func = DepthFunc::Less;   // resolved: the triangle's own or the frame's
+    bool depth_write = true;
+    BlendMode blend = BlendMode::None;
     int32_t x[3] = {}, y[3] = {};  // snapped, oriented so signed area is positive
     Edge edge[3] = {};             // edge i runs from vertex i to vertex (i+1)%3
     Plane depth;

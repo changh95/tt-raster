@@ -42,13 +42,17 @@ typedef struct {
 } ttr_vertex;
 
 enum { TTR_DEPTH_LESS = 0, TTR_DEPTH_LEQUAL = 1, TTR_DEPTH_ALWAYS = 2 };
+enum { TTR_BLEND_NONE = 0, TTR_BLEND_ALPHA = 1, TTR_BLEND_ADD = 2, TTR_BLEND_PREMULTIPLIED = 3, TTR_BLEND_MULTIPLY = 4, TTR_BLEND_ALPHA_ADD = 5 };
+typedef struct {
+   int depth_func, depth_write, blend;
+} ttr_state;
 enum { TTR_SHADE_LINEAR = 0, TTR_SHADE_FLAT = 1, TTR_SHADE_PERSPECTIVE = 2 };
 
 struct ttr_api {
    void *(*context_create)(const char *backend, uint32_t n_chips);
    void (*context_destroy)(void *ctx);
    int (*frame_begin)(void *ctx, uint32_t w, uint32_t h, const float clear_color[4], float clear_depth, int depth_func);
-   int (*frame_triangles)(void *ctx, const ttr_vertex *verts, uint32_t n, int shading, int cull);
+   int (*frame_triangles)(void *ctx, const ttr_vertex *verts, uint32_t n, int shading, int cull, const ttr_state *state);
    int (*frame_end)(void *ctx, uint8_t *rgba, uint32_t stride, float *depth, int flip_y);
    const char *(*last_error)(void);
    const char *(*context_report)(void *ctx);
@@ -70,14 +74,15 @@ struct sp_tensix {
    enum frame_state state;
    float clear_color[4];
    float clear_depth;
-   int depth_func;          /* of the open frame */
    uint32_t width, height;  /* of the open frame */
 
    /* The draw in progress. */
    bool tri_active;
    int color_slot;          /* vertex slot of the colour varying */
    bool flat;
-   bool perspective;        /* the colour varying is perspective-interpolated: accepted within a tolerance */
+   bool perspective;        /* the colour varying is perspective-interpolated */
+   ttr_state draw_state;    /* depth and blend state of the current draw */
+   bool own_state;          /* it differs from the frame default (LESS, depth writes on, no blending) */
    ttr_vertex *verts;
    size_t nverts, cap;
 
@@ -279,28 +284,42 @@ draw_refused(struct sp_tensix *t, const struct pipe_draw_info *info)
    if (sp->active_query_count || sp->active_statistics_queries)
       return "active query";
    const struct pipe_blend_state *b = sp->blend;
-   if (b->rt[0].blend_enable || b->logicop_enable || b->alpha_to_coverage || b->alpha_to_one || b->rt[0].colormask != 0xf)
-      return "blending, logic op or colour mask";
+   if (b->logicop_enable || b->alpha_to_coverage || b->alpha_to_one || b->rt[0].colormask != 0xf)
+      return "logic op, alpha to coverage or colour write mask";
    const struct pipe_depth_stencil_alpha_state *ds = sp->depth_stencil;
    if (ds->stencil[0].enabled || ds->stencil[1].enabled || ds->alpha_enabled || ds->depth_bounds_test)
       return "stencil, alpha or depth bounds test";
-   int depth_func;
+   ttr_state st = {TTR_DEPTH_ALWAYS, 0, TTR_BLEND_NONE};   /* depth test off: nothing is tested or written */
    if (ds->depth_enabled) {
-      if (!ds->depth_writemask)
-         return "depth test without depth writes";
-      if (ds->depth_func == PIPE_FUNC_LESS)
-         depth_func = TTR_DEPTH_LESS;
-      else if (ds->depth_func == PIPE_FUNC_LEQUAL)
-         depth_func = TTR_DEPTH_LEQUAL;
-      else if (ds->depth_func == PIPE_FUNC_ALWAYS)
-         depth_func = TTR_DEPTH_ALWAYS;
-      else
-         return "depth function";
-   } else {
-      depth_func = TTR_DEPTH_ALWAYS;
+      st.depth_write = ds->depth_writemask;
+      switch (ds->depth_func) {
+      case PIPE_FUNC_LESS: st.depth_func = TTR_DEPTH_LESS; break;
+      case PIPE_FUNC_LEQUAL: st.depth_func = TTR_DEPTH_LEQUAL; break;
+      case PIPE_FUNC_ALWAYS: st.depth_func = TTR_DEPTH_ALWAYS; break;
+      default: return "depth function";
+      }
    }
-   if (t->state == FRAME_OPEN && depth_func != t->depth_func)
-      return "depth function changed within the frame";
+   const struct pipe_rt_blend_state *rt = &b->rt[0];
+   if (rt->blend_enable) {
+      if (rt->rgb_func != PIPE_BLEND_ADD || rt->alpha_func != PIPE_BLEND_ADD || rt->rgb_src_factor != rt->alpha_src_factor ||
+          rt->rgb_dst_factor != rt->alpha_dst_factor)
+         return "blend equation or separate alpha factors";
+      const unsigned sf = rt->rgb_src_factor, df = rt->rgb_dst_factor;
+      if (sf == PIPE_BLENDFACTOR_SRC_ALPHA && df == PIPE_BLENDFACTOR_INV_SRC_ALPHA)
+         st.blend = TTR_BLEND_ALPHA;
+      else if (sf == PIPE_BLENDFACTOR_ONE && df == PIPE_BLENDFACTOR_ONE)
+         st.blend = TTR_BLEND_ADD;
+      else if (sf == PIPE_BLENDFACTOR_ONE && df == PIPE_BLENDFACTOR_INV_SRC_ALPHA)
+         st.blend = TTR_BLEND_PREMULTIPLIED;
+      else if (sf == PIPE_BLENDFACTOR_DST_COLOR && df == PIPE_BLENDFACTOR_ZERO)
+         st.blend = TTR_BLEND_MULTIPLY;
+      else if (sf == PIPE_BLENDFACTOR_SRC_ALPHA && df == PIPE_BLENDFACTOR_ONE)
+         st.blend = TTR_BLEND_ALPHA_ADD;
+      else
+         return "blend factors";
+   }
+   t->draw_state = st;
+   t->own_state = !(st.depth_func == TTR_DEPTH_LESS && st.depth_write && st.blend == TTR_BLEND_NONE);
    if (!sp->fs_variant)
       return "no fragment shader";
    /* softpipe derives the vertex layout and the setup info lazily, when the draw module asks for it. */
@@ -327,7 +346,6 @@ draw_refused(struct sp_tensix *t, const struct pipe_draw_info *info)
    t->color_slot = sp->setup_info.attrib[k].src_index;
    t->flat = interp == SP_INTERP_CONSTANT;
    t->perspective = interp == SP_INTERP_PERSPECTIVE;
-   t->depth_func = depth_func;   /* adopted when the frame begins; compared above once it is open */
    return NULL;
 }
 
@@ -580,7 +598,7 @@ sp_tensix_begin_draw(struct sp_tensix *t, const struct pipe_draw_info *info)
       return;
    }
    if (t->state == FRAME_CLEARED) {
-      if (t->api.frame_begin(t->ctx, t->width, t->height, t->clear_color, t->clear_depth, t->depth_func) != 0) {
+      if (t->api.frame_begin(t->ctx, t->width, t->height, t->clear_color, t->clear_depth, TTR_DEPTH_LESS) != 0) {
          fprintf(stderr, "tensix: frame_begin failed: %s\n", t->api.last_error());
          t->state = FRAME_NONE;
          t->draws_slow++;
@@ -604,7 +622,8 @@ submit_batch(struct sp_tensix *t)
 {
    if (t->nverts &&
        t->api.frame_triangles(t->ctx, t->verts, (uint32_t)(t->nverts / 3),
-                              t->flat ? TTR_SHADE_FLAT : t->perspective ? TTR_SHADE_PERSPECTIVE : TTR_SHADE_LINEAR, 0) != 0) {
+                              t->flat ? TTR_SHADE_FLAT : t->perspective ? TTR_SHADE_PERSPECTIVE : TTR_SHADE_LINEAR, 0,
+                              t->own_state ? &t->draw_state : NULL) != 0) {
       fprintf(stderr, "tensix: frame_triangles failed: %s\n", t->api.last_error());
    }
    t->nverts = 0;

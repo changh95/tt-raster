@@ -61,6 +61,10 @@ struct TriScalars {
     float rc, rx, ry, gc, gx, gy, bc, bx, by, ac, ax, ay;  // colour planes (gradients unused when flat)
     float wc, wx, wy;                          // rhw plane (perspective triangles only)
     float id;
+    uint32_t depth_func;                       // stateful records: 0 LESS, 1 LESS_EQUAL, 2 ALWAYS
+    uint32_t depth_write;
+    float ka_c, ka_sa, kb_c, kb_sa, kb_s;      // blend coefficients (raster_layout.h); blend off: all 0 and `blend` false
+    bool blend;
     uint32_t packed;  // flat colour packed to RGBA8 (packed-colour variant)
 };
 
@@ -82,6 +86,9 @@ inline TriScalars load_scalars(const volatile float* rec) {
         s.wc = rec[ttr::layout::kWPlane]; s.wx = rec[ttr::layout::kWPlane + 1]; s.wy = rec[ttr::layout::kWPlane + 2];
     }
     s.id = rec[24];
+    s.depth_func = 0;
+    s.depth_write = 1;
+    s.blend = false;
     s.packed = reinterpret_cast<const volatile uint32_t*>(rec)[ttr::layout::kFlatPacked];
     return s;
 }
@@ -226,6 +233,144 @@ inline void raster_triangle_impl(const volatile float* rec) {
     }
 }
 
+// ---- General path: records with their own depth function, depth write and blend state -----------------------------
+// (kFlagStateful). The specialized path above stays untouched for the common case.
+
+inline void load_state(TriScalars& s, uint32_t flags) {
+    s.depth_func = (flags >> ttr::layout::kDepthFuncShift) & 3u;
+    s.depth_write = (flags & ttr::layout::kFlagDepthWrite) != 0u;
+    const uint32_t mode = (flags >> ttr::layout::kBlendShift) & 7u;
+    s.blend = mode != 0u;
+    s.ka_c = ttr::layout::kBlendCoef[mode][0];
+    s.ka_sa = ttr::layout::kBlendCoef[mode][1];
+    s.kb_c = ttr::layout::kBlendCoef[mode][2];
+    s.kb_sa = ttr::layout::kBlendCoef[mode][3];
+    s.kb_s = ttr::layout::kBlendCoef[mode][4];
+}
+
+__attribute__((always_inline)) inline sfpi::vFloat raster_clamp01(sfpi::vFloat v) {
+    v_if (v < 0.0f) { v = 0.0f; }
+    v_endif;
+    v_if (v > 1.0f) { v = 1.0f; }
+    v_endif;
+    return v;
+}
+
+// The fragment colour of a pixel that passed the tests, blended with the colour in Dest. Evaluation order as
+// ttr::blend_channel (src/ttraster/tile.h): every channel is clamped, then r = s * A + d * B, clamped again.
+template <bool FLAT, bool PERSP>
+__attribute__((always_inline)) inline void write_colour_blend(const TriScalars& s, sfpi::vFloat dx, sfpi::vFloat dy) {
+#if defined(RASTER_EXP_NO_COLOUR) || !(RASTER_PLANE_MASK & 1) || defined(RASTER_PACKED_COLOUR)
+    (void)s; (void)dx; (void)dy;   // no colour plane requested: nothing to blend
+#else
+    sfpi::vFloat q = 1.0f;
+    if constexpr (PERSP) {
+        q = raster_reciprocal(s.wx * dx + (s.wy * dy + s.wc));
+    }
+    sfpi::vFloat sa;
+    if constexpr (FLAT) {
+        sa = s.ac;
+    } else if constexpr (PERSP) {
+        sa = (s.ax * dx + (s.ay * dy + s.ac)) * q;
+    } else {
+        sa = s.ax * dx + (s.ay * dy + s.ac);
+    }
+    sa = raster_clamp01(sa);
+    sfpi::vFloat a = sa * s.ka_sa + s.ka_c;
+    sfpi::vFloat bp = sa * s.kb_sa + s.kb_c;
+    // Channels one after the other: only a few registers are live at a time.
+#define RASTER_BLEND_CHANNEL(SLOT, CC, CX, CY)                                                      \
+    {                                                                                                \
+        sfpi::vFloat c;                                                                              \
+        if constexpr (FLAT) {                                                                        \
+            c = s.CC;                                                                                \
+        } else if constexpr (PERSP) {                                                                \
+            c = (s.CX * dx + (s.CY * dy + s.CC)) * q;                                                \
+        } else {                                                                                     \
+            c = s.CX * dx + (s.CY * dy + s.CC);                                                      \
+        }                                                                                            \
+        c = raster_clamp01(c);                                                                       \
+        sfpi::vFloat d = sfpi::dst_reg[(SLOT) * kVectors];                                           \
+        sfpi::vFloat b = c * s.kb_s + bp;                                                            \
+        sfpi::vFloat r = c * a + d * b;                                                              \
+        sfpi::dst_reg[(SLOT) * kVectors] = raster_clamp01(r);                                        \
+    }
+    RASTER_BLEND_CHANNEL(kSlotR, rc, rx, ry)
+    RASTER_BLEND_CHANNEL(kSlotG, gc, gx, gy)
+    RASTER_BLEND_CHANNEL(kSlotB, bc, bx, by)
+    RASTER_BLEND_CHANNEL(kSlotA, ac, ax, ay)
+#undef RASTER_BLEND_CHANNEL
+#endif
+}
+
+template <bool FLAT, bool PERSP, bool LEQ>
+__attribute__((always_inline)) inline void shade_vector_state(const TriScalars& s, sfpi::vFloat dx, sfpi::vFloat dy) {
+    sfpi::vFloat z = s.zx * dx + (s.zy * dy + s.zc);
+    sfpi::vFloat zo = sfpi::dst_reg[kSlotZ * kVectors];
+    if (s.depth_func == 2u) {
+        zo = 3.0e38f;   // depth test off: every fragment passes
+    }
+    if constexpr (LEQ) {
+        v_if (z <= zo) {
+            if (s.depth_write) { sfpi::dst_reg[kSlotZ * kVectors] = z; }
+            sfpi::dst_reg[kSlotId * kVectors] = s.id;
+            if (s.blend) { write_colour_blend<FLAT, PERSP>(s, dx, dy); } else { write_colour<FLAT, PERSP>(s, dx, dy); }
+        }
+        v_endif;
+    } else {
+        v_if (z < zo) {
+            if (s.depth_write) { sfpi::dst_reg[kSlotZ * kVectors] = z; }
+            sfpi::dst_reg[kSlotId * kVectors] = s.id;
+            if (s.blend) { write_colour_blend<FLAT, PERSP>(s, dx, dy); } else { write_colour<FLAT, PERSP>(s, dx, dy); }
+        }
+        v_endif;
+    }
+}
+
+template <bool FULL, bool FLAT, bool PERSP, bool LEQ>
+__attribute__((always_inline)) inline void draw_vector_state(const TriScalars& s) {
+    sfpi::vFloat dx = sfpi::dst_reg[kSlotDx * kVectors];
+    sfpi::vFloat dy = sfpi::dst_reg[kSlotDy * kVectors];
+    if constexpr (FULL) {
+        shade_vector_state<FLAT, PERSP, LEQ>(s, dx, dy);
+    } else {
+        sfpi::vFloat t0 = s.b0 * dy + s.c0;
+        sfpi::vFloat e0 = s.a0 * dx + t0;
+        v_if (e0 >= 0.0f) {
+            sfpi::vFloat t1 = s.b1 * dy + s.c1;
+            sfpi::vFloat e1 = s.a1 * dx + t1;
+            v_if (e1 >= 0.0f) {
+                sfpi::vFloat t2 = s.b2 * dy + s.c2;
+                sfpi::vFloat e2 = s.a2 * dx + t2;
+                v_if (e2 >= 0.0f) { shade_vector_state<FLAT, PERSP, LEQ>(s, dx, dy); }
+                v_endif;
+            }
+            v_endif;
+        }
+        v_endif;
+    }
+}
+
+template <bool FLAT, bool PERSP, bool LEQ>
+inline void raster_triangle_state_impl(const volatile float* rec, uint32_t flags) {
+    TriScalars s = load_scalars<FLAT, PERSP>(rec);
+    load_state(s, flags);
+    const volatile uint32_t* classes = reinterpret_cast<const volatile uint32_t*>(rec) + ttr::layout::kVecClass;
+    for (uint32_t half = 0; half < 2; half++) {
+        uint32_t bits = classes[half];
+        for (uint32_t i = 0; i < 16; i++) {
+            const uint32_t cls = bits & 3u;
+            bits >>= 2;
+            if (cls == 1u) {
+                draw_vector_state<false, FLAT, PERSP, LEQ>(s);
+            } else if (cls == 2u) {
+                draw_vector_state<true, FLAT, PERSP, LEQ>(s);
+            }
+            sfpi::dst_reg++;
+        }
+    }
+}
+
 #if defined(RASTER_LESS_EQUAL)
 constexpr bool kLessEqual = true;
 #else
@@ -242,6 +387,17 @@ constexpr bool kCover = false;
 // docs/PERF.md.)
 inline void raster_triangle(const volatile float* rec) {
     const uint32_t flags = reinterpret_cast<const volatile uint32_t*>(rec)[ttr::layout::kFlags];
+    if (!kCover && (flags & ttr::layout::kFlagStateful)) {   // the coverage-count debug mode ignores state
+        const bool leq = ((flags >> ttr::layout::kDepthFuncShift) & 3u) == 1u;   // ALWAYS is LESS against +infinity
+        if (flags & ttr::layout::kFlagFlat) {
+            if (leq) raster_triangle_state_impl<true, false, true>(rec, flags); else raster_triangle_state_impl<true, false, false>(rec, flags);
+        } else if (flags & ttr::layout::kFlagPersp) {
+            if (leq) raster_triangle_state_impl<false, true, true>(rec, flags); else raster_triangle_state_impl<false, true, false>(rec, flags);
+        } else {
+            if (leq) raster_triangle_state_impl<false, false, true>(rec, flags); else raster_triangle_state_impl<false, false, false>(rec, flags);
+        }
+        return;
+    }
     if (flags & ttr::layout::kFlagFlat) {
         raster_triangle_impl<true, false, kLessEqual, kCover>(rec);
     } else if (flags & ttr::layout::kFlagPersp) {

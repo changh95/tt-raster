@@ -2,11 +2,12 @@
  *
  * Deterministic fixed-function OpenGL test scene for the softpipe fast path (mesa/README.md).
  *
- *   gl_scene [--glsl|--glsl-alu] [--frames N] [--size S] [--dump PREFIX] [--blend] [--lighting] [--cull] [--swap] [--ortho] [--depth] [--continue]
+ *   gl_scene [--glsl|--glsl-alu] [--frames N] [--size S] [--dump PREFIX] [--blend|--blend-sep] [--depthmask] [--nodepth] [--lighting] [--cull] [--swap] [--ortho] [--depth] [--continue]
  *
  * Draws N frames (rotation angle = frame index), reads every frame back with glReadPixels and, with --dump,
- * writes PREFIX<frame>.ppm. --blend draws one extra blended triangle (a draw the fast path refuses: tests the
- * mid-frame fallback); --lighting uses fixed-function lighting; --cull enables back-face culling; --swap also
+ * writes PREFIX<frame>.ppm. --blend draws one extra alpha-blended triangle; --blend-sep the same with separate alpha
+ * factors (a draw the fast path refuses: tests the mid-frame fallback); --depthmask adds additive layers drawn with depth
+ * writes off, then an opaque triangle behind them; --nodepth an overlay drawn with the depth test off; --lighting uses fixed-function lighting; --cull enables back-face culling; --swap also
  * calls glXSwapBuffers every frame; --glsl draws with a GLSL 1.20 program (lighting in the vertex shader, the fragment
  * shader passes the colour through: the fast path takes it), --glsl-alu has a fragment shader with arithmetic (the fast
  * path refuses it: softpipe draws); --ortho uses an orthographic projection (w = 1); --depth also dumps the depth
@@ -65,7 +66,7 @@ make_program(int alu)
 }
 
 static void
-draw_scene(int frame, int blend, int lighting, int ortho, GLuint program)
+draw_scene(int frame, int blend, int lighting, int ortho, GLuint program, int depthmask, int nodepth)
 {
    glClearColor(0.1f, 0.12f, 0.2f, 1.0f);
    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -129,13 +130,52 @@ draw_scene(int frame, int blend, int lighting, int ortho, GLuint program)
       glUseProgram(0);
       glDisable(GL_LIGHTING);
       glEnable(GL_BLEND);
-      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      if (blend == 2)
+         glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);   /* separate alpha: refused */
+      else
+         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
       glBegin(GL_TRIANGLES);
       glColor4f(1.0f, 1.0f, 1.0f, 0.4f); glVertex3f(-1.0f, -1.0f, 1.5f);
       glColor4f(1.0f, 0.0f, 0.0f, 0.4f); glVertex3f(1.2f, -0.8f, 1.5f);
       glColor4f(0.0f, 0.0f, 1.0f, 0.4f); glVertex3f(0.0f, 1.3f, 1.5f);
       glEnd();
       glDisable(GL_BLEND);
+   }
+
+   if (depthmask) {
+      /* Translucent layers that test depth but do not write it, then an opaque triangle behind them. */
+      glUseProgram(0);
+      glDisable(GL_LIGHTING);
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+      glDepthMask(GL_FALSE);
+      for (int k = 0; k < 3; k++) {
+         glBegin(GL_TRIANGLES);
+         glColor4f(1.0f, 0.5f, 0.1f, 0.35f); glVertex3f(-1.4f + 0.3f * k, -1.2f, 0.9f - 0.2f * k);
+         glColor4f(0.1f, 0.6f, 1.0f, 0.35f); glVertex3f(1.4f + 0.3f * k, -0.9f, 0.9f - 0.2f * k);
+         glColor4f(1.0f, 1.0f, 1.0f, 0.35f); glVertex3f(0.1f * k, 1.6f, 0.2f);
+         glEnd();
+      }
+      glDepthMask(GL_TRUE);
+      glDisable(GL_BLEND);
+      glBegin(GL_TRIANGLES);
+      glColor3f(0.9f, 0.9f, 0.2f); glVertex3f(-2.4f, -2.0f, -0.8f);
+      glColor3f(0.2f, 0.9f, 0.9f); glVertex3f(2.4f, -1.9f, -0.8f);
+      glColor3f(0.9f, 0.2f, 0.9f); glVertex3f(0.0f, 2.4f, -0.8f);
+      glEnd();
+   }
+
+   if (nodepth) {
+      /* An overlay drawn with the depth test off (and so without touching the depth buffer). */
+      glUseProgram(0);
+      glDisable(GL_LIGHTING);
+      glDisable(GL_DEPTH_TEST);
+      glBegin(GL_TRIANGLES);
+      glColor3f(0.0f, 0.0f, 0.0f); glVertex3f(-0.6f, -0.6f, 2.0f);
+      glColor3f(1.0f, 1.0f, 1.0f); glVertex3f(0.6f, -0.5f, 2.0f);
+      glColor3f(0.5f, 0.0f, 0.5f); glVertex3f(0.0f, 0.7f, 2.0f);
+      glEnd();
+      glEnable(GL_DEPTH_TEST);
    }
 }
 
@@ -174,13 +214,16 @@ dump_depth(const char *prefix, int frame, int size)
 int
 main(int argc, char **argv)
 {
-   int frames = 1, size = 256, blend = 0, lighting = 0, cull = 0, swap = 0, ortho = 0, depth_out = 0, cont = 0, glsl = 0, glsl_alu = 0;
+   int frames = 1, size = 256, blend = 0, lighting = 0, cull = 0, swap = 0, ortho = 0, depth_out = 0, cont = 0, glsl = 0, glsl_alu = 0, depthmask = 0, nodepth = 0;
    const char *dump = NULL;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--size") && i + 1 < argc) size = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump = argv[++i];
       else if (!strcmp(argv[i], "--blend")) blend = 1;
+      else if (!strcmp(argv[i], "--blend-sep")) blend = 2;
+      else if (!strcmp(argv[i], "--depthmask")) depthmask = 1;
+      else if (!strcmp(argv[i], "--nodepth")) nodepth = 1;
       else if (!strcmp(argv[i], "--lighting")) lighting = 1;
       else if (!strcmp(argv[i], "--cull")) cull = 1;
       else if (!strcmp(argv[i], "--swap")) swap = 1;
@@ -210,7 +253,7 @@ main(int argc, char **argv)
    const GLuint program = glsl || glsl_alu ? make_program(glsl_alu) : 0;
    unsigned char *px = malloc((size_t)size * size * 4);
    for (int f = 0; f < frames; f++) {
-      draw_scene(f, blend, lighting, ortho, program);
+      draw_scene(f, blend, lighting, ortho, program, depthmask, nodepth);
       glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, px);
       if (dump) {
          dump_rgba(dump, f, "", px, size);

@@ -276,6 +276,9 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
             t.clipped = outside_guard;
             t.flat = tri.flat;
             t.perspective = perspective;
+            t.depth_func = tri.own_state ? tri.depth_func : frame.depth_func;
+            t.depth_write = tri.own_state ? tri.depth_write : true;
+            t.blend = tri.own_state ? tri.blend : BlendMode::None;
             for (int i = 0; i < 3; i++) {
                 t.x[i] = static_cast<int32_t>(pieces[k][i][0]);
                 t.y[i] = static_cast<int32_t>(pieces[k][i][1]);

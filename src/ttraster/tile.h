@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "tensix/kernels/raster_layout.h"
 #include "ttraster/setup.h"
 
 namespace ttr {
@@ -87,6 +88,20 @@ inline float edge_value(const TileEdge& e, float ddx, float ddy) {
     return std::fmaf(e.a, ddx, std::fmaf(e.b, ddy, e.c));
 }
 inline bool edge_inside(const TileEdge& e, float ddx, float ddy) { return edge_value(e, ddx, ddy) >= 0.0f; }
+
+// One colour channel of a blend (frame.h, BlendMode): s is the fragment's channel, sa its alpha (both clamped to
+// [0, 1]), d the target's channel; the result is clamped to [0, 1]. The device evaluates exactly this chain, with the
+// coefficients of raster_layout.h:  A = sa * ka_sa + ka_c;  B = s * kb_s + (sa * kb_sa + kb_c);  r = s * A + d * B.
+inline float blend_channel(BlendMode mode, float s, float sa, float d) {
+    if (mode == BlendMode::None) return s;
+    const float* k = layout::kBlendCoef[static_cast<int>(mode)];
+    const float a = std::fmaf(sa, k[1], k[0]);
+    const float bp = std::fmaf(sa, k[3], k[2]);
+    const float b = std::fmaf(s, k[4], bp);
+    const float r = std::fmaf(s, a, d * b);
+    return r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+}
+inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
 struct BinEntry {
     uint32_t tri;  // index into SetupResult::tris

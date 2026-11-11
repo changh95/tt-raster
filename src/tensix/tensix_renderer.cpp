@@ -42,7 +42,7 @@ void put_float(std::vector<uint32_t>& w, size_t at, float f) { w[at] = float_bit
 // Encode one (tile, triangle) record at word offset `at` of `w`.
 void encode_record(
     std::vector<uint32_t>& w, size_t at, const SetupTriangle& tri, const TileParams& p, TileCoverage cov, int tx, int ty,
-    uint64_t* vec_counts = nullptr) {
+    DepthFunc frame_depth, uint64_t* vec_counts = nullptr) {
     using namespace layout;
     for (int e = 0; e < 3; e++) {
         put_float(w, at + kEdge + 3 * e + 0, p.edge[e].a);
@@ -64,8 +64,13 @@ void encode_record(
     }
     put_float(w, at + kId, static_cast<float>(tri.source + 1));
     w[at + kFlatPacked] = pack_rgba8(p.color_c);  // meaningful for flat triangles (gradients are zero)
-    w[at + kFlags] = (tri.flat ? kFlagFlat : 0u) | (cov == TileCoverage::Full ? kFlagFull : 0u) |
-                     (p.perspective ? kFlagPersp : 0u);
+    uint32_t flags = (tri.flat ? kFlagFlat : 0u) | (cov == TileCoverage::Full ? kFlagFull : 0u) | (p.perspective ? kFlagPersp : 0u);
+    if (tri.depth_func != frame_depth || !tri.depth_write || tri.blend != BlendMode::None) {
+        // Own depth/blend state: the kernel's general path decodes it (the common case keeps the specialized path).
+        flags |= kFlagStateful | (static_cast<uint32_t>(tri.depth_func) << kDepthFuncShift) |
+                 (tri.depth_write ? kFlagDepthWrite : 0u) | (static_cast<uint32_t>(tri.blend) << kBlendShift);
+    }
+    w[at + kFlags] = flags;
     const VectorClasses vc = classify_vectors(tri, tx, ty, cov);
     w[at + kVecClass + 0] = vc.word[0];
     w[at + kVecClass + 1] = vc.word[1];
@@ -214,6 +219,9 @@ DeviceFrame TensixRenderer::render(
     // buffer is not cleared between frames.
     std::vector<uint32_t>& words = words_[opt.slot];
     words.resize(static_cast<size_t>(pages_total) * (kPageBytes / 4));
+    // The specialized kernel path compares with LESS, or LESS_EQUAL when the frame says so (RASTER_LESS_EQUAL);
+    // a triangle with any other depth function takes the general path.
+    const DepthFunc kernel_depth = frame.depth_func == DepthFunc::LessEqual ? DepthFunc::LessEqual : DepthFunc::Less;
     struct CoreCounts {
         uint64_t records = 0, vec_partial = 0, vec_full = 0;
     };
@@ -230,7 +238,7 @@ DeviceFrame TensixRenderer::render(
                 const SetupTriangle& tri = setup.tris[entries[i].tri];
                 const TileParams p = make_tile_params(tri, tx, ty);
                 uint64_t vc[2] = {0, 0};
-                encode_record(words, base + (i + 1) * kRecordWords, tri, p, entries[i].coverage, tx, ty, vc);
+                encode_record(words, base + (i + 1) * kRecordWords, tri, p, entries[i].coverage, tx, ty, kernel_depth, vc);
                 cc.vec_partial += vc[0];
                 cc.vec_full += vc[1];
             }
@@ -310,7 +318,7 @@ DeviceFrame TensixRenderer::render(
             .compile_args = writer_args,
             .defines = defines});
 
-    if (frame.depth_func == DepthFunc::LessEqual) {
+    if (frame.depth_func == DepthFunc::LessEqual) {   // the specialized path's comparison; Always is per-triangle state
         defines["RASTER_LESS_EQUAL"] = "1";
     }
     if (opt.cover_count) {

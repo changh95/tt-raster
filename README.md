@@ -61,7 +61,7 @@ Speed: 1,024 environments of 96 x 96 take about 24 ms per frame for depth on one
 
 ## OpenGL through Mesa (Track G)
 
-Mesa's softpipe driver, patched (`mesa/`), hands the rasterization of whole frames to tt-raster: a real OpenGL program (GL 3.3 compatibility profile) draws through Mesa's frontend, GLSL vertex shaders and fixed-function state run on the host as before, and the triangles are rasterized on a Blackhole chip. Draws the fast path cannot do (blending, textures, stencil, lines, fragment shaders with arithmetic) run on softpipe, so output stays correct. glxgears at 1920 x 1080: 126 FPS on a Tensix chip, 31 FPS on stock softpipe; at 300 x 300 stock softpipe is faster (575 against 310 FPS), because a chip frame has about 2 ms of fixed latency.
+Mesa's softpipe driver, patched (`mesa/`), hands the rasterization of whole frames to tt-raster: a real OpenGL program (GL 3.3 compatibility profile) draws through Mesa's frontend, GLSL vertex shaders and fixed-function state run on the host as before, and the triangles are rasterized on a Blackhole chip. Depth tests and writes, alpha blending and the common blend factors work per draw; draws the fast path cannot do (textures, stencil, lines, other blend factors, fragment shaders with arithmetic) run on softpipe, so output stays correct. glxgears at 1920 x 1080: 126 FPS on a Tensix chip, 31 FPS on stock softpipe; at 300 x 300 stock softpipe is faster (575 against 310 FPS), because a chip frame has about 2 ms of fixed latency.
 
 ```
 scripts/build_mesa.sh && scripts/run_gl.sh 5 glxgears -geometry 1920x1080

@@ -228,10 +228,11 @@ int main(int argc, char** argv) {
             } else {
                 const Image d = image_from_framebuffer(dev.fb, w, h);
                 // Compare everywhere except pixels the reference flags as depth-ambiguous (the golden is the reference's own output).
-                // Perspective triangles divide by a Newton-refined reciprocal on the device, which can differ from the
-                // reference's IEEE division in the last float bit: one colour level is then allowed (and counted).
+                // Perspective colours (a Newton-refined reciprocal instead of IEEE division) and blend chains (the SFPU's
+                // partially fused multiply-add) can differ from the reference in the last float bit: one colour level is then
+                // allowed (and counted).
                 bool perspective = false;
-                for (const Triangle& t : frame.triangles) perspective |= t.perspective && !t.flat;
+                for (const Triangle& t : frame.triangles) perspective |= (t.perspective && !t.flat) || t.blend != BlendMode::None;
                 uint64_t bad = 0, off_by_one = 0;
                 for (uint32_t y = 0; y < h; y++)
                     for (uint32_t x = 0; x < w; x++) {
@@ -244,7 +245,7 @@ int main(int argc, char** argv) {
                         if (perspective && worst <= 1) off_by_one++; else bad++;
                     }
                 std::printf("    golden image: %llu mismatching pixels", static_cast<unsigned long long>(bad));
-                if (perspective) std::printf(" (+ %llu within one level, allowed for perspective colours)", static_cast<unsigned long long>(off_by_one));
+                if (perspective) std::printf(" (+ %llu within one level, allowed for perspective colours and blending)", static_cast<unsigned long long>(off_by_one));
                 std::printf("\n");
                 all_ok &= bad == 0;
             }

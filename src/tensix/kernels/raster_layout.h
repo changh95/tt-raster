@@ -34,12 +34,29 @@ constexpr uint32_t kId = 24;        // 1 + source triangle index, as a float (ex
 constexpr uint32_t kFlags = 25;     // uint32 bit flags
 constexpr uint32_t kFlagFlat = 1u;  // colour gradients are zero (flat shaded)
 constexpr uint32_t kFlagFull = 2u;  // every pixel of the tile is inside (informational: the classes say it too)
+constexpr uint32_t kFlagStateful = 8u;    // the triangle has its own depth/blend state: bits below
+constexpr uint32_t kDepthFuncShift = 4;   // 2 bits: 0 LESS, 1 LESS_EQUAL, 2 ALWAYS (matches ttr::DepthFunc)
+constexpr uint32_t kFlagDepthWrite = 1u << 6;
+constexpr uint32_t kBlendShift = 7;       // 3 bits: 0 none, 1 alpha, 2 add, 3 premultiplied, 4 multiply, 5 alpha-add (ttr::BlendMode)
 constexpr uint32_t kFlagPersp = 4u;  // colour planes hold colour * rhw; the plane in kWPlane is rhw (colour = plane / rhw)
 constexpr uint32_t kWPlane = 29;    // rhw plane (c, gx, gy), words 29..31, perspective triangles only
 constexpr uint32_t kFlatPacked = 28;  // flat colour as packed RGBA8 (host-computed), for the packed-colour variant
 constexpr uint32_t kVecClass = 26;  // 2 words, 2 bits per SFPU vector: 0 reject (skip), 1 partial (edge tests), 2 full
 
 // Header word offsets (inside record slot 0 of the block's first page).
+// Blend of one channel (src s, src alpha sa, dst d), the same chain on host and device:
+//   A = sa * ka_sa + ka_c;  B = s * kb_s + (sa * kb_sa + kb_c);  r = clamp01(s * A + d * B)
+// Rows by BlendMode (None unused): Alpha (sa, 1 - sa), Add (1, 1), Premultiplied (1, 1 - sa), Multiply (0, s), AlphaAdd (sa, 1).
+// Columns: ka_c, ka_sa, kb_c, kb_sa, kb_s.
+constexpr float kBlendCoef[6][5] = {
+    {0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {0.0f, 1.0f, 1.0f, -1.0f, 0.0f},
+    {1.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+    {1.0f, 0.0f, 1.0f, -1.0f, 0.0f},
+    {0.0f, 0.0f, 0.0f, 0.0f, 1.0f},
+    {0.0f, 1.0f, 1.0f, 0.0f, 0.0f},
+};
+
 constexpr uint32_t kHdrRecords = 0;
 constexpr uint32_t kHdrTileX = 1;
 constexpr uint32_t kHdrTileY = 2;

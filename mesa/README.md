@@ -19,8 +19,9 @@ fast path has collected so far; the rest of that frame then runs on softpipe):
 | Vertex stage | anything (fixed function, GLSL vertex shaders): it runs on the host in Mesa's draw module |
 | Fragment shader | a colour pass-through: `gl_FragColor = varying` (what fixed-function rendering and `lighting in the vertex shader` produce); colours interpolated smooth (perspective-correct), flat, or linear; no kill, no depth write, no textures, no arithmetic |
 | Framebuffer | one 8-bit unorm RGBA/BGRA colour buffer (not sRGB) and a depth buffer (Z24S8, Z24X8, S8Z24, X8Z24, Z32, Z32F, Z16), single sample, at most 2048 x 2048 |
-| Depth | test LESS, LEQUAL or ALWAYS (or off), writes on; no stencil, no alpha test, no depth bounds |
-| Blending and masks | none: blending, logic op, colour write mask, two-sided colour, scissor, polygon stipple/smoothing, queries are refused |
+| Depth | test LESS, LEQUAL or ALWAYS, or off (then nothing is tested or written); depth writes on or off per draw; no stencil, no alpha test, no depth bounds |
+| Blending | equation ADD with (SRC_ALPHA, ONE_MINUS_SRC_ALPHA), (ONE, ONE), (SRC_ALPHA, ONE), (ONE, ONE_MINUS_SRC_ALPHA) or (DST_COLOR, ZERO), the same factors for RGB and alpha; RGBA colour mask. Refused: other factors, separate alpha factors, logic op, colour write masks, two-sided colour, scissor, polygon stipple/smoothing, queries |
+| State changes | depth function, depth writes and blending can change between draws of a frame: every triangle carries its state to the rasterizer (draws stay in API order) |
 | Frame structure | a frame starts with a full colour+depth clear; draws before it run on softpipe |
 
 A frame is collected, rendered once when something needs the pixels (a buffer swap, `glFlush`/`glFinish`, a read-back,
@@ -77,6 +78,6 @@ Speed (glxgears, Xvfb, one x8 chip, stock softpipe is single-threaded on this ho
 ## Limits and what comes next
 
 Whole-frame batching assumes the usual loop. Missing for conformance-grade OpenGL: textures (Tensix has no texture units),
-blending (needs read-modify-write across the batch), stencil, MSAA, lines and points, arithmetic fragment shaders
-(G.6), per-frame state changes inside one batch other than those listed. Vulkan is a different frontend (lavapipe) and
+stencil (the eight Dest planes are full), MSAA, lines and points, arithmetic fragment shaders (G.6), other blend factors
+and separate alpha factors (a table row each), colour write masks, scissor. Vulkan is a different frontend (lavapipe) and
 is not covered.

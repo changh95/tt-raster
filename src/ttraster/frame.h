@@ -29,6 +29,19 @@ struct Vertex {
     float color[4];   // RGBA in [0, 1]
 };
 
+// Always: the depth test is off (every fragment passes).
+enum class DepthFunc : uint8_t { Less, LessEqual, Always };
+
+// Blending of the fragment colour (clamped to [0, 1]) with the colour already in the target, result clamped to
+// [0, 1]; the same factor pair is used for RGB and alpha. With s the fragment, d the target, sa the fragment alpha:
+//   Alpha          s * sa + d * (1 - sa)        (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+//   Add            s + d                        (GL_ONE, GL_ONE)
+//   Premultiplied  s + d * (1 - sa)             (GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+//   Multiply       s * d                        (GL_DST_COLOR, GL_ZERO)
+//   AlphaAdd       s * sa + d                   (GL_SRC_ALPHA, GL_ONE)
+// evaluated as fma(s, a, d * b) with (a, b) = (sa, 1 - sa), (1, 1), (1, 1 - sa), (0, s), (sa, 1) respectively.
+enum class BlendMode : uint8_t { None, Alpha, Add, Premultiplied, Multiply, AlphaAdd };
+
 // A rectangle of the render target that some triangles are confined to (one camera of a tiled
 // camera atlas). Triangles are clipped to it, so nothing bleeds into a neighbour. The rectangle
 // must not extend past the padded target and is at most kMaxTargetSize pixels wide and high.
@@ -45,9 +58,14 @@ struct Triangle {
     // vertex needs a finite rhw > 0 (triangles with other values are dropped as non-finite).
     bool flat = false;
     bool perspective = false;
+    // Per-triangle state. Unless `own_state` is set the triangle uses the frame's depth function, writes depth and does
+    // not blend. Triangles with their own state can follow each other in one frame (depth test on and off, blended
+    // layers, depth writes off); they are drawn in API order like every other triangle.
+    bool own_state = false;
+    DepthFunc depth_func = DepthFunc::Less;
+    bool depth_write = true;
+    BlendMode blend = BlendMode::None;
 };
-
-enum class DepthFunc : uint8_t { Less, LessEqual };
 
 // Face culling by the sign of signed_area2 = (x1-x0)*(y2-y0) - (y1-y0)*(x2-x0) in window
 // coordinates (y down). A cull mode names the sign that is removed.

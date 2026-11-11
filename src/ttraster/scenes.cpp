@@ -210,6 +210,37 @@ void scene_perspective(Frame& f, uint32_t w, uint32_t h) {
     }
 }
 
+// 60 triangles with their own depth and blend state in API order: opaque and LESS_EQUAL layers, and alpha, additive,
+// premultiplied and multiplicative blended layers with depth writes off or the depth test off.
+void scene_state(Frame& f, uint32_t w, uint32_t h) {
+    Rng rng(0x73746174ull);
+    const float W = static_cast<float>(w), H = static_cast<float>(h);
+    for (int k = 0; k < 60; k++) {
+        const float cx = rng.range(0.2f, 0.8f) * W;
+        const float cy = rng.range(0.2f, 0.8f) * H;
+        Triangle t;
+        const float z0 = rng.range(0.05f, 0.95f);
+        const float alpha = rng.range(0.2f, 0.9f);
+        for (int i = 0; i < 3; i++) {
+            const float dx = rng.range(-0.3f, 0.3f) * W;
+            const float dy = rng.range(-0.3f, 0.3f) * H;
+            Vertex v = vtx(cx + dx, cy + dy, k % 6 == 5 ? z0 : z0 + rng.range(-0.05f, 0.05f), rng.range(0.1f, 1.0f),
+                           rng.range(0.1f, 1.0f), rng.range(0.1f, 1.0f));
+            v.color[3] = (k % 6 == 0 || k % 6 == 5) ? 1.0f : alpha;
+            t.v[i] = v;
+        }
+        switch (k % 6) {
+            case 0: break;   // default state
+            case 1: t.own_state = true; t.depth_func = DepthFunc::Always; t.depth_write = false; t.blend = BlendMode::Alpha; break;
+            case 2: t.own_state = true; t.depth_func = DepthFunc::Less; t.depth_write = false; t.blend = BlendMode::Add; break;
+            case 3: t.own_state = true; t.depth_func = DepthFunc::Always; t.depth_write = false; t.blend = (k / 6) % 2 ? BlendMode::AlphaAdd : BlendMode::Premultiplied; break;
+            case 4: t.own_state = true; t.depth_func = DepthFunc::LessEqual; t.depth_write = false; t.blend = BlendMode::Multiply; break;
+            case 5: t.own_state = true; t.depth_func = DepthFunc::LessEqual; t.depth_write = true; break;
+        }
+        f.triangles.push_back(t);
+    }
+}
+
 // One right triangle whose legs run far past the viewport, so that its edges need guard-band
 // clipping and the hypotenuse still lies beyond the far corner of the viewport.
 void scene_fullscreen(Frame& f, uint32_t w, uint32_t h) {
@@ -300,6 +331,7 @@ const std::vector<SceneInfo>& scene_list() {
         {"fullscreen", "one right triangle covering the viewport, edges beyond the guard band", false},
         {"coplanar_lequal", "overlapping coplanar flat triangles under LESS_EQUAL: the last drawn wins ties", false},
         {"perspective", "a receding floor and 20 large triangles with perspective-correct colours", false},
+        {"state", "60 triangles with their own depth function, depth write and blend state (alpha, add, premultiplied, multiply)", false},
         {"tiny_10k", "10,000 triangles 1 to 6 pixels across", false},
         {"random_10k", "10,000 random triangles, 3 px to a third of the screen, partly off screen", false},
     };
@@ -315,6 +347,7 @@ bool make_scene(const std::string& name, uint32_t width, uint32_t height, Frame&
     else if (name == "fullscreen") scene_fullscreen(out, width, height);
     else if (name == "coplanar_lequal") scene_coplanar(out, width, height);
     else if (name == "perspective") scene_perspective(out, width, height);
+    else if (name == "state") scene_state(out, width, height);
     else if (name == "tiny_10k") scene_tiny(out, width, height);
     else if (name == "random_10k") scene_random(out, width, height);
     else return false;

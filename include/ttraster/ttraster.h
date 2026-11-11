@@ -111,8 +111,26 @@ void ttr_context_destroy(ttr_context* ctx);
 
 int ttr_frame_begin(
     ttr_context* ctx, uint32_t width, uint32_t height, const float clear_color[4], float clear_depth, int depth_func);
-/* verts: 3 per triangle. shading: TTR_SHADE_*. cull: TTR_CULL_* (one mode per frame). */
-int ttr_frame_triangles(ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull);
+/* Depth and blend state of a batch of triangles. Blending: the colour is clamped, blended with the colour in the
+ * target and clamped again (see BlendMode in src/ttraster/frame.h): ALPHA = (SRC_ALPHA, ONE_MINUS_SRC_ALPHA),
+ * ADD = (ONE, ONE), PREMULTIPLIED = (ONE, ONE_MINUS_SRC_ALPHA), MULTIPLY = (DST_COLOR, ZERO),
+ * ALPHA_ADD = (SRC_ALPHA, ONE), the same factors for
+ * RGB and alpha. depth_func TTR_DEPTH_ALWAYS = depth test off. Batches with different state can follow each
+ * other in one frame; triangles are drawn in submission order. */
+enum {
+    TTR_BLEND_NONE = 0, TTR_BLEND_ALPHA = 1, TTR_BLEND_ADD = 2, TTR_BLEND_PREMULTIPLIED = 3, TTR_BLEND_MULTIPLY = 4,
+    TTR_BLEND_ALPHA_ADD = 5 /* (SRC_ALPHA, ONE) */
+};
+typedef struct {
+    int depth_func;   /* TTR_DEPTH_* */
+    int depth_write;  /* nonzero: passing fragments write depth */
+    int blend;        /* TTR_BLEND_* */
+} ttr_state;
+
+/* verts: 3 per triangle. shading: TTR_SHADE_*. cull: TTR_CULL_* (one mode per frame). state: NULL = the frame's
+ * depth function, depth writes on, no blending. */
+int ttr_frame_triangles(
+    ttr_context* ctx, const ttr_vertex* verts, uint32_t n_triangles, int shading, int cull, const ttr_state* state);
 /* Render the frame. rgba: width x height x 4 bytes (row pitch `stride_bytes`, 0 = width * 4); depth: width x height
  * floats or NULL. flip_y != 0 writes the bottom row of the render target first (OpenGL window orientation). */
 int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float* depth, int flip_y);
