@@ -4,7 +4,7 @@
  * fragment ALU work. One frame is a clear plus the draws below, then glFinish and a one-pixel read-back (so the frame is rendered
  * but not copied to a window).
  *
- *   gl_bench [--size WxH] [--frames N] [--tris N] [--layers L] [--alu K]
+ *   gl_bench [--size WxH] [--frames N] [--tris N] [--layers L] [--alu K] [--per-frame]
  *
  *   --tris N     N small triangles tiling the window (fixed-function, per-vertex colours, depth test on)
  *   --layers L   L full-window quads, back to front, no depth test (overdraw); with --alu K each has a GLSL fragment shader of K
@@ -66,13 +66,14 @@ static GLuint make_program(int alu)
 
 int main(int argc, char **argv)
 {
-   int w = 1920, h = 1080, frames = 100, tris = 0, layers = 0, alu = 0;
+   int w = 1920, h = 1080, frames = 100, tris = 0, layers = 0, alu = 0, per_frame = 0;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--size") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &w, &h);
       else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--tris") && i + 1 < argc) tris = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--layers") && i + 1 < argc) layers = atoi(argv[++i]);
       else if (!strcmp(argv[i], "--alu") && i + 1 < argc) alu = atoi(argv[++i]);
+      else if (!strcmp(argv[i], "--per-frame")) per_frame = 1;
    }
    if (!tris && !layers) layers = 1;
    Display *dpy = XOpenDisplay(NULL);
@@ -120,6 +121,7 @@ int main(int argc, char **argv)
    unsigned char px[4];
    for (int f = 0; f < frames + 5; f++) {
       if (f == 5) t0 = now_ms();
+      double tf = now_ms();
       glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
       glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
       if (tris) {
@@ -142,6 +144,7 @@ int main(int argc, char **argv)
       }
       glFinish();
       glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+      if (per_frame) printf("frame %d: %.1f ms\n", f, now_ms() - tf);
    }
    double ms = (now_ms() - t0) / frames;
    printf("%dx%d tris=%d layers=%d alu=%d: %.2f ms/frame, %.1f FPS\n", w, h, ntri, layers, alu, ms, 1000.0 / ms);

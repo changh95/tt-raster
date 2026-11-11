@@ -29,6 +29,10 @@ struct CodegenOptions {
     // The compute kernel's code must fit the 70,656 bytes of kernel text of a core together with the interpreter (the build
     // fails otherwise); a program is compiled only while the estimated size of everything chosen so far stays below this.
     uint32_t max_code_bytes = 36000;
+    // 2: values stay in local registers across instructions while the SFPU's 8 local registers allow it (a lifetime analysis,
+    //    estimates of what each helper needs; the kernel may still fail to build). 1: every result goes to its Dest row and
+    //    is loaded again (always builds). The renderer tries 2, then 1, then the interpreter.
+    uint32_t level = 2;
 };
 
 // The header for `programs` (program i is the one with index i in the frame, as the record's program index says).

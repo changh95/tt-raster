@@ -8,6 +8,8 @@
 
 #include <map>
 #include <memory>
+#include <thread>
+#include <set>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -45,6 +47,9 @@ struct DeviceOptions {
     // kernel is built for the set of programs (about a minute the first time, then cached by tt-metal); also switched on by the
     // environment variable TTR_SHADER_COMPILE=1.
     bool compile_shaders = false;
+    // Code generation level (shader_codegen.h): 2 keeps values in local registers across instructions, 1 does not. render() lowers
+    // it when a kernel fails to build.
+    uint32_t compile_level = 2;
     // Never compile (set when a kernel with compiled shaders failed to build and the frame is run again with the interpreter).
     bool no_compile = false;
     // Extra compile-time defines for the kernels, for experiments (name -> value).
@@ -102,6 +107,9 @@ private:
     // One frame at a time uses the chip (buffers, program, upload, run, read-back); encoding and untiling of
     // frames in other slots overlap with it.
     std::mutex device_mutex_;
+    // Program sets (a key over the programs and a code generation level) whose compiled kernel did not build: not tried again.
+    std::mutex failed_mutex_;
+    std::set<uint64_t> failed_;
 };
 
 // Plans: every tile of the target, split over `cores` in contiguous row-major chunks.

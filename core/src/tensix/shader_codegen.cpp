@@ -2,6 +2,8 @@
 
 #include "tensix/shader_codegen.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdarg>
 #include <cstdio>
 
@@ -24,17 +26,15 @@ struct Writer {
     }
 };
 
-// `sfpi::vFloat <name> = operand;` with the modifiers (absolute value first, then negate). A register is read from its Dest row
-// (compile-time address), except that the result of the previous instruction is still in a local variable (`carry`, the name of that
-// variable) when this instruction can take the extra live value: the SFPU has 8 local registers and the compiler cannot spill a vector
-// ("too few lregs to hold live values"), so values are not kept across more than one instruction.
-void operand(Writer& w, const char* name, uint32_t word, int32_t carry_reg, const std::string& carry) {
+// `sfpi::vFloat <name> = operand;` with the modifiers (absolute value first, then negate). `local` is the name of the local variable
+// that holds the register's value, or empty: then it is read from its Dest row (compile-time address).
+void operand(Writer& w, const char* name, uint32_t word, const std::string& local) {
     const uint32_t idx = word & kSrcIndexMask;
     std::string base;
     if (word & kSrcConst) {
         base = "s.consts[" + std::to_string(idx) + "]";
-    } else if (carry_reg >= 0 && idx == static_cast<uint32_t>(carry_reg)) {
-        base = carry;
+    } else if (!local.empty()) {
+        base = local;
     } else {
         base = "sfpi::dst_reg[kRegBase + " + std::to_string(idx) + "]";
     }
@@ -43,14 +43,23 @@ void operand(Writer& w, const char* name, uint32_t word, int32_t carry_reg, cons
     if (word & kSrcNeg) w.line("        %s = -%s;", name, name);
 }
 
-// Instructions whose own temporaries are few enough to hold one more live value from the previous instruction.
-bool light(uint32_t op) {
+// Local registers (LREGs) an instruction needs while it runs, besides the values live across it: its operands, its result and the
+// temporaries of the helper it expands to (peak live values in ckernel_sfpu_shader.h, with one spare). The SFPU has 8 and the compiler
+// cannot spill a vector ("too few lregs to hold live values"), so the allocator below keeps a value in a local variable across
+// instructions only while all of these fit. The numbers are estimates; a kernel that still fails to build is retried with
+// level 1 (no values kept across instructions) and then with the interpreter.
+uint32_t temporaries(uint32_t op) {
     switch (op) {
-        case kOpMov: case kOpAdd: case kOpMul: case kOpMad: case kOpMin: case kOpMax:
-        case kOpSlt: case kOpSge: case kOpSeq: case kOpSne: case kOpCmp: case kOpSel: case kOpKill: return true;
-        default: return false;
+        case kOpMin: case kOpMax: case kOpCmp: case kOpSel: case kOpKill: return 2;   // a predicated block copies values
+        case kOpSlt: case kOpSge: case kOpSeq: case kOpSne: return 3;
+        case kOpFrc: case kOpFlr: case kOpRcp: case kOpRsq: case kOpSin: case kOpCos: return 4;
+        case kOpSqrt: case kOpEx2: return 5;
+        case kOpLg2: return 6;
+        default: return 0;
     }
 }
+
+constexpr uint32_t kLocalRegisters = 7;   // of the 8, one is kept free for the compiler
 
 // The instruction's computation on a, b, c into d: the interpreter's case bodies (ckernel_sfpu_shader.h, sh_run).
 const char* body(uint32_t op) {
@@ -82,35 +91,84 @@ const char* body(uint32_t op) {
     }
 }
 
-void program(Writer& w, const ShaderProgram& p, uint32_t index) {
-    w.line("// Program %u: %zu instructions, %u registers.", index, p.code.size(), p.num_regs);
+void program(Writer& w, const ShaderProgram& p, uint32_t index, uint32_t level) {
+    const size_t n_instr = p.code.size();
+    w.line("// Program %u: %zu instructions, %u registers, level %u.", index, n_instr, p.num_regs, level);
     w.line("__attribute__((always_inline)) inline void sh_prog_%u(const ShTri& s) {", index);
     w.line("    using namespace ttr::shader;");
-    int32_t carry_reg = -1;      // the register whose value the previous instruction left in a local variable
-    std::string carry;           // ... and the name of that variable
-    for (size_t n = 0; n < p.code.size(); n++) {
+
+    // ---- Which values stay in local variables (level 2) ----------------------------------------------------------------
+    // reaching[n][k]: the instruction whose result source k of instruction n reads (-1: an input or an unwritten register).
+    // last_use[d]: the last instruction that reads the result of d. live_out[d]: d is the final value of an output register.
+    std::vector<std::array<int32_t, 3>> reaching(n_instr, {-1, -1, -1});
+    std::vector<int32_t> last_use(n_instr, -1), def_of(p.num_regs, -1);
+    std::vector<bool> live_out(n_instr, false);
+    // A product that is added to something in a later instruction must not stay in a local variable: the kernels are built with
+    // -ffast-math, which lets the compiler fuse `x * y` and the following `+ z` into one multiply-add with a single rounding. The CPU
+    // reference rounds the product first (that is what the instruction means), and the interpreter cannot fuse because the product goes
+    // through Dest in between. Through Dest it stays here too.
+    std::vector<bool> fusible(n_instr, false);
+    for (size_t n = 0; n < n_instr; n++) {
+        const uint32_t* in = p.code[n].w;
+        const uint32_t op = instr_op(in[0]);
+        for (uint32_t k = 0; k < op_sources(op); k++) {
+            if (in[1 + k] & kSrcConst) continue;
+            const uint32_t r = in[1 + k] & kSrcIndexMask;
+            reaching[n][k] = r < def_of.size() ? def_of[r] : -1;
+            if (reaching[n][k] >= 0) last_use[static_cast<size_t>(reaching[n][k])] = static_cast<int32_t>(n);
+            if (reaching[n][k] >= 0 && (op == kOpAdd || (op == kOpMad && k == 2))) fusible[static_cast<size_t>(reaching[n][k])] = true;
+        }
+        if (op_writes(op) && instr_dst(in[0]) < def_of.size()) def_of[instr_dst(in[0])] = static_cast<int32_t>(n);
+    }
+    for (uint32_t c = 0; c < 4; c++) {
+        if (p.out_reg + c < def_of.size() && def_of[p.out_reg + c] >= 0) live_out[static_cast<size_t>(def_of[p.out_reg + c])] = true;
+    }
+    std::vector<bool> local(n_instr, false);
+    if (level >= 2) {
+        // Registers free for values that are live across instruction n: what is left after its own needs.
+        std::vector<int32_t> room(n_instr), across(n_instr, 0);
+        for (size_t n = 0; n < n_instr; n++) {
+            const uint32_t op = instr_op(p.code[n].w[0]);
+            const uint32_t need = op_sources(op) + temporaries(op) + (op_writes(op) ? 1 : 0);
+            room[n] = static_cast<int32_t>(kLocalRegisters) - static_cast<int32_t>(need);
+        }
+        std::vector<size_t> order;
+        for (size_t n = 0; n < n_instr; n++) {
+            const uint32_t op = instr_op(p.code[n].w[0]);
+            if (op_writes(op) && last_use[n] > static_cast<int32_t>(n) && !(op == kOpMul && fusible[n])) order.push_back(n);
+        }
+        std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) { return last_use[x] - static_cast<int32_t>(x) < last_use[y] - static_cast<int32_t>(y); });
+        for (size_t d : order) {
+            bool fits = true;
+            for (int32_t n = static_cast<int32_t>(d) + 1; n < last_use[d] && fits; n++) fits = across[n] + 1 <= room[n];
+            if (!fits) continue;
+            local[d] = true;
+            for (int32_t n = static_cast<int32_t>(d) + 1; n < last_use[d]; n++) across[n]++;
+        }
+    }
+
+    // ---- Emit ---------------------------------------------------------------------------------------------------------
+    for (size_t n = 0; n < n_instr; n++) {
         const uint32_t* in = p.code[n].w;
         const uint32_t op = instr_op(in[0]);
         const uint32_t sources = op_sources(op);
-        const bool take = light(op);
         w.line("    // %zu", n);
         const std::string dname = "d" + std::to_string(n);
         if (op_writes(op)) w.line("    sfpi::vFloat %s = 0.0f;", dname.c_str());
         w.line("    {");
         if (op_writes(op)) w.line("        sfpi::vFloat& d = %s;", dname.c_str());
-        if (sources >= 1) operand(w, "a", in[1], take ? carry_reg : -1, carry);
-        if (sources >= 2) operand(w, "b", in[2], take ? carry_reg : -1, carry);
-        if (sources >= 3) operand(w, "c", in[3], take ? carry_reg : -1, carry);
+        const char* names[3] = {"a", "b", "c"};
+        for (uint32_t k = 0; k < sources; k++) {
+            const int32_t from = reaching[n][k];
+            // A result that stayed local is read from its variable, anything else from Dest. An instruction that reads the same
+            // register as two operands is fine: the variable is copied.
+            operand(w, names[k], in[1 + k], from >= 0 && local[static_cast<size_t>(from)] ? "d" + std::to_string(from) : std::string());
+        }
         w.line("        %s", body(op));
         if (op_writes(op) && (instr_flags(in[0]) & kFlagSat)) w.line("        d = sh_sat(d);");
         w.line("    }");
-        if (op_writes(op)) {
-            w.line("    sfpi::dst_reg[kRegBase + %u] = %s;", instr_dst(in[0]), dname.c_str());
-            carry_reg = static_cast<int32_t>(instr_dst(in[0]));
-            carry = dname;
-        } else {
-            carry_reg = -1;
-        }
+        // Results that are read from Dest later, and the output registers, are stored; a value that only local readers use is not.
+        if (op_writes(op) && (!local[n] || live_out[n])) w.line("    sfpi::dst_reg[kRegBase + %u] = %s;", instr_dst(in[0]), dname.c_str());
     }
     w.line("}");
     w.line("");
@@ -152,7 +210,7 @@ std::string generate_shader_header(const std::vector<ShaderProgram>& programs, c
         bytes += est;
         chosen.push_back(i);
     }
-    for (uint32_t i : chosen) program(w, programs[i], i);
+    for (uint32_t i : chosen) program(w, programs[i], i, options.level);
     w.line("__attribute__((always_inline)) inline void sh_dispatch(const ShTri& s) {");
     w.line("    switch (s.prog) {");
     for (uint32_t i : chosen) w.line("        case %u: sh_prog_%u(s); break;", i, i);

@@ -32,4 +32,8 @@ scripts/run.sh "$mc_nodes" "$bin/ttr_shader_fuzz" --chips 8 --iters 20 --seed 40
 TTR_SHADER_COMPILE=1 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 12 --seed 1
 TTR_SHADER_COMPILE=1 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 6 --seed 1000 --blend
 TTR_SHADER_COMPILE=1 TTR_SHADER_COMPILE_BYTES=2000000 TTR_SHADER_COMPILE_PROGRAMS=100 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --iters 8 --seed 1000 --blend
+# Every program compiled, however short (and the per-instruction accuracy tests through the compiled path: a product that stays in a local
+# register can be fused with the next add by the compiler, which the reference does not do), including smooth mode with Mad.
+TTR_SHADER_COMPILE=1 TTR_SHADER_COMPILE_MIN=1 scripts/run.sh "$node" "$bin/ttr_shader_ops" all
+TTR_SHADER_COMPILE=1 TTR_SHADER_COMPILE_MIN=1 scripts/run.sh "$node" "$bin/ttr_shader_fuzz" --mode smooth --iters 8 --seed 2000 --blend
 scripts/run.sh "$mc_nodes" "$bin/ttr_multichip" all --chips "$mc_chips" --bench 5

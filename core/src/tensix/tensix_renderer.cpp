@@ -246,6 +246,18 @@ bool env_flag(const char* name) {
     return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// A key over the programs of a frame (code, register counts, interface), for remembering which program sets did not build.
+uint64_t shader_set_key(const std::vector<ShaderProgram>& programs) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    for (const ShaderProgram& p : programs) {
+        mix(p.num_inputs); mix(p.num_regs); mix(p.out_reg); mix(static_cast<uint64_t>(p.fragcoord_reg) + 7);
+        for (const ShaderInstr& in : p.code) for (uint32_t w : in.w) mix(w);
+        mix(0xfeedu);
+    }
+    return h & ~3ull;   // the low two bits carry the level
+}
+
 // A copy of the kernel directory plus the generated shader header, in a cache directory named after the contents (tt-metal caches the
 // kernel binaries by their source, so a program set that was built before costs nothing). TT_RASTER_SHADER_CACHE overrides the
 // location (default ~/.cache/tt-raster/shader-kernels).
@@ -282,22 +294,108 @@ std::string prepare_kernel_dir(const std::string& kernel_dir, const std::string&
 
 }  // namespace
 
+namespace {
+
+struct RasterKernels {
+    tt::tt_metal::KernelHandle reader, writer, compute;
+};
+
+// The three kernels of a frame (reader, writer, compute) with their compile-time arguments and defines; with compiled shaders the compute
+// kernel comes from the generated copy of the kernel directory. 
+RasterKernels create_raster_kernels(
+    Program& program, const CoreRangeSet& core_set, const TensorAccessorArgs& in_args, const TensorAccessorArgs& out_args, const Frame& frame,
+    uint32_t mask, bool shaded, const DeviceOptions& opt) {
+    using namespace tt::tt_metal;
+    // TT_RASTER_KERNEL_DIR overrides the kernel directory (A/B runs of older kernel versions).
+    const char* kdir_env = std::getenv("TT_RASTER_KERNEL_DIR");
+    const std::string kdir = kdir_env != nullptr ? std::string(kdir_env) + "/" : std::string(TT_RASTER_TENSIX_KERNELS);
+    std::vector<uint32_t> reader_args, writer_args;
+    in_args.append_to(reader_args);
+    out_args.append_to(writer_args);
+    std::map<std::string, std::string> reader_defines;
+    if (shaded) reader_defines["RASTER_SHADERS"] = "1";
+    auto reader = CreateKernel(
+        program, kdir + "reader.cpp", core_set,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = reader_args,
+            .defines = reader_defines});
+    std::map<std::string, std::string> defines = opt.defines;
+    if (shaded) {
+        defines["RASTER_SHADERS"] = "1";
+        defines["RASTER_PACKED_COLOUR"] = "1";   // colour in one Dest slot frees three tiles for shader registers
+    }
+    defines["RASTER_PLANE_MASK"] = std::to_string(mask);
+    if (opt.float_planes) {
+        defines["RASTER_FLOAT_PLANES"] = "1";
+    }
+    auto writer = CreateKernel(
+        program, kdir + "writer.cpp", core_set,
+        DataMovementConfig{
+            .processor = DataMovementProcessor::RISCV_1,
+            .noc = NOC::RISCV_1_default,
+            .compile_args = writer_args,
+            .defines = defines});
+
+    if (frame.depth_func == DepthFunc::LessEqual) {   // the specialized path's comparison; Always is per-triangle state
+        defines["RASTER_LESS_EQUAL"] = "1";
+    }
+    if (opt.cover_count) {
+        defines["RASTER_COVER_COUNT"] = "1";
+    }
+    std::string compute_dir = kdir;
+    if (shaded && !opt.no_compile && (opt.compile_shaders || env_flag("TTR_SHADER_COMPILE"))) {
+        uint32_t n_compiled = 0;
+        CodegenOptions copt;
+        copt.level = opt.compile_level;
+        if (const char* v = std::getenv("TTR_SHADER_COMPILE_BYTES")) copt.max_code_bytes = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));   // tests
+        if (const char* v = std::getenv("TTR_SHADER_COMPILE_MIN")) copt.min_instructions = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+        if (const char* v = std::getenv("TTR_SHADER_COMPILE_PROGRAMS")) copt.max_programs = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+        const std::string header = generate_shader_header(frame.shaders, copt, &n_compiled);
+        if (n_compiled > 0) {
+            compute_dir = prepare_kernel_dir(kdir, header);
+            defines["RASTER_COMPILED_SHADERS"] = "1";
+            if (const char* v = std::getenv("TTR_SHADER_COMPILE"); v != nullptr && v[0] == '2') {
+                std::fprintf(stderr, "tensix: compiled %u of %zu shader programs, kernels in %s\n", n_compiled, frame.shaders.size(), compute_dir.c_str());
+            }
+        }
+    }
+    auto compute = CreateKernel(
+        program, compute_dir + "compute.cpp", core_set,
+        ComputeConfig{.fp32_dest_acc_en = true, .dst_full_sync_en = true, .defines = defines});
+
+    return {reader, writer, compute};
+}
+
+}  // namespace
+
 DeviceFrame TensixRenderer::render(
     const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
     const DeviceOptions& opt, Framebuffer* target) {
     const bool compiling = !frame.shaders.empty() && !opt.no_compile && (opt.compile_shaders || env_flag("TTR_SHADER_COMPILE"));
     if (!compiling) return render_impl(frame, setup, bins, plan, opt, target);
-    try {
-        return render_impl(frame, setup, bins, plan, opt, target);
-    } catch (const std::runtime_error& e) {
-        // The kernel with compiled shaders did not build (e.g. its code does not fit the core's kernel text): the interpreter always does.
-        std::string why = e.what();
-        why = why.substr(0, why.find('\n'));
-        std::fprintf(stderr, "tensix: kernel with compiled shaders failed (%s); running the interpreter\n", why.c_str());
-        DeviceOptions plain = opt;
-        plain.no_compile = true;
-        return render_impl(frame, setup, bins, plan, plain, target);
+    // Compiled kernels may not build (the code does not fit the core's kernel text, or the compiler runs out of local registers):
+    // try level 2 (values kept in local registers), then level 1 (everything through Dest), then the interpreter, and remember what failed.
+    const uint64_t key = shader_set_key(frame.shaders);
+    for (uint32_t level = std::min<uint32_t>(opt.compile_level, 2); level >= 1; level--) {
+        {
+            std::lock_guard<std::mutex> lock(failed_mutex_);
+            if (failed_.count(key | level) != 0) continue;
+        }
+        try {
+            DeviceOptions o = opt;
+            o.compile_level = level;
+            return render_impl(frame, setup, bins, plan, o, target);
+        } catch (const std::runtime_error& e) {
+            std::string why = e.what();
+            why = why.substr(0, why.find('\n'));
+            std::fprintf(stderr, "tensix: kernel with compiled shaders (level %u) failed (%s); trying the next level\n", level, why.c_str());
+            std::lock_guard<std::mutex> lock(failed_mutex_);
+            failed_.insert(key | level);
+        }
     }
+    DeviceOptions plain = opt;
+    plain.no_compile = true;
+    return render_impl(frame, setup, bins, plan, plain, target);
 }
 
 DeviceFrame TensixRenderer::render_impl(
@@ -465,60 +563,10 @@ DeviceFrame TensixRenderer::render_impl(
         }
     }
 
-    // TT_RASTER_KERNEL_DIR overrides the kernel directory (A/B runs of older kernel versions).
-    const char* kdir_env = std::getenv("TT_RASTER_KERNEL_DIR");
-    const std::string kdir = kdir_env != nullptr ? std::string(kdir_env) + "/" : std::string(TT_RASTER_TENSIX_KERNELS);
-    std::vector<uint32_t> reader_args, writer_args;
-    TensorAccessorArgs(*in_buf->get_backing_buffer()).append_to(reader_args);
-    TensorAccessorArgs(*out_buf->get_backing_buffer()).append_to(writer_args);
-    std::map<std::string, std::string> reader_defines;
-    if (shaded) reader_defines["RASTER_SHADERS"] = "1";
-    auto reader = CreateKernel(
-        program, kdir + "reader.cpp", core_set,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_0, .noc = NOC::RISCV_0_default, .compile_args = reader_args,
-            .defines = reader_defines});
-    std::map<std::string, std::string> defines = opt.defines;
-    if (shaded) {
-        defines["RASTER_SHADERS"] = "1";
-        defines["RASTER_PACKED_COLOUR"] = "1";   // colour in one Dest slot frees three tiles for shader registers
-    }
-    defines["RASTER_PLANE_MASK"] = std::to_string(mask);
-    if (opt.float_planes) {
-        defines["RASTER_FLOAT_PLANES"] = "1";
-    }
-    auto writer = CreateKernel(
-        program, kdir + "writer.cpp", core_set,
-        DataMovementConfig{
-            .processor = DataMovementProcessor::RISCV_1,
-            .noc = NOC::RISCV_1_default,
-            .compile_args = writer_args,
-            .defines = defines});
-
-    if (frame.depth_func == DepthFunc::LessEqual) {   // the specialized path's comparison; Always is per-triangle state
-        defines["RASTER_LESS_EQUAL"] = "1";
-    }
-    if (opt.cover_count) {
-        defines["RASTER_COVER_COUNT"] = "1";
-    }
-    std::string compute_dir = kdir;
-    if (shaded && !opt.no_compile && (opt.compile_shaders || env_flag("TTR_SHADER_COMPILE"))) {
-        uint32_t n_compiled = 0;
-        CodegenOptions copt;
-        if (const char* v = std::getenv("TTR_SHADER_COMPILE_BYTES")) copt.max_code_bytes = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));   // tests
-        if (const char* v = std::getenv("TTR_SHADER_COMPILE_PROGRAMS")) copt.max_programs = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
-        const std::string header = generate_shader_header(frame.shaders, copt, &n_compiled);
-        if (n_compiled > 0) {
-            compute_dir = prepare_kernel_dir(kdir, header);
-            defines["RASTER_COMPILED_SHADERS"] = "1";
-            if (const char* v = std::getenv("TTR_SHADER_COMPILE"); v != nullptr && v[0] == '2') {
-                std::fprintf(stderr, "tensix: compiled %u of %zu shader programs, kernels in %s\n", n_compiled, frame.shaders.size(), compute_dir.c_str());
-            }
-        }
-    }
-    auto compute = CreateKernel(
-        program, compute_dir + "compute.cpp", core_set,
-        ComputeConfig{.fp32_dest_acc_en = true, .dst_full_sync_en = true, .defines = defines});
+    const RasterKernels kernels = create_raster_kernels(
+        program, core_set, TensorAccessorArgs(*in_buf->get_backing_buffer()), TensorAccessorArgs(*out_buf->get_backing_buffer()), frame, mask,
+        shaded, opt);
+    const auto reader = kernels.reader, writer = kernels.writer, compute = kernels.compute;
 
     for (size_t c = 0; c < plan.size(); c++) {
         const CoreCoord core = plan[c].core;
