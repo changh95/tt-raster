@@ -100,7 +100,7 @@ stripes from `gl_FragCoord`, `discard`, a loop of `sin`, conditionals, a uniform
 
 ![GLSL fragment shaders drawn on a Tensix chip](../docs/images/gl_fragment_shaders.gif)
 
-A Phong-lit sphere at 1024 x 1024 takes 73 ms per frame on stock softpipe and 9.7 ms on one chip (4.6 ms of it in the
+The test scene (a few large triangles) with the per-pixel Phong shader at 1024 x 1024 takes 73 ms per frame on stock softpipe and 9.7 ms on one chip (4.6 ms of it in the
 rasterizer, 2.2 ms on the device; the rest is Mesa's own work and the read-back); `docs/PERF.md`.
 
 ## Limits and what comes next
