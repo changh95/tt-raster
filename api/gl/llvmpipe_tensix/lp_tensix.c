@@ -509,6 +509,8 @@ state_refused(struct lp_tensix *t)
    if (!nir || BITSET_LAST_BIT(nir->info.textures_used) || BITSET_LAST_BIT(nir->info.images_used) || nir->info.num_ssbos ||
        nir->info.num_textures || nir->info.num_images || nir->info.fs.uses_fbfetch_output || nir->info.writes_memory)
       return "textures, images or storage buffers";
+   if (nir->info.outputs_written & (BITFIELD64_BIT(FRAG_RESULT_DEPTH) | BITFIELD64_BIT(FRAG_RESULT_STENCIL) | BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)))
+      return "shader writes depth, stencil or sample mask";
    const char *nir_why = shader_nir_refused(t, nir);
    if (nir_why)
       return nir_why;
