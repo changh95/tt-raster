@@ -4,6 +4,8 @@
 
 #include <algorithm>
 
+#include "ttraster/parallel.h"
+
 namespace ttr {
 
 namespace {
@@ -134,26 +136,89 @@ TileParams make_tile_params(const SetupTriangle& t, int tx, int ty) {
     return p;
 }
 
+namespace {
+
+struct BinCounts {
+    uint64_t entries = 0, full = 0, rejected = 0;
+};
+
+// Bin the triangles that touch tile rows [row_lo, row_hi] into those rows. Triangles are visited in API order, so the
+// bins of those rows come out exactly as in a pass over all rows. `rows` (optional) holds tile_y0 | tile_y1 << 16 of
+// every triangle: a band skips the triangles outside its rows by reading 4 bytes instead of a whole SetupTriangle.
+void bin_rows(const std::vector<SetupTriangle>& tris, const uint32_t* rows, uint32_t tiles_x, int row_lo, int row_hi,
+              std::vector<std::vector<BinEntry>>& bins, BinCounts& n) {
+    for (uint32_t i = 0; i < tris.size(); i++) {
+        if (rows) {
+            const int y0 = static_cast<int>(rows[i] & 0xFFFFu), y1 = static_cast<int>(rows[i] >> 16);
+            if (y1 < row_lo || y0 > row_hi) continue;
+        }
+        const SetupTriangle& t = tris[i];
+        const int y0 = std::max(t.tile_y0, row_lo), y1 = std::min(t.tile_y1, row_hi);
+        for (int ty = y0; ty <= y1; ty++) {
+            for (int tx = t.tile_x0; tx <= t.tile_x1; tx++) {
+                const TileCoverage c = classify_tile(t, tx, ty);
+                if (c == TileCoverage::Reject) {
+                    n.rejected++;
+                    continue;
+                }
+                bins[static_cast<size_t>(ty) * tiles_x + tx].push_back({i, c});
+                n.entries++;
+                n.full += c == TileCoverage::Full;
+            }
+        }
+    }
+}
+
+}  // namespace
+
 void bin_triangles(const SetupResult& setup, uint32_t tiles_x, uint32_t tiles_y, TileBins& b) {
     b.tiles_x = tiles_x;
     b.tiles_y = tiles_y;
     b.entries = b.full_entries = b.rejected = 0;
     b.bins.resize(static_cast<size_t>(tiles_x) * tiles_y);
     for (auto& v : b.bins) v.clear();
-    for (uint32_t i = 0; i < setup.tris.size(); i++) {
-        const SetupTriangle& t = setup.tris[i];
-        for (int ty = t.tile_y0; ty <= t.tile_y1; ty++) {
-            for (int tx = t.tile_x0; tx <= t.tile_x1; tx++) {
-                const TileCoverage c = classify_tile(t, tx, ty);
-                if (c == TileCoverage::Reject) {
-                    b.rejected++;
-                    continue;
-                }
-                b.bins[static_cast<size_t>(ty) * tiles_x + tx].push_back({i, c});
-                b.entries++;
-                b.full_entries += c == TileCoverage::Full;
-            }
+
+    // Tile rows are independent: a bin belongs to exactly one row, and one thread bins a band of rows walking the
+    // triangles in API order. Small frames stay on the calling thread.
+    constexpr size_t kParallelMinTris = 2048;
+    constexpr uint64_t kParallelMinPairs = 16384;    // (tile, triangle) candidate pairs worth waking the pool for
+    constexpr uint32_t kRowsPerBand = 1;
+    const std::vector<SetupTriangle>& tris = setup.tris;
+    uint64_t pairs = 0;
+    for (size_t i = 0; i < tris.size() && pairs < kParallelMinPairs; i++) {
+        pairs += static_cast<uint64_t>(tris[i].tile_x1 - tris[i].tile_x0 + 1) *
+                 static_cast<uint64_t>(tris[i].tile_y1 - tris[i].tile_y0 + 1);
+    }
+    if (tris.size() < kParallelMinTris || pairs < kParallelMinPairs || tiles_y < 2 || tiles_y > 0xFFFFu) {
+        BinCounts n;
+        bin_rows(tris, nullptr, tiles_x, 0, static_cast<int>(tiles_y) - 1, b.bins, n);
+        b.entries = n.entries;
+        b.full_entries = n.full;
+        b.rejected = n.rejected;
+        return;
+    }
+
+    std::vector<uint32_t> rows(tris.size());
+    constexpr size_t kChunk = 4096;
+    parallel_for((tris.size() + kChunk - 1) / kChunk, 0, [&](size_t c) {
+        const size_t end = std::min(tris.size(), (c + 1) * kChunk);
+        for (size_t i = c * kChunk; i < end; i++) {
+            rows[i] = static_cast<uint32_t>(tris[i].tile_y0) | static_cast<uint32_t>(tris[i].tile_y1) << 16;
         }
+    });
+    const size_t bands = (tiles_y + kRowsPerBand - 1) / kRowsPerBand;
+    std::vector<BinCounts> counts(bands);
+    parallel_for(bands, 0, [&](size_t band) {
+        const int lo = static_cast<int>(band * kRowsPerBand);
+        const int hi = std::min<int>(lo + kRowsPerBand, static_cast<int>(tiles_y)) - 1;
+        BinCounts local;   // counted in a local: neighbouring entries of `counts` share a cache line
+        bin_rows(tris, rows.data(), tiles_x, lo, hi, b.bins, local);
+        counts[band] = local;
+    });
+    for (const BinCounts& n : counts) {
+        b.entries += n.entries;
+        b.full_entries += n.full;
+        b.rejected += n.rejected;
     }
 }
 

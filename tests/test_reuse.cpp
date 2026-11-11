@@ -54,6 +54,30 @@ bool same_bins(const TileBins& a, const TileBins& b) {
     return true;
 }
 
+// The binning contract written out plainly: triangles in API order, tiles in row-major order, exact classification.
+TileBins naive_bins(const SetupResult& setup, uint32_t tiles_x, uint32_t tiles_y) {
+    TileBins b;
+    b.tiles_x = tiles_x;
+    b.tiles_y = tiles_y;
+    b.bins.resize(static_cast<size_t>(tiles_x) * tiles_y);
+    for (uint32_t i = 0; i < setup.tris.size(); i++) {
+        const SetupTriangle& t = setup.tris[i];
+        for (int ty = t.tile_y0; ty <= t.tile_y1; ty++) {
+            for (int tx = t.tile_x0; tx <= t.tile_x1; tx++) {
+                const TileCoverage c = classify_tile(t, tx, ty);
+                if (c == TileCoverage::Reject) {
+                    b.rejected++;
+                    continue;
+                }
+                b.bins[static_cast<size_t>(ty) * tiles_x + tx].push_back({i, c});
+                b.entries++;
+                b.full_entries += c == TileCoverage::Full;
+            }
+        }
+    }
+    return b;
+}
+
 Frame big_frame(uint32_t w, uint32_t h) {
     // More than 4 chunks of 4096 triangles, so setup_frame takes its multi-threaded path.
     Frame f, g;
@@ -86,6 +110,8 @@ int main() {
         const TileBins fresh_bins = bin_triangles(fresh, f.tiles_x(), f.tiles_y());
         bin_triangles(res, f.tiles_x(), f.tiles_y(), bins);
         CHECK_MSG(same_bins(bins, fresh_bins), "bins differ at step %zu", step);
+        // The banded multi-threaded binning must equal the plain loop (big and mid frames take the parallel path).
+        CHECK_MSG(same_bins(bins, naive_bins(res, f.tiles_x(), f.tiles_y())), "bins differ from the plain loop at step %zu", step);
     }
     return ttr_test::finish();
 }
