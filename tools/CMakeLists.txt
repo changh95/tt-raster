@@ -21,4 +21,7 @@ if(TT_RASTER_BUILD_DEVICE)
 
     add_executable(ttr_multichip ttr_multichip.cpp)
     target_link_libraries(ttr_multichip PRIVATE ttraster_tensix)
+
+    add_executable(ttr_shader_ops ttr_shader_ops.cpp)
+    target_link_libraries(ttr_shader_ops PRIVATE ttraster_tensix)
 endif()

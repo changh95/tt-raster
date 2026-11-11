@@ -166,11 +166,16 @@ __attribute__((always_inline)) inline sfpi::vFloat sh_lg2(sfpi::vFloat x) {
     return e + t * s * 2.88539008f;   // 2 / ln 2
 }
 
-// sin(x): reduce to [-pi, pi], fold to [-pi/2, pi/2], odd Taylor polynomial of degree 11 (error 6e-8 at pi/2).
-__attribute__((always_inline)) inline sfpi::vFloat sh_sin(sfpi::vFloat x) {
+// sin and cos: reduce the argument to [-pi, pi] (a multiple of 2 pi in two parts), shift by pi/2 for cos, fold to
+// [-pi/2, pi/2] and evaluate an odd Taylor polynomial of degree 11 (error 6e-8 at pi/2). Shifting after the reduction keeps
+// the cos error at that of sin (shifting before would add the rounding error of the large argument).
+__attribute__((always_inline)) inline sfpi::vFloat sh_reduce(sfpi::vFloat x) {
     sfpi::vFloat k = sh_round(x * 0.159154943f);
     sfpi::vFloat r = x - k * 6.28318548f;
-    r = r + k * 1.74845553e-7f;                // 2 pi = 6.28318548 - 1.7484555e-7 (second part of the constant)
+    return r + k * 1.74845553e-7f;             // 2 pi = 6.28318548 - 1.7484555e-7 (second part of the constant)
+}
+
+__attribute__((always_inline)) inline sfpi::vFloat sh_sin_folded(sfpi::vFloat r) {
     v_if (r > 1.57079633f) { r = 3.14159265f - r; }
     v_endif;
     v_if (r < -1.57079633f) { r = -3.14159265f - r; }
@@ -239,8 +244,8 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
             }
             case kOpEx2: d = sh_ex2(a); break;
             case kOpLg2: d = sh_lg2(a); break;
-            case kOpSin: d = sh_sin(a); break;
-            case kOpCos: d = sh_sin(a + 1.57079633f); break;
+            case kOpSin: d = sh_sin_folded(sh_reduce(a)); break;
+            case kOpCos: d = sh_sin_folded(sh_reduce(a) + 1.57079633f); break;
             case kOpSlt: d = 0.0f; v_if (a < b) { d = 1.0f; } v_endif; break;
             case kOpSge: d = 0.0f; v_if (a >= b) { d = 1.0f; } v_endif; break;
             case kOpSeq: d = 0.0f; v_if (a == b) { d = 1.0f; } v_endif; break;
