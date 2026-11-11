@@ -85,6 +85,15 @@ class RenderData:
         self.outputs: dict[str, Any] = {}          # Isaac Lab kind -> ProxyArray
         self._host_bufs: dict[str, np.ndarray] = {}  # ttraster output name -> persistent host array
         self.native: tuple[str, ...] = ()
+        # Asynchronous rendering (cfg.async_rendering): two sets of host images (a frame in flight owns one while the previous
+        # frame is published from the other), the frame in flight as (ticket, set index, capture metadata), the frame counter,
+        # the metadata snapshot of the capture about to be submitted (prepare_capture) and of the one just published.
+        self._sets: list[dict[str, np.ndarray]] = [{}, {}]
+        self._inflight: tuple[int, int, dict | None] | None = None
+        self._frames = 0
+        self._started = False
+        self.capture: dict | None = None
+        self.ready_capture: dict | None = None
 
     def set_outputs(self, output_data: dict) -> None:
         unsupported = [k for k in output_data if str(k) not in _NATIVE]
@@ -94,6 +103,8 @@ class RenderData:
             )
         self.outputs = {str(k): v for k, v in output_data.items()}
         self.native = tuple(dict.fromkeys(_NATIVE[k][0] for k in self.outputs))
+        self._sets = [{}, {}]
+        self._started = False
 
     def update(self, positions, orientations, intrinsics) -> None:
         self.camera_poses = bridge.camera_poses_opengl(_host(positions), _host(orientations))
@@ -136,6 +147,7 @@ class TtRasterRenderer(BaseRenderer):
         self.backend = None
         self._warned_geometry = False
         self.last_stats: dict | None = None
+        self._async_cameras = 0
 
     def initialize(self) -> None:
         self.backend = self._sim.get_or_create_backend(self.newton_cfg)
@@ -172,9 +184,14 @@ class TtRasterRenderer(BaseRenderer):
             )
         if self._scene is not None and spec.num_instances != self._scene.num_worlds:
             raise ValueError(f"camera has {spec.num_instances} instances, the Newton model has {self._scene.num_worlds} worlds")
-        return RenderData(spec, self.cfg)
+        if self.cfg.async_rendering and self._async_cameras >= 1:
+            raise NotImplementedError("async_rendering supports one camera per renderer (two frames in flight at most)")
+        render_data = RenderData(spec, self.cfg)
+        self._async_cameras += 1 if self.cfg.async_rendering else 0
+        return render_data
 
     def set_outputs(self, render_data: RenderData, output_data: dict[str, ProxyArray]) -> None:
+        self._drain(render_data)
         render_data.set_outputs(output_data)
 
     def update_transforms(self) -> None:
@@ -203,6 +220,9 @@ class TtRasterRenderer(BaseRenderer):
         if render_data.camera is None or render_data.camera_poses is None:
             raise RuntimeError("update_camera() must be called before render()")
         self._sync_scene()
+        if self.cfg.async_rendering:
+            self._render_async(render_data)
+            return
         images, stats = self._scene.render(
             render_data.camera, render_data.camera_poses, render_data.native, out=render_data._host_bufs
         )
@@ -210,13 +230,80 @@ class TtRasterRenderer(BaseRenderer):
         self.last_stats = stats
         render_data.publish(images, self.cfg.depth_clipping_behavior)
 
-    def read_output(self, render_data: RenderData, camera_data: CameraData) -> None:
-        pass  # the images were written into the bound buffers by render()
+    def prepare_capture(self, render_data: RenderData, camera_data: CameraData, frame: ProxyArray) -> None:
+        """Snapshot the metadata of the capture about to be submitted; it is delivered with its image one step later."""
+        if not self.cfg.async_rendering:
+            return
+        import warp as wp
+        from isaaclab.utils.warp import ProxyArray as _ProxyArray
+
+        render_data.capture = {
+            name: _ProxyArray(wp.clone(value.warp))
+            for name, value in (
+                ("pos_w", camera_data.pos_w),
+                ("quat_w_world", camera_data.quat_w_world),
+                ("intrinsic_matrices", camera_data.intrinsic_matrices),
+                ("frame", frame),
+            )
+        }
+
+    def reset(self, render_data: RenderData, env_ids=None) -> None:
+        """Drop the frame in flight (an observation from before the reset); the next capture waits for a fresh image."""
+        self._drain(render_data)
+        render_data._started = False
+        render_data.ready_capture = None
+
+    def _render_async(self, rd: RenderData) -> None:
+        """Start this step's frame and publish the previous one (see ``TtRasterRendererCfg.async_rendering``)."""
+        slot = rd._frames % 2
+        rd._frames += 1
+        capture, rd.capture = rd.capture, None
+        ticket = self._scene.submit(rd.camera, rd.camera_poses, rd.native, out=rd._sets[slot])
+        if rd._inflight is None and not rd._started:
+            # The first capture (or the first after a reset) has no predecessor: wait for it, so that the buffers hold a valid image.
+            images, stats = self._scene.collect(ticket)
+            rd._sets[slot] = images
+            rd._started = True
+            self.last_stats = stats
+            rd.publish(images, self.cfg.depth_clipping_behavior)
+            rd.ready_capture = capture
+            return
+        # Record the new frame first: if collecting the previous one fails, the new one is still owned and gets drained.
+        previous, rd._inflight = rd._inflight, (ticket, slot, capture)
+        if previous is not None:
+            images, stats = self._scene.collect(previous[0])
+            rd._sets[previous[1]] = images
+            self.last_stats = stats
+            rd.publish(images, self.cfg.depth_clipping_behavior)
+            rd.ready_capture = previous[2]
+        # else: the second capture; the buffers still hold the first image, which is the previous one
+
+    def _drain(self, rd: RenderData) -> None:
+        """Wait for the frame in flight of this camera and drop it."""
+        if rd._inflight is not None and self._scene is not None:
+            ticket, slot, _ = rd._inflight
+            rd._inflight = None
+            try:
+                rd._sets[slot], _ = self._scene.collect(ticket)
+            except Exception:  # a failed frame is dropped with the rest
+                logger.exception("ttraster: dropping a frame in flight")
+
+    def read_output(self, render_data: RenderData, camera_data: CameraData | None = None) -> None:
+        """The images were written into the bound buffers by render(); with async_rendering the metadata of the image that
+        was just delivered goes into ``camera_data.info[output]["capture"]`` (the pose, calibration and frame indices it was
+        rendered with, as Isaac Lab defines for delayed captures)."""
+        capture, render_data.ready_capture = render_data.ready_capture, None
+        if capture is not None and camera_data is not None and camera_data.info is not None:
+            for name in camera_data.info:
+                camera_data.info[name] = {**(camera_data.info[name] or {}), "capture": capture}
 
     def cleanup(self, render_data: RenderData | None) -> None:
         if render_data is not None:
+            self._drain(render_data)
             render_data.outputs = {}
             render_data._host_bufs = {}
+            render_data._sets = [{}, {}]
+            self._async_cameras = max(0, self._async_cameras - (1 if self.cfg.async_rendering else 0))
 
     def close(self) -> None:
         if self._scene is not None:

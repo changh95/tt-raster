@@ -37,6 +37,16 @@ class TtRasterRendererCfg(RendererCfg):
     near_distance: float = 0.01
     """Near clip [m] used when the camera spawn config carries no clipping range."""
 
+    async_rendering: bool = False
+    """Trade one capture of camera latency for pipelined rendering (the pattern of ``OVRTXRendererCfg.async_rendering``).
+    Defaults to False (synchronous).
+
+    ``render()`` starts the frame of the current step and returns the previous capture, so the chip renders while the
+    physics step and the policy run and a step costs the longer of the two instead of their sum. The first capture and the
+    first capture after a reset wait for a fresh image; the second repeats the first. Live pose and calibration fields stay
+    current; ``camera.data.info[output_name]["capture"]`` carries the image's matching ``pos_w``, ``quat_w_world``,
+    ``intrinsic_matrices`` and per-environment ``frame`` indices. One camera per renderer."""
+
     depth_clipping_behavior: Literal["max", "zero", "none"] = "none"
     """``"max"`` replaces the depth of pixels that hit nothing with the far clip; ``"zero"`` and ``"none"`` leave 0."""
 

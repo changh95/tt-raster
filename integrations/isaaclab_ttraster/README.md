@@ -52,8 +52,19 @@ Semantic and instance segmentation, HDR colour, lens distortion, ISP pipelines, 
 geometry (`geometry_offsets`), principal point offsets. Attribute interpolation is screen-linear and lighting
 per-vertex.
 
+## Asynchronous rendering
+
+`TtRasterRendererCfg(async_rendering=True)` follows the delayed-capture pattern of Isaac Lab (`OVRTXRendererCfg.async_rendering`): the chip
+renders while the physics step and the policy run, and every camera returns its previous capture. `prepare_capture` snapshots the pose, calibration
+and frame indices of the capture being submitted, `render()` submits it and publishes the previous one, and `read_output` puts the snapshot that
+belongs to the published image into `camera.data.info[output]["capture"]`. The first capture and the first one after `reset()` wait for a fresh
+image (the second repeats the first, without new `capture` metadata). The price is one step of latency in the observations; the gain is that a
+step costs the longer of the simulation and one frame instead of their sum (1,024 environments, 96 x 96, 356,000 triangles, x8 chip: 67 ms
+down to 31 ms per step with 20 ms of other work; `docs/PERF.md`, `validation/bench_isaaclab_shim.py`). One camera per renderer. Checked
+against the Isaac Lab stand-ins, bit for bit against synchronous renders of the same states (`validation/test_isaaclab_shim.py`).
+
 ## Cost
 
-The v1 data path reads poses to the host, rasterizes, and copies images back to the output buffers (a host to
+The data path reads poses to the host, rasterizes, and copies images back to the output buffers (a host to
 device copy when those live on a GPU). On the x8-link chip a 1,024-environment, 96 x 96 depth frame takes about 33
 ms in the renderer (`docs/PERF.md`); an Isaac Lab step adds its own copies and the GPU synchronization.

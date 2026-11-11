@@ -240,6 +240,18 @@ Empty tiles are no longer sent to the chip (`MultiChipRenderer`): a tile with no
 
 A process-wide CPU census explains why the first version of the pipeline gained little: a synchronous frame burned 443 ms of CPU time (12 cores busy on average, 65 ms of it system time) before the pool, mostly in creating and joining threads; with the pool the frame is shorter but uses more cores while it runs (750 ms of CPU, 23 cores), so the host stages are now CPU-bound when two frames overlap.
 
+### Isaac Lab renderer: asynchronous rendering (`async_rendering`)
+
+`TtRasterRendererCfg.async_rendering` uses the pipeline above the way Isaac Lab's delayed captures do (`OVRTXRendererCfg.async_rendering`, `BaseRenderer.prepare_capture`): `render()` submits the frame of the current step, collects the frame of the previous step and publishes it into the camera's buffers, so the chip renders while the physics step and the policy run, at the price of one step of latency in the camera observations (the first capture and the first after a reset wait for a fresh image; the pose, calibration and frame indices of the delivered image come with it in `camera.data.info[output]["capture"]`). `validation/bench_isaaclab_shim.py` (stand-ins for Isaac Lab, a real Newton model of 1,024 environments with coarse shape tessellation: 356,352 triangles per frame, 96 x 96, `distance_to_camera`, node 5 = x8 chip, median of 30 steps, a sleep stands in for physics and policy):
+
+| Other work per step | Synchronous step | `render()` blocks | Asynchronous step | `render()` blocks |
+| --- | --- | --- | --- | --- |
+| 0 ms | 41.4 ms | 41.4 ms | 20.4 ms | 20.4 ms |
+| 20 ms | 67.0 ms | 46.9 ms | 31.3 ms | 11.2 ms |
+| 40 ms | 87.4 ms | 47.3 ms | 47.2 ms | 7.1 ms |
+
+Without other work the step is the pipelined frame time (two frames in flight between `submit` and `collect`); with other work it is the larger of the work and one frame's latency (31 ms here), plus what `render()` still does on the calling thread (pose update, collect, copying the image into the output buffer). The synchronous shim costs 41 ms where the C API alone takes 25 to 30 ms in `docs/PERF.md` above because the Newton bridge recomputes instance poses and the output buffers are copied once more. With the default tessellation of the same model (3.2 million triangles per frame) a synchronous frame takes 135 ms and an asynchronous step with 20 ms of work 90 ms (one run).
+
 ## OpenGL: glxgears through Mesa (Track G)
 
 `scripts/run_gl.sh 5 [--backend off] glxgears -geometry WxH`, Xvfb, Mesa 26.3.0 softpipe on this host's CPU (single-threaded, the stock driver) against the same Mesa with the Tensix fast path on the x8 chip (node 5), three 5-second windows each, host load average about 6:

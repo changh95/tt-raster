@@ -174,6 +174,94 @@ def main():
     check(float(np.median(rel2)) < 2e-3 and changed > 0.5,
           f"second frame follows the new body poses (median depth error {np.median(rel2):.2e}, largest change vs frame 1 {changed:.2f} m)")
 
+    # Asynchronous rendering (Isaac Lab's delayed-capture pattern): each step the sensor calls update_camera, prepare_capture, render and
+    # read_output; render() starts this step's frame and publishes the previous one (the first call waits for its own frame, the second
+    # repeats it) and read_output hands the metadata that belongs to the published image to camera_data.info[output]["capture"]. Compared bit
+    # for bit with synchronous renders of the same states and camera poses.
+    shapes = {"rgba": 4, "depth": 1, "normals": 3}
+    dtypes = {"rgba": wp.uint8, "depth": wp.float32, "normals": wp.float32}
+
+    def make_bufs():
+        return {k: wp.zeros((W, N, N, c), dtype=dtypes[k], device="cpu") for k, c in shapes.items()}
+
+    def cam_at(i):
+        """Camera position and the Isaac Lab sensor's camera data for step i (the camera moves from step to step)."""
+        p = np.tile(cam_pos + np.array([0.25 * i, 0.1 * i, 0.0], dtype=np.float32), (W, 1))
+        return wp.array(p, dtype=wp.vec3f, device="cpu")
+
+    class CameraData:
+        def __init__(self):
+            self.pos_w = self.quat_w_world = self.intrinsic_matrices = None
+            self.info = {k: None for k in shapes}   # the camera allocates one (empty) entry per output
+
+    narrow_cfg = types.SimpleNamespace(**{**vars(cam_cfg), "data_types": list(shapes)})
+    narrow_spec = stubs.CameraRenderSpec(cfg=narrow_cfg, device="cpu", num_instances=W, camera_prim_paths=("/c",), view_count=W)
+    states = [wp.array(TB.pose_bodies(model, W, np.random.default_rng(100 + i)), dtype=wp.transformf, device="cpu") for i in range(6)]
+
+    def drive(renderer, rdata, bufs, steps, first=0, reset_at=None):
+        """The camera sensor's call sequence for `steps` steps; returns [(images, camera data)] per step."""
+        cd = CameraData()
+        cd.quat_w_world, cd.intrinsic_matrices = Proxy(ori), Proxy(intr)
+        out = []
+        for i in range(first, first + steps):
+            if reset_at == i:
+                renderer.reset(rdata, None)
+            sim.backend.published = states[i]
+            cd.pos_w = Proxy(cam_at(i))
+            renderer.update_camera(rdata, cd.pos_w, cd.quat_w_world, cd.intrinsic_matrices)
+            renderer.prepare_capture(rdata, cd, Proxy(wp.array(np.full(W, i, dtype=np.int64), dtype=wp.int64, device="cpu")))
+            renderer.render_batch([rdata])
+            renderer.read_output(rdata, cd)
+            out.append(({k: v.numpy().copy() for k, v in bufs.items()}, {k: (dict(v) if v else v) for k, v in cd.info.items()}))
+        return out
+
+    # One renderer (a process opens the chip once); async_rendering is read at every render() call.
+    rs = ra = r
+    rds = rs.create_render_data(narrow_spec)
+    bs = make_bufs()
+    rs.set_outputs(rds, {k: Proxy(v) for k, v in bs.items()})
+    sync_out = drive(rs, rds, bs, len(states))
+    check(all(info[k] is None for _, info in sync_out for k in shapes), "a synchronous renderer adds no capture metadata")
+    r.cfg.async_rendering = True
+    rda = ra.create_render_data(narrow_spec)
+    ba = make_bufs()
+    ra.set_outputs(rda, {k: Proxy(v) for k, v in ba.items()})
+    got = drive(ra, rda, ba, len(states))
+    expect = [0, 0, 1, 2, 3, 4]   # step whose frame each call shows: the first call waits for itself, then one step behind
+    same = [all(np.array_equal(got[k][0][name], sync_out[expect[k]][0][name]) for name in shapes) for k in range(len(states))]
+    check(all(same), f"async rendering shows the frames of steps {expect} bit for bit, camera moving (per step: {same})")
+    check(not np.array_equal(got[2][0]["depth"], got[3][0]["depth"]), "consecutive async frames differ (bodies and camera moved)")
+    # Capture metadata: delivered with the first image, absent on the repeated second call, then the previous step's pose and frame index.
+    frames = [None if got[k][1]["rgba"] is None or "capture" not in got[k][1]["rgba"] else int(got[k][1]["rgba"]["capture"]["frame"].warp.numpy()[0])
+              for k in range(len(states))]
+    check(frames == [0, 0, 1, 2, 3, 4], f"info['rgba']['capture']['frame'] names the step of the pixels per call: {frames}")
+    cap = got[4][1]["depth"]["capture"]
+    check(np.allclose(cap["pos_w"].warp.numpy(), cam_at(3).numpy()) and set(cap) == {"pos_w", "quat_w_world", "intrinsic_matrices", "frame"},
+          "the capture carries the camera position of the step it shows (a snapshot, not the live value)")
+    check(ra.last_stats is not None, "the stats of the last collected frame are kept")
+    try:
+        ra.create_render_data(narrow_spec)
+        check(False, "a second async camera is rejected")
+    except NotImplementedError:
+        check(True, "a second async camera is rejected")
+    # Re-binding the outputs drains the frame in flight; the next frame is waited for like the first one.
+    ba2 = make_bufs()
+    ra.set_outputs(rda, {k: Proxy(v) for k, v in ba2.items()})
+    sim.backend.published = states[5]
+    ra.update_camera(rda, Proxy(cam_at(5)), Proxy(ori), Proxy(intr))
+    ra.render(rda)
+    check(all(np.array_equal(ba2[k].numpy(), sync_out[5][0][k]) for k in shapes), "after set_outputs the first async frame is waited for")
+    # reset() drops the frame in flight: the call after it shows its own frame again.
+    ra.reset(rda, None)
+    got2 = drive(ra, rda, ba2, 4, first=0, reset_at=2)
+    expect2 = [0, 0, 2, 2]   # steps 0, 1 as at the start; after the reset step 2 waits for itself, step 3 repeats it
+    same2 = [all(np.array_equal(got2[k][0][name], sync_out[expect2[k]][0][name]) for name in shapes) for k in range(4)]
+    check(all(same2), f"after reset() the next capture shows its own frame (steps {expect2}; per step {same2})")
+    ra.render(rda)   # leave a frame in flight, then clean up
+    ra.cleanup(rda)
+    r.cfg.async_rendering = False
+    rs.cleanup(rds)
+
     # Unsupported requests fail loudly instead of returning empty buffers.
     bad = stubs.CameraRenderSpec(cfg=types.SimpleNamespace(**{**vars(cam_cfg), "data_types": ["semantic_segmentation"]}),
                                  device="cpu", num_instances=W, camera_prim_paths=("/x",), view_count=W)

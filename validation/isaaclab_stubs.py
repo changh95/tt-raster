@@ -115,6 +115,14 @@ class CameraRenderSpec:
     view_count: int
 
 
+class ProxyArray:
+    """isaaclab.utils.warp.ProxyArray: a warp array with a torch view (no torch here)."""
+
+    def __init__(self, warp_array):
+        self.warp = warp_array
+        self.torch = None
+
+
 class SceneDataFormat:
     class Transform:
         transforms = None
@@ -146,6 +154,7 @@ def install():
     mod("isaaclab.renderers.camera_render_spec", CameraRenderSpec=CameraRenderSpec)
     mod("isaaclab.renderers.renderer_cfg", RendererCfg=RendererCfg)
     mod("isaaclab.utils", configclass=dataclasses.dataclass)
+    mod("isaaclab.utils.warp", ProxyArray=ProxyArray)
     mod("isaaclab.scene_data", REQUIRES_STAGE_AND_MODEL=REQUIRES_STAGE_AND_MODEL, SceneDataFormat=SceneDataFormat)
     mod("isaaclab.sim", SimulationContext=SimulationContext)
     mod("isaaclab_newton")

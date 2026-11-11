@@ -293,6 +293,13 @@ class NewtonScene:
     def render(self, camera, camera_poses, outputs=("depth",), light_direction=None, out=None):
         return self.scene.render(camera, camera_poses, outputs, light_direction, out)
 
+    def submit(self, camera, camera_poses, outputs=("depth",), light_direction=None, out=None):
+        """Start a frame with the poses set by the last :meth:`update`; see :meth:`ttraster.Scene.submit`."""
+        return self.scene.submit(camera, camera_poses, outputs, light_direction, out)
+
+    def collect(self, ticket):
+        return self.scene.collect(ticket)
+
     def backend_report(self):
         return self.scene.backend_report()
 
