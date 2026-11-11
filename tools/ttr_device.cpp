@@ -4,10 +4,12 @@
 //
 //   scripts/run.sh <nodes> build/tools/ttr_device [scene|all] [--size WxH] [--mode crops|grid]
 //                  [--tile tx,ty] [--cores N] [--png DIR] [--bench R] [--define NAME=VALUE]...
-//                  [--colour-only]
+//                  [--colour-only] [--plan-stats]
 //
 //   crops   one core draws a set of 32x32 tiles of the scene in turn (Phase 2.1 and 2.2)
 //   grid    every tile of the target, split over N worker cores (Phase 2.3, default all cores)
+//   balanced  the production plan: contiguous chunks of equal estimated cost (plan_balanced); --plan-stats prints how the
+//           records and the shader instructions spread over the cores
 //   --bench R   after the checks, run the frame R more times and report device time statistics
 //   --define    extra kernel compile-time define, for experiments (affects the checks too)
 //   --colour-only  read back only the colour plane (production read-back; checks image only)
@@ -109,7 +111,7 @@ int main(int argc, char** argv) {
     std::string which = "all", mode = "crops", png_dir;
     uint32_t w = 1920, h = 1088, n_cores = 0;
     int tile_x = -1, tile_y = -1, bench = 0;
-    bool colour_only = false, strict = false, golden = false;
+    bool colour_only = false, strict = false, golden = false, plan_stats = false;
     std::map<std::string, std::string> defines;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -129,6 +131,8 @@ int main(int argc, char** argv) {
             golden = true;
         } else if (a == "--strict") {
             strict = true;
+        } else if (a == "--plan-stats") {
+            plan_stats = true;
         } else if (a == "--colour-only") {
             colour_only = true;
         } else if (a == "--define" && i + 1 < argc) {
@@ -165,7 +169,9 @@ int main(int argc, char** argv) {
         const Framebuffer ref = render_reference(frame, setup, bins);
 
         std::vector<CorePlan> plan;
-        if (mode == "grid") {
+        if (mode == "balanced") {   // the plan of the production path: contiguous chunks of equal estimated cost
+            plan = plan_balanced(cores, all_tiles(frame.tiles_x(), frame.tiles_y()), bins);
+        } else if (mode == "grid") {
             plan = plan_row_major(cores, frame.tiles_x(), frame.tiles_y());
         } else {
             CorePlan cp;
@@ -249,6 +255,27 @@ int main(int argc, char** argv) {
                 std::printf("\n");
                 all_ok &= bad == 0;
             }
+        }
+        if (plan_stats) {
+            // How the plan spreads the work: records and tiles per core, and the instructions the shader records will execute.
+            std::vector<double> recs, instr;
+            for (const CorePlan& cp : plan) {
+                double r = 0, n = 0;
+                for (auto& [tx, ty] : cp.tiles) {
+                    for (const BinEntry& e : bins.tile(tx, ty)) {
+                        r += 1;
+                        const SetupTriangle& st = setup.tris[e.tri];
+                        if (st.shader != 0) n += frame.shaders[st.shader - 1].code.size();
+                    }
+                }
+                recs.push_back(r);
+                instr.push_back(n);
+            }
+            std::sort(recs.begin(), recs.end());
+            std::sort(instr.begin(), instr.end());
+            auto q = [](const std::vector<double>& v, double f) { return v.empty() ? 0.0 : v[static_cast<size_t>(f * static_cast<double>(v.size() - 1))]; };
+            std::printf("    plan: records per core min %.0f / median %.0f / max %.0f; shader instructions per core min %.0f / median %.0f / max %.0f\n",
+                        q(recs, 0), q(recs, 0.5), q(recs, 1), q(instr, 0), q(instr, 0.5), q(instr, 1));
         }
         if (bench > 0) {
             std::vector<double> t_dev, t_all;

@@ -220,6 +220,11 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
         const volatile uint32_t* in = s.code + n * kInstrWords;
         const uint32_t w0 = in[0];
         const uint32_t op = instr_op(w0);
+#ifdef RASTER_EXP_SH_DECODE_ONLY   // timing experiment: read the instruction, issue nothing
+        if (op == kOpCount) { sfpi::dst_reg[kRegBase] = 0.0f; }
+        (void)in[1]; (void)in[2]; (void)in[3];
+        continue;
+#endif
         sfpi::vFloat a = sh_src(in[1], s.consts);
         sfpi::vFloat b = sh_src(in[2], s.consts);   // unused operands are zero: they read register 0, harmlessly
         sfpi::vFloat c = sh_src(in[3], s.consts);
@@ -264,7 +269,11 @@ __attribute__((always_inline)) inline void sh_run(const ShTri& s) {
             default: break;
         }
         if (instr_flags(w0) & kFlagSat) { d = sh_sat(d); }
+#ifndef RASTER_EXP_SH_NOSTORE
         sfpi::dst_reg[kRegBase + instr_dst(w0)] = d;
+#else
+        if (op == kOpCount) { sfpi::dst_reg[kRegBase + instr_dst(w0)] = d; }
+#endif
     }
 }
 

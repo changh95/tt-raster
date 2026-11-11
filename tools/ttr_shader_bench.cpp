@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -23,13 +24,25 @@ using namespace ttr::shader;
 
 namespace {
 
+bool g_regs_only = false;     // --regs: the independent Mad has register operands only (no constant: SFPLOADI with a runtime immediate)
+bool g_independent = false;   // --indep: instruction i reads only the inputs and writes one of 8 registers (no dependency chain)
+
 ShaderProgram make_chain(uint32_t op, int k) {
     ShaderBuilder sb(2);   // u, v
     const uint32_t out = sb.alloc4();
     const uint32_t acc = sb.alloc();
+    uint32_t extra[8];
+    for (auto& e : extra) e = sb.alloc();
     sb.emit_to(kOpMov, acc, sb.in(0));
+    for (auto e : extra) sb.emit_to(kOpMov, e, sb.in(1));
     const ShaderBuilder::Src z{0};
     for (int i = 0; i < k; i++) {
+        if (g_independent && op == kOpMad) {
+            const uint32_t d = extra[i % 8];
+            if (g_regs_only) sb.emit_to(kOpMad, d, sb.in(0), sb.in(1), sb.in(1));
+            else sb.emit_to(kOpMad, d, sb.in(0), sb.constant(0.9f), sb.in(1));
+            continue;
+        }
         switch (op) {
             case kOpMad: sb.emit_to(kOpMad, acc, sb.reg(acc), sb.constant(0.9f), sb.in(1)); break;
             case kOpMul: sb.emit_to(kOpMul, acc, sb.reg(acc), sb.constant(0.99f)); break;
@@ -51,8 +64,19 @@ ShaderProgram make_chain(uint32_t op, int k) {
 
 int main(int argc, char** argv) {
     int runs = 20;
+    std::string only;
+    std::map<std::string, std::string> defines;   // extra kernel defines (timing experiments)
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--runs" && i + 1 < argc) runs = std::atoi(argv[++i]);
+        const std::string a = argv[i];
+        if (a == "--runs" && i + 1 < argc) runs = std::atoi(argv[++i]);
+        else if (a == "--op" && i + 1 < argc) only = argv[++i];
+        else if (a == "--indep") g_independent = true;
+        else if (a == "--regs") g_independent = g_regs_only = true;
+        else if (a == "--define" && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            const size_t eq = kv.find('=');
+            defines[kv.substr(0, eq)] = eq == std::string::npos ? "1" : kv.substr(eq + 1);
+        }
     }
     auto mesh = tt::tt_metal::distributed::MeshDevice::create_unit_mesh(0);
     TensixRenderer renderer(mesh);
@@ -60,6 +84,7 @@ int main(int argc, char** argv) {
     const uint32_t W = 1920, H = 1088;
     std::printf("%-5s %5s %12s %12s %20s\n", "op", "K", "device ms", "ms vs K=0", "ns per instr per vector (busiest core)");
     for (uint32_t op : {kOpMad, kOpMul, kOpRcp, kOpEx2, kOpSin, kOpSlt}) {
+        if (!only.empty() && std::to_string(op) != only) continue;
         double base = 0.0;
         for (int k : {0, 8, 32, 128}) {
             Frame f;
@@ -88,6 +113,7 @@ int main(int argc, char** argv) {
             const auto plan = plan_row_major(cores, f.tiles_x(), f.tiles_y());
             DeviceOptions opt;
             opt.debug_planes = false;
+            opt.defines = defines;
             renderer.render(f, setup, bins, plan, opt);   // warm-up (kernel build)
             std::vector<double> t;
             for (int r = 0; r < runs; r++) t.push_back(renderer.render(f, setup, bins, plan, opt).times.device_ms);
