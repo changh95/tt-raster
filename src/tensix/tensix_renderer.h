@@ -55,6 +55,7 @@ struct DeviceTimes {
     double upload_ms = 0;    // host to device DRAM
     double device_ms = 0;    // enqueue, run, finish (includes kernel launch; JIT cached after the first run)
     double readback_ms = 0;  // device DRAM to host, untilize into the framebuffer
+    double read_ms = 0;      // of which: the device-to-host transfer alone (the rest is untilizing)
     uint64_t records = 0;
     uint64_t blocks = 0;
     uint64_t vec_partial = 0, vec_full = 0;  // SFPU vectors the kernel will process (rejected ones are skipped)

@@ -208,12 +208,12 @@ Reading: device and read-back shrink with the chip count (read-back runs on eigh
 
 ## Tiled-camera rendering for Isaac Lab (Track I)
 
-`validation/bench_scene.py`, 1,024 environments of 96 x 96, 316 triangles per environment (pole capsule 4 x 16), poses change every frame, median of 5 frames after a warm-up, outputs copied to host memory. Chips: one x8 chip (node 5) or all eight of the tray.
+`validation/bench_scene.py`, 1,024 environments of 96 x 96, 316 triangles per environment (pole capsule 4 x 16), poses change every frame, median of 9 frames after a warm-up, outputs written into preallocated host arrays. Chips: one x8 chip (node 5), one x1 chip (node 0) or all eight of the tray. Seven of the eight chips have x1 PCIe links, so which chip is used matters (see below).
 
-| Outputs | Passes | 1 chip: frame | 1 chip: images/s | 8 chips: frame |
-| --- | --- | --- | --- | --- |
-| depth | 1 | 36.5 ms | 28,000 | 40.9 ms |
-| rgb + depth | 1 | 44.9 ms | 22,800 | 47.2 ms |
-| depth, shape, rgb, normals | 2 | 86.9 ms | 11,800 | 88.1 ms |
+| Outputs | Passes | 1 chip, x8: frame | 1 chip, x8: images/s | 1 chip, x1: frame | 8 chips: frame |
+| --- | --- | --- | --- | --- | --- |
+| depth | 1 | 32.8 ms | 31,200 | 63.3 ms | 32.8 ms |
+| rgb + depth | 1 | 39.2 ms | 26,100 | 78.7 ms | 38.3 ms |
+| depth, shape, rgb, normals | 2 | 77.4 ms | 13,200 | 165.7 ms | 75.7 ms |
 
-Breakdown of the 1-chip depth frame (ms): vertex stage 3.4, setup 6.1, binning 1.6, record encoding 2.5, upload 3.0, device kernels 1.4, read-back 7.6, frame construction 2.4, output assembly 5.2. CPU reference backend, same scene, depth: 827 ms for 1,024 environments (256: 219 ms). History of the 1-chip depth frame: 126 ms (serial setup 25 ms, assembly 27 ms), 57 ms after parallelizing the host stages, 36.5 ms after reusing the frame's triangle storage (frame construction 20.6 ms to 2.4 ms). Quality against Newton Warp is in FINDINGS.md.
+Breakdown of the depth frame (ms), slowest chip where several: vertex stage 3.3, setup 4.6, binning 1.5, record encoding 2.5, upload 3.0 (x1 chip: 14.0), device kernels 1.4, read-back 8.1 (transfer 4.9, untiling 3.2; x1 chip: 27.6 with 24.2 transfer), frame construction 2.6, output assembly 2.7. With eight chips: upload 2.4, device 0.9, read-back 8.1 (transfer 6.9), so the transfer of an eighth of the data per chip takes as long as the whole frame's transfer on the x8 chip. CPU reference backend, same scene, depth: 827 ms for 1,024 environments (256: 219 ms). History of the 1-chip (x8) depth frame: 126 ms (serial setup 25 ms, assembly 27 ms), 57 ms after parallelizing the host stages, 36.5 ms after reusing the frame's triangle storage (frame construction 20.6 ms to 2.4 ms), 32.8 ms after reusing setup and bin storage (setup 6.1 to 4.6 ms, binning 1.6 to 1.5 ms) and writing into preallocated output arrays (assembly 5.2 to 2.7 ms). Quality against Newton Warp is in FINDINGS.md.

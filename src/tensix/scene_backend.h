@@ -31,6 +31,10 @@ public:
 private:
     MultiChipRenderer mc_;
     Timings last_;
+    // Kept between frames so a render loop reuses the (tens of MB) triangle and bin storage.
+    SetupResult setup_;
+    SetupWorkspace setup_ws_;
+    TileBins bins_;
 };
 
 std::unique_ptr<scene::Backend> make_tensix_backend(size_t n_chips);

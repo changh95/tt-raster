@@ -254,13 +254,15 @@ The whole-image figures are lower because of silhouette pixels (one renderer hit
 
 **Speed** (`validation/bench_scene.py`: 1,024 environments of 96 x 96, 316 triangles each, poses change every frame, median of 5 frames, frame = everything from poses to output arrays in host memory):
 
-| Outputs | Passes | CPU reference (64 threads for the host stages) | Tensix, 1 chip (x8 link) | Tensix, 8 chips |
-| --- | --- | --- | --- | --- |
-| depth | 1 | 827 ms | 36.5 ms (28,000 images/s) | 40.9 ms |
-| rgb + depth | 1 | | 44.9 ms | 47.2 ms |
-| depth, shape, rgb, normals | 2 | | 86.9 ms | 88.1 ms |
+| Outputs | Passes | CPU reference (64 threads for the host stages) | Tensix, 1 chip, x8 link (node 5) | Tensix, 1 chip, x1 link (node 0) | Tensix, 8 chips |
+| --- | --- | --- | --- | --- | --- |
+| depth | 1 | 827 ms | 32.8 ms (31,200 images/s) | 63.3 ms (16,200 images/s) | 32.8 ms (31,200 images/s) |
+| rgb + depth | 1 | | 39.2 ms | 78.7 ms | 38.3 ms |
+| depth, shape, rgb, normals | 2 | | 77.4 ms | 165.7 ms | 75.7 ms |
 
-For scale only: Newton's Warp ray tracer on this host's CPU needs about 1.3 ms per environment (10 ms for 8), which says nothing about its GPU speed; the comparison that matters, against Newton on a GPU, was not possible here. Where a frame goes (depth, 1 chip): vertex stage 3.4 ms, setup 6, binning 1.6, record encoding 2.5, upload 3, **device 1.4**, read-back 7.6, frame construction 2.4, output assembly 5.2. The kernels are not the bottleneck: the Tensix draws 324,000 triangles into 9.4 million pixels in 1.4 ms. Frame time is host work and PCIe, and it is serial per frame, so eight chips do not beat one x8 chip (seven of the eight chips have x1 links, about 3 GB/s each, and the per-chip work is too small to matter). Two host fixes were worth 2x: reusing the frame's triangle storage between frames (a fresh 35 MB allocation cost 21 ms in page faults) and running setup, assembly and untiling on all host threads (frame time 126 ms to 57 ms to 36.5 ms). What would help next, in order: keep setup and bins in reused storage, keep outputs on the device in tile layout (I.6 stretch), send transforms instead of triangles (device vertex stage, I.3), and overlap frames (asynchronous capture).
+Seven of the eight chips of a tray sit on x1 PCIe links (`current_link_width` in sysfs), only node 5 has x8; the result depends on which chip is used: a depth frame moves 12 MB of triangle records to the chip and 38 MB of depth back, and the x1 chips manage only about 0.9 GB/s up and 1.6 GB/s down in this path (upload 14.0 ms and read-back 27.6 ms against 3.0 and 8.1 ms on node 5). All eight chips together are as fast as the x8 chip, because every chip then moves an eighth of the data.
+
+For scale only: Newton's Warp ray tracer on this host's CPU needs about 1.3 ms per environment (10 ms for 8), which says nothing about its GPU speed; the comparison that matters, against Newton on a GPU, was not possible here. Where a frame goes (depth, node 5): vertex stage 3.3 ms, setup 4.6, binning 1.5, record encoding 2.5, upload 3.0, **device 1.4**, read-back 8.1 (transfer 4.9, untiling 3.2), frame construction 2.6, output assembly 2.7 (into reused output arrays). The kernels are not the bottleneck: the Tensix draws 324,000 triangles into 9.4 million pixels in 1.4 ms. Frame time is host work and PCIe, and it is serial per frame, so eight chips do not beat one x8 chip. With eight chips the slowest chip's transfer still takes 6.9 ms for an eighth of the data, so the reads of different chips do not scale as eight independent links would (cause not found; the aggregate stays near 5.5 GB/s). Two host fixes were worth 2x: reusing the frame's triangle storage between frames (a fresh 35 MB allocation cost 21 ms in page faults) and running setup, assembly and untiling on all host threads (frame time 126 ms to 57 ms to 36.5 ms); reusing setup and bin storage between frames and passing preallocated output arrays then took it to 32.8 ms. What would help next, in order: keep outputs on the device in tile layout (I.6 stretch), send transforms instead of triangles (device vertex stage, I.3), and overlap frames (asynchronous capture).
 
 ### Incident: chip 0 stuck after a hang, and how it was recovered (2026-11-11)
 

@@ -170,7 +170,7 @@ std::vector<Pt> clip_polygon(std::vector<Pt> poly, const ClipRect& r) {
     return clean;
 }
 
-SetupResult setup_frame(const Frame& frame) {
+void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
     const uint32_t pw = frame.padded_width(), ph = frame.padded_height();
     const bool has_viewports = !frame.viewports.empty();
     ClipRect frame_guard{};
@@ -188,8 +188,7 @@ SetupResult setup_frame(const Frame& frame) {
         }
     }
 
-    SetupResult res;
-
+    res.stats = SetupStats{};
     res.stats.input = frame.triangles.size();
     auto process = [&](uint32_t src, std::vector<SetupTriangle>& tris, SetupStats& stats) {
         const Triangle& tri = frame.triangles[src];
@@ -242,7 +241,9 @@ SetupResult setup_frame(const Frame& frame) {
             outside_guard |= p[0] < guard.x0 || p[0] > guard.x1 || p[1] < guard.y0 || p[1] > guard.y1;
         }
 
-        std::vector<std::array<Pt, 3>> pieces;
+        // Reused per thread: a heap allocation per input triangle would dominate this stage.
+        thread_local std::vector<std::array<Pt, 3>> pieces;
+        pieces.clear();
         if (!outside_guard) {
             pieces.push_back(g);
         } else {
@@ -293,33 +294,54 @@ SetupResult setup_frame(const Frame& frame) {
     const size_t n_chunks = (n + kChunk - 1) / kChunk;
     const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
     if (n < 4 * kChunk || hw == 1) {
+        res.tris.clear();
         for (uint32_t src = 0; src < n; src++) process(src, res.tris, res.stats);
-        return res;
+        return;
     }
-    std::vector<std::vector<SetupTriangle>> parts(n_chunks);
-    std::vector<SetupStats> part_stats(n_chunks);
+    if (ws.parts.size() < n_chunks) ws.parts.resize(n_chunks);
+    ws.part_stats.assign(n_chunks, SetupStats{});
+    for (size_t c = 0; c < n_chunks; c++) ws.parts[c].clear();
+    const size_t n_threads = std::min(hw, n_chunks);
+
+    auto run_threads = [&](auto&& body) {
+        std::vector<std::thread> pool;
+        for (size_t t = 0; t < n_threads; t++) pool.emplace_back(body);
+        for (auto& th : pool) th.join();
+    };
+
     std::atomic<size_t> next{0};
-    std::vector<std::thread> pool;
-    for (size_t t = 0; t < std::min(hw, n_chunks); t++) {
-        pool.emplace_back([&] {
-            for (size_t c = next++; c < n_chunks; c = next++) {
-                for (size_t src = c * kChunk; src < std::min(n, (c + 1) * kChunk); src++) {
-                    process(static_cast<uint32_t>(src), parts[c], part_stats[c]);
-                }
+    run_threads([&] {
+        for (size_t c = next++; c < n_chunks; c = next++) {
+            for (size_t src = c * kChunk; src < std::min(n, (c + 1) * kChunk); src++) {
+                process(static_cast<uint32_t>(src), ws.parts[c], ws.part_stats[c]);
             }
-        });
-    }
-    for (auto& th : pool) th.join();
-    size_t total = 0;
-    for (const auto& p : parts) total += p.size();
-    res.tris.reserve(total);
+        }
+    });
+
+    // Concatenate in parallel into the persistent output. Elements are only default-constructed when
+    // the frame has more triangles than any earlier one, so a steady-state loop does no page faults here.
+    ws.offset.assign(n_chunks + 1, 0);
     for (size_t c = 0; c < n_chunks; c++) {
-        res.tris.insert(res.tris.end(), parts[c].begin(), parts[c].end());
-        const SetupStats& st = part_stats[c];
+        ws.offset[c + 1] = ws.offset[c] + ws.parts[c].size();
+        const SetupStats& st = ws.part_stats[c];
         res.stats.accepted += st.accepted; res.stats.pieces += st.pieces; res.stats.clipped_sources += st.clipped_sources;
         res.stats.non_finite += st.non_finite; res.stats.out_of_range += st.out_of_range; res.stats.degenerate += st.degenerate;
         res.stats.culled += st.culled; res.stats.off_screen += st.off_screen;
     }
+    // (No clear() before this resize: the old elements stay and are overwritten by the copy below.)
+    res.tris.resize(ws.offset[n_chunks]);
+    next = 0;
+    run_threads([&] {
+        for (size_t c = next++; c < n_chunks; c = next++) {
+            std::copy(ws.parts[c].begin(), ws.parts[c].end(), res.tris.begin() + static_cast<std::ptrdiff_t>(ws.offset[c]));
+        }
+    });
+}
+
+SetupResult setup_frame(const Frame& frame) {
+    SetupResult res;
+    SetupWorkspace ws;
+    setup_frame(frame, res, ws);
     return res;
 }
 

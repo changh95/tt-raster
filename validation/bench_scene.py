@@ -37,6 +37,7 @@ def main():
     base = np.zeros((sc.num_instances, 7), dtype=np.float32)
     base[:, 6] = 1
     walls, last = [], None
+    bufs = {}  # persistent output arrays, as an RL loop would keep them
     for rep in range(args.reps + 1):
         poses = base.copy().reshape(W, 4, 7)
         for w in range(W):
@@ -47,7 +48,7 @@ def main():
             poses[w, 3] = (x, 0, 1.0, *S.quat_y(th))
         sc.set_instance_poses(poses.reshape(-1, 7))
         t0 = time.perf_counter()
-        out, st = sc.render(cam, cams, outputs)
+        bufs, st = sc.render(cam, cams, outputs, out=bufs)
         walls.append((time.perf_counter() - t0) * 1000)
         last = st
     walls = sorted(walls[1:])  # the first call compiles kernels and warms caches

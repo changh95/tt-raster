@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -84,7 +85,17 @@ ClipRect guard_rect(uint32_t padded_width, uint32_t padded_height);
 // edge clip it to the same points and stay watertight.
 std::vector<std::array<int64_t, 2>> clip_polygon(std::vector<std::array<int64_t, 2>> poly, const ClipRect& rect);
 
+// Scratch storage of setup_frame that survives between frames. Pass the same workspace and result
+// to every call of a render loop: the buffers keep their capacity, so no frame pays for page faults.
+struct SetupWorkspace {
+    std::vector<std::vector<SetupTriangle>> parts;
+    std::vector<SetupStats> part_stats;
+    std::vector<std::size_t> offset;
+};
+
 // Whole-frame setup. Throws std::invalid_argument if the padded target exceeds kMaxTargetSize.
 SetupResult setup_frame(const Frame& frame);
+// Same result, written into `res` (previous content is replaced) using `ws` as scratch.
+void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws);
 
 }  // namespace ttr

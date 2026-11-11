@@ -146,13 +146,24 @@ class Scene:
     def backend_report(self):
         return _l().ttr_backend_report(self._h).decode()
 
-    def render(self, camera, camera_poses, outputs=("depth",), light_direction=None):
-        """Returns ({name: array [worlds, H, W, C]}, stats dict)."""
+    def render(self, camera, camera_poses, outputs=("depth",), light_direction=None, out=None):
+        """Returns ({name: array [worlds, H, W, C]}, stats dict).
+
+        `out` may hold preallocated C-contiguous arrays (name -> array of the right shape and dtype) that
+        are filled in place; a render loop should pass the same ones every frame, since fresh multi-MB
+        arrays cost page faults on every frame. Outputs missing from `out` are allocated."""
         W, H = self.num_worlds, camera.height
-        out, ptrs = {}, _Images()
+        out = {} if out is None else dict(out)
+        ptrs = _Images()
         for name in outputs:
             dt, ch = _CHANNELS[name]
-            out[name] = np.zeros((W, H, camera.width, ch), dtype=dt)
+            shape = (W, H, camera.width, ch)
+            if name in out:
+                a = out[name]
+                if a.shape != shape or a.dtype != np.dtype(dt) or not a.flags["C_CONTIGUOUS"]:
+                    raise ValueError(f"output '{name}' must be a C-contiguous {np.dtype(dt).name} array of shape {shape}")
+            else:
+                out[name] = np.zeros(shape, dtype=dt)
             setattr(ptrs, name, out[name].ctypes.data)
         cam = _Camera(camera.width, camera.height, camera.focal_length, camera.horizontal_aperture,
                       camera.vertical_aperture, camera.near_clip, camera.far_clip)

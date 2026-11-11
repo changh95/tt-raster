@@ -122,11 +122,12 @@ TileParams make_tile_params(const SetupTriangle& t, int tx, int ty) {
     return p;
 }
 
-TileBins bin_triangles(const SetupResult& setup, uint32_t tiles_x, uint32_t tiles_y) {
-    TileBins b;
+void bin_triangles(const SetupResult& setup, uint32_t tiles_x, uint32_t tiles_y, TileBins& b) {
     b.tiles_x = tiles_x;
     b.tiles_y = tiles_y;
+    b.entries = b.full_entries = b.rejected = 0;
     b.bins.resize(static_cast<size_t>(tiles_x) * tiles_y);
+    for (auto& v : b.bins) v.clear();
     for (uint32_t i = 0; i < setup.tris.size(); i++) {
         const SetupTriangle& t = setup.tris[i];
         for (int ty = t.tile_y0; ty <= t.tile_y1; ty++) {
@@ -142,6 +143,11 @@ TileBins bin_triangles(const SetupResult& setup, uint32_t tiles_x, uint32_t tile
             }
         }
     }
+}
+
+TileBins bin_triangles(const SetupResult& setup, uint32_t tiles_x, uint32_t tiles_y) {
+    TileBins b;
+    bin_triangles(setup, tiles_x, tiles_y, b);
     return b;
 }
 

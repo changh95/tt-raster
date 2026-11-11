@@ -348,6 +348,7 @@ DeviceFrame TensixRenderer::render(
     t0 = Clock::now();
     std::vector<uint32_t>& raw = raw_;
     distributed::EnqueueReadMeshBuffer(cq, raw, out_buf, true);
+    out.times.read_ms = ms_since(t0);
     // Untile: a tile holds four 16x16 faces (TL, TR, BL, BR), each row-major, so every face row is a
     // 16-word copy into the frame. Colour is a plain copy; depth is a plain copy; the id plane is
     // stored as floats and converted.

@@ -100,5 +100,8 @@ struct TileBins {
 };
 
 TileBins bin_triangles(const SetupResult& setup, uint32_t tiles_x, uint32_t tiles_y);
+// Same result, written into `out` (previous content is replaced). The per-tile vectors keep their
+// capacity between calls, so a render loop does not reallocate them every frame.
+void bin_triangles(const SetupResult& setup, uint32_t tiles_x, uint32_t tiles_y, TileBins& out);
 
 }  // namespace ttr
