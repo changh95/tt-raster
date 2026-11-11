@@ -256,6 +256,72 @@ void copy_planes(
 
 }  // namespace
 
+namespace {
+
+// Depth rows into a driver's surface (ttr_depth_target): float as it is, unorm formats rounded like the drivers do (double: 1.0 * 16777215 + 0.5
+// must not round up to 2^24), stencil bits of the combined formats kept.
+void write_depth_rows(const ttr::Framebuffer& fb, uint32_t width, uint32_t height, const ttr_depth_target& d, int flip_y) {
+    constexpr uint32_t kRowsPerItem = 32;
+    const size_t items = (height + kRowsPerItem - 1) / kRowsPerItem;
+    ttr::parallel_for(items, 0, [&](size_t item) {
+        const uint32_t y0 = static_cast<uint32_t>(item) * kRowsPerItem, y1 = std::min(height, y0 + kRowsPerItem);
+        for (uint32_t y = y0; y < y1; y++) {
+            const uint32_t src_y = flip_y ? height - 1 - y : y;
+            const float* src = &fb.depth[fb.index(0, src_y)];
+            uint8_t* row = d.data + static_cast<size_t>(y) * d.stride_bytes;
+            if (d.format == TTR_DEPTH_F32) {
+                std::memcpy(row, src, static_cast<size_t>(width) * 4);
+                continue;
+            }
+            uint32_t* d32 = reinterpret_cast<uint32_t*>(row);
+            uint16_t* d16 = reinterpret_cast<uint16_t*>(row);
+            for (uint32_t x = 0; x < width; x++) {
+                const double z = src[x] < 0.0f ? 0.0 : src[x] > 1.0f ? 1.0 : static_cast<double>(src[x]);
+                switch (d.format) {
+                    case TTR_DEPTH_U32: d32[x] = static_cast<uint32_t>(z * 4294967295.0 + 0.5); break;
+                    case TTR_DEPTH_U16: d16[x] = static_cast<uint16_t>(z * 65535.0 + 0.5); break;
+                    case TTR_DEPTH_U24_LOW: d32[x] = (d32[x] & 0xff000000u) | static_cast<uint32_t>(z * 16777215.0 + 0.5); break;
+                    case TTR_DEPTH_U24_HIGH: d32[x] = (d32[x] & 0xffu) | (static_cast<uint32_t>(z * 16777215.0 + 0.5) << 8); break;
+                    case TTR_DEPTH_U24_LOW_X: d32[x] = static_cast<uint32_t>(z * 16777215.0 + 0.5); break;
+                    case TTR_DEPTH_U24_HIGH_X: d32[x] = static_cast<uint32_t>(z * 16777215.0 + 0.5) << 8; break;
+                    default: break;
+                }
+            }
+        }
+    });
+}
+
+}  // namespace
+
+int ttr_frame_end_depth(
+    ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, uint32_t color_flags, const ttr_depth_target* depth, int flip_y) {
+    try {
+        if (!ctx->open) {
+            g_error = "ttr_frame_end outside a frame";
+            return -1;
+        }
+        ctx->open = false;
+        const ttr::Frame& f = ctx->frame;
+        const uint32_t planes = (rgba || !depth ? ttr::kRenderColor : 0u) | (depth ? ttr::kRenderDepth : 0u);
+        const auto t0 = std::chrono::steady_clock::now();
+        const ttr::Framebuffer& fb = ctx->backend->render(f, planes);
+        const auto t1 = std::chrono::steady_clock::now();
+        ctx->report = ctx->backend->report();
+        ctx->ended = true;
+        copy_planes(fb, f.width, f.height, rgba, stride_bytes != 0 ? stride_bytes : f.width * 4, color_flags, nullptr, flip_y);
+        if (depth) write_depth_rows(fb, f.width, f.height, *depth, flip_y);
+        const auto t2 = std::chrono::steady_clock::now();
+        char buf[96];
+        std::snprintf(buf, sizeof buf, " | render %.1f copy-out %.1f ms", std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                      std::chrono::duration<double, std::milli>(t2 - t1).count());
+        ctx->report += buf;
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
 int ttr_frame_end_ex(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, uint32_t color_flags, float* depth, int flip_y) {
     try {
         if (!ctx->open) {

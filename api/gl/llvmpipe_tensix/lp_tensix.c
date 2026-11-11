@@ -57,6 +57,13 @@ typedef struct {
 enum { TTR_SHADE_LINEAR = 0, TTR_SHADE_FLAT = 1, TTR_SHADE_PERSPECTIVE = 2 };
 enum { TTR_OUT_SWAP_RB = 1, TTR_OUT_OPAQUE = 2 };
 
+enum { TTR_DEPTH_F32, TTR_DEPTH_U32, TTR_DEPTH_U16, TTR_DEPTH_U24_LOW, TTR_DEPTH_U24_HIGH, TTR_DEPTH_U24_LOW_X, TTR_DEPTH_U24_HIGH_X };
+typedef struct {
+   uint8_t *data;
+   uint32_t stride_bytes;
+   int format;
+} ttr_depth_target;
+
 typedef struct {
    const uint32_t *code;
    uint32_t n_instr;
@@ -74,7 +81,7 @@ struct ttr_api {
    uint32_t (*frame_shader)(void *ctx, const ttr_shader_desc *desc);
    int (*frame_triangles_shaded)(void *ctx, const ttr_vertex *verts, uint32_t n, uint32_t shader, const float *attrs,
                                  int perspective, int cull, const ttr_state *state);
-   int (*frame_end_ex)(void *ctx, uint8_t *rgba, uint32_t stride, uint32_t color_flags, float *depth, int flip_y);
+   int (*frame_end_depth)(void *ctx, uint8_t *rgba, uint32_t stride, uint32_t color_flags, const ttr_depth_target *depth, int flip_y);
    const char *(*last_error)(void);
    const char *(*context_report)(void *ctx);
 };
@@ -167,7 +174,7 @@ load_api(struct lp_tensix *t, const char *path)
    LOAD(frame_triangles, "ttr_frame_triangles")
    LOAD(frame_shader, "ttr_frame_shader")
    LOAD(frame_triangles_shaded, "ttr_frame_triangles_shaded")
-   LOAD(frame_end_ex, "ttr_frame_end_ex")
+   LOAD(frame_end_depth, "ttr_frame_end_depth")
    LOAD(last_error, "ttr_last_error")
    LOAD(context_report, "ttr_context_report")
 #undef LOAD
@@ -508,49 +515,20 @@ state_refused(struct lp_tensix *t)
 
 /* ---- surfaces ------------------------------------------------------------------------------------------------ */
 
-static void
-write_depth(struct lp_tensix *t, const float *depth)
+/* How the library writes the depth surface of this format, or -1. */
+static int
+depth_target_format(enum pipe_format f)
 {
-   uint8_t *dst = llvmpipe_resource_map(t->zbuf, t->zlevel, t->zfirst, LP_TEX_USAGE_READ_WRITE);
-   if (!dst)
-      return;
-   const unsigned stride = llvmpipe_resource_stride(t->zbuf, t->zlevel);
-   const uint32_t w = t->width, h = t->height;
-   for (uint32_t y = 0; y < h; y++) {
-      const float *src = depth + (size_t)y * w;
-      uint32_t *d32 = (uint32_t *)(dst + (size_t)y * stride);
-      uint16_t *d16 = (uint16_t *)(dst + (size_t)y * stride);
-      if (t->zformat == PIPE_FORMAT_Z32_FLOAT) {
-         memcpy(d32, src, (size_t)w * 4);
-         continue;
-      }
-      for (uint32_t x = 0; x < w; x++) {
-         const double zd = src[x] < 0.0f ? 0.0 : src[x] > 1.0f ? 1.0 : (double)src[x];
-         switch (t->zformat) {
-         case PIPE_FORMAT_Z24_UNORM_S8_UINT:
-            d32[x] = (d32[x] & 0xff000000u) | (uint32_t)(zd * 16777215.0 + 0.5);
-            break;
-         case PIPE_FORMAT_Z24X8_UNORM:
-            d32[x] = (uint32_t)(zd * 16777215.0 + 0.5);
-            break;
-         case PIPE_FORMAT_S8_UINT_Z24_UNORM:
-            d32[x] = (d32[x] & 0xffu) | ((uint32_t)(zd * 16777215.0 + 0.5) << 8);
-            break;
-         case PIPE_FORMAT_X8Z24_UNORM:
-            d32[x] = (uint32_t)(zd * 16777215.0 + 0.5) << 8;
-            break;
-         case PIPE_FORMAT_Z32_UNORM:
-            d32[x] = (uint32_t)(zd * 4294967295.0 + 0.5);
-            break;
-         case PIPE_FORMAT_Z16_UNORM:
-            d16[x] = (uint16_t)(zd * 65535.0 + 0.5);
-            break;
-         default:
-            break;
-         }
-      }
+   switch (f) {
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT: return TTR_DEPTH_U24_LOW;
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM: return TTR_DEPTH_U24_HIGH;
+   case PIPE_FORMAT_Z24X8_UNORM: return TTR_DEPTH_U24_LOW_X;
+   case PIPE_FORMAT_X8Z24_UNORM: return TTR_DEPTH_U24_HIGH_X;
+   case PIPE_FORMAT_Z32_UNORM: return TTR_DEPTH_U32;
+   case PIPE_FORMAT_Z32_FLOAT: return TTR_DEPTH_F32;
+   case PIPE_FORMAT_Z16_UNORM: return TTR_DEPTH_U16;
+   default: return -1;
    }
-   llvmpipe_resource_unmap(t->zbuf, t->zlevel, t->zfirst);
 }
 
 /* Wait until the rasterizer threads of llvmpipe are done with everything that was submitted: the frame is about to write into surfaces
@@ -603,7 +581,7 @@ apply_clear(struct lp_tensix *t)
    t->busy = was_busy;
 }
 
-/* End the frame in progress: colours (converted to the surface's layout) and depth go straight into the surfaces. */
+/* End the frame in progress: colours (converted to the surface's layout) and depth (converted to its format) go straight into the surfaces. */
 static void
 flush_frame(struct lp_tensix *t)
 {
@@ -618,30 +596,28 @@ flush_frame(struct lp_tensix *t)
       submit_batch(t);
    unsigned rs;
    bool has_alpha;
-   if (!color_format_ok(t->cformat, &rs, &has_alpha)) {
-      fprintf(stderr, "tensix: the colour surface format is not supported; frame dropped\n");
+   const int dfmt = depth_target_format(t->zformat);
+   if (!color_format_ok(t->cformat, &rs, &has_alpha) || dfmt < 0) {
+      fprintf(stderr, "tensix: the surface format is not supported; frame dropped\n");
       return;
    }
    wait_rasterizer(t);
-   const size_t px = (size_t)t->width * t->height;
-   float *depth = MALLOC(px * sizeof(float));
-   if (!depth) {
-      fprintf(stderr, "tensix: out of memory\n");
-      return;
-   }
    uint8_t *dst = llvmpipe_resource_map(t->cbuf, t->clevel, t->cfirst, LP_TEX_USAGE_WRITE_ALL);
-   if (dst) {
+   uint8_t *zdst = llvmpipe_resource_map(t->zbuf, t->zlevel, t->zfirst, LP_TEX_USAGE_READ_WRITE);
+   if (dst && zdst) {
       const uint32_t flags = (rs != 0 ? TTR_OUT_SWAP_RB : 0) | (has_alpha ? 0 : TTR_OUT_OPAQUE);
-      DBG(t, "frame rendered (%s)", t->api.context_report(t->ctx));
-      if (t->api.frame_end_ex(t->ctx, dst, llvmpipe_resource_stride(t->cbuf, t->clevel), flags, depth, 0) != 0) {
+      const ttr_depth_target zt = {zdst, llvmpipe_resource_stride(t->zbuf, t->zlevel), dfmt};
+      if (t->api.frame_end_depth(t->ctx, dst, llvmpipe_resource_stride(t->cbuf, t->clevel), flags, &zt, 0) != 0)
          fprintf(stderr, "tensix: frame failed: %s\n", t->api.last_error());
-      } else {
+      else {
          t->frames++;
-         write_depth(t, depth);
+         DBG(t, "frame rendered (%s)", t->api.context_report(t->ctx));
       }
-      llvmpipe_resource_unmap(t->cbuf, t->clevel, t->cfirst);
    }
-   FREE(depth);
+   if (zdst)
+      llvmpipe_resource_unmap(t->zbuf, t->zlevel, t->zfirst);
+   if (dst)
+      llvmpipe_resource_unmap(t->cbuf, t->clevel, t->cfirst);
 }
 
 /* ---- the hooks ----------------------------------------------------------------------------------------------- */

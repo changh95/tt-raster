@@ -178,6 +178,42 @@ def main():
     check(lib.ttr_frame_depth(ctx, zz.ctypes.data, 0) != 0, "ttr_frame_depth during an open frame is refused")
     img_scratch = np.zeros((H, W, 4), dtype=np.uint8)
     lib.ttr_frame_end(ctx, img_scratch.ctypes.data, 0, None, 0)
+    # ttr_frame_end_depth: the depth plane converted into a driver's depth surface (formats, stencil bits kept, row pitch, flip).
+    lib.ttr_frame_end_depth.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p, C.c_int]
+
+    class DepthTarget(C.Structure):
+        _fields_ = [("data", C.c_void_p), ("stride_bytes", C.c_uint32), ("format", C.c_int)]
+
+    def end_depth(fmt, dtype, pitch_px, fill, flip=0):
+        cc = (C.c_float * 4)(0.1, 0.2, 0.3, 0.5)
+        assert lib.ttr_frame_begin(ctx, W, H, cc, 1.0, LESS) == 0
+        arr = (Vertex * (3 * len(scene)))(*[v for tri3 in scene for v in tri3])
+        assert lib.ttr_frame_triangles(ctx, arr, len(scene), PERSP, 0, None) == 0
+        rgba = np.zeros((H, W, 4), dtype=np.uint8)
+        surface = np.full((H, pitch_px), fill, dtype=dtype)
+        tgt = DepthTarget(surface.ctypes.data, pitch_px * surface.itemsize, fmt)
+        assert lib.ttr_frame_end_depth(ctx, rgba.ctypes.data, 0, 0, C.byref(tgt), flip) == 0
+        return surface[:, :W], surface[:, W:]
+
+    zref = ref_z.astype(np.float64)
+    # F32: bit for bit; U32 / U16: rounded; the 24-bit formats in the low or the high bits with the stencil bits kept or cleared.
+    z, pad = end_depth(0, np.float32, W + 8, 7.0)
+    check(np.array_equal(z, ref_z) and np.all(pad == 7.0), "ttr_frame_end_depth F32: the depth plane as it is, padding untouched")
+    z, _ = end_depth(1, np.uint32, W, 0)
+    check(np.array_equal(z, np.floor(np.clip(zref, 0, 1) * 4294967295.0 + 0.5).astype(np.uint32)), "ttr_frame_end_depth U32")
+    z, _ = end_depth(2, np.uint16, W, 0)
+    check(np.array_equal(z, np.floor(np.clip(zref, 0, 1) * 65535.0 + 0.5).astype(np.uint16)), "ttr_frame_end_depth U16")
+    z24 = np.floor(np.clip(zref, 0, 1) * 16777215.0 + 0.5).astype(np.uint32)
+    z, _ = end_depth(3, np.uint32, W, 0xAB000000)
+    check(np.array_equal(z & 0xFFFFFF, z24) and np.all((z >> 24) == 0xAB), "ttr_frame_end_depth U24_LOW keeps the stencil bits (24..31)")
+    z, _ = end_depth(4, np.uint32, W, 0x000000CD)
+    check(np.array_equal(z >> 8, z24) and np.all((z & 0xFF) == 0xCD), "ttr_frame_end_depth U24_HIGH keeps the stencil bits (0..7)")
+    z, _ = end_depth(5, np.uint32, W, 0xFFFFFFFF)
+    check(np.array_equal(z, z24), "ttr_frame_end_depth U24_LOW_X clears the high byte")
+    z, _ = end_depth(6, np.uint32, W, 0xFFFFFFFF)
+    check(np.array_equal(z, z24 << 8), "ttr_frame_end_depth U24_HIGH_X clears the low byte")
+    z, _ = end_depth(0, np.float32, W, 0.0, flip=1)
+    check(np.array_equal(z, ref_z[::-1]), "ttr_frame_end_depth with flip_y")
     # Fragment shaders: a program over two varyings, built by hand (core/include/ttraster/ttraster_isa.h).
     class ShaderDesc(C.Structure):
         _fields_ = [("code", C.c_void_p), ("n_instr", C.c_uint32), ("consts", C.c_void_p), ("n_consts", C.c_uint32),

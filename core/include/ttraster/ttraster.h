@@ -99,6 +99,24 @@ int ttr_frame_end(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, float*
  * layout (a BGRA window) needs no second pass. depth may be NULL, and then the depth plane is not read back at all. */
 enum { TTR_OUT_SWAP_RB = 1 /* the word is B, G, R, A in memory order */, TTR_OUT_OPAQUE = 2 /* alpha forced to 255 */ };
 int ttr_frame_end_ex(ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, uint32_t color_flags, float* depth, int flip_y);
+/* The same, with the depth plane written straight into a depth surface of a graphics driver, converted on the way (on the host thread
+ * pool, like the colour). `bits_kept` formats keep the stencil bits of the words they write into: the surface is read and written. */
+enum {
+    TTR_DEPTH_F32 = 0,        /* 32-bit float */
+    TTR_DEPTH_U32 = 1,        /* 32-bit unorm */
+    TTR_DEPTH_U16 = 2,        /* 16-bit unorm */
+    TTR_DEPTH_U24_LOW = 3,    /* 24-bit unorm in bits 0..23 of a 32-bit word, bits 24..31 (stencil) kept */
+    TTR_DEPTH_U24_HIGH = 4,   /* 24-bit unorm in bits 8..31, bits 0..7 (stencil) kept */
+    TTR_DEPTH_U24_LOW_X = 5,  /* in bits 0..23, bits 24..31 zero */
+    TTR_DEPTH_U24_HIGH_X = 6  /* in bits 8..31, bits 0..7 zero */
+};
+typedef struct {
+    uint8_t* data;
+    uint32_t stride_bytes;
+    int format; /* TTR_DEPTH_* */
+} ttr_depth_target;
+int ttr_frame_end_depth(
+    ttr_context* ctx, uint8_t* rgba, uint32_t stride_bytes, uint32_t color_flags, const ttr_depth_target* depth, int flip_y);
 /* The depth plane of the frame ended last (renders the frame again; the triangles stay in the context until the next
  * ttr_frame_begin). For a caller that ended the frame without depth and now needs it after all. 0 on success. */
 int ttr_frame_depth(ttr_context* ctx, float* depth, int flip_y);
