@@ -41,6 +41,7 @@ camera = TiledCameraCfg(..., renderer_cfg=TtRasterRendererCfg(backend="tensix", 
 | `distance_to_camera` | distance along the pixel ray |
 | `depth`, `distance_to_image_plane` | distance along the camera axis; `depth_clipping_behavior="max"` fills misses with the far clip |
 | `normals` | world-space unit normals, zero where nothing is hit |
+| `semantic_segmentation`, `instance_segmentation` | the per-pixel shape index (Newton's global shape index, as `shape_index_image`) goes through Isaac Lab's own `NewtonSegmentationMapper` (`isaaclab_newton.renderers.segmentation`), exactly as in the Newton Warp renderer: colorized RGBA or int32 ids, `info["idToLabels"]`; the config fields `semantic_filter`, `colorize_semantic_segmentation`, `colorize_instance_segmentation` and `semantic_segmentation_mapping` are the Newton renderer's. **Only the plumbing is tested** (against a stand-in mapper; the real one needs the USD stage) |
 
 Shapes: plane, sphere, capsule, box, ellipsoid, cylinder, cone, triangle meshes (flat shaded when the mesh has no
 normals). One shared intrinsics matrix and a centred principal point are required. The shape id the renderer
@@ -48,7 +49,7 @@ produces internally is Newton's global shape index.
 
 ## Not supported (rejected with `NotImplementedError` where a camera asks for it)
 
-Semantic and instance segmentation, HDR colour, lens distortion, ISP pipelines, textures, shadows, deforming
+HDR colour, lens distortion, ISP pipelines, textures, shadows, deforming
 geometry (`geometry_offsets`), principal point offsets. Attribute interpolation is screen-linear and lighting
 per-vertex.
 

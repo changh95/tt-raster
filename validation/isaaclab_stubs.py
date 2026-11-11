@@ -141,6 +141,53 @@ class NewtonBackendCfg:
     device: object = None
 
 
+def configclass(cls):
+    """isaaclab.utils.configclass: a dataclass whose mutable defaults (dict, list) are copied per instance."""
+    import copy
+
+    for name, value in list(cls.__dict__.items()):
+        if not name.startswith("__") and isinstance(value, (dict, list, set)):
+            setattr(cls, name, dataclasses.field(default_factory=lambda v=value: copy.deepcopy(v)))
+    return dataclasses.dataclass(cls)
+
+
+class FakeSegmentationMapping:
+    """Stand-in for isaaclab_newton.renderers.segmentation.NewtonSegmentationMapping: the same call, a simple lookup.
+
+    Real ids come from the USD stage's semantic labels; here shape i gets id 2 + i % 3 (a 3-class "semantics"), a miss BACKGROUND_ID 0 and
+    synthetic hits UNLABELLED_ID 1, which is what the real kernels write for those cases.
+    """
+
+    def __init__(self, kind, colorize, shape_count):
+        self.kind, self.colorize, self.shape_count = kind, colorize, shape_count
+        self.info = {"idToLabels": {str(2 + i): {"class": f"class{i}"} for i in range(3)}}
+
+    def ids(self, shape_index):
+        import numpy as np
+
+        idx = shape_index.astype(np.int64)
+        out = np.where(idx < self.shape_count, 2 + idx % 3, 1)
+        return np.where(idx == 0xFFFFFFFF, 0, out).astype(np.int32)
+
+    def convert_shape_index_to_output(self, shape_index, out_view):
+        ids = self.ids(shape_index.numpy())
+        if self.colorize:
+            ids = (0xFF000000 | (ids.astype("uint32") * 0x00101010)).astype("uint32")   # a packed RGBA colour per id
+        out_view.assign(ids.astype(out_view.numpy().dtype))
+
+
+class FakeSegmentationMapper:
+    def __init__(self, model, stage, cfg, plan):
+        self.shape_count = len(getattr(model, "shape_label", []) or [])
+        self.maps = {}
+
+    def build_mapping(self, kind, colorize):
+        self.maps[(kind, colorize)] = FakeSegmentationMapping(kind, colorize, self.shape_count)
+
+    def get_mapping(self, kind, colorize):
+        return self.maps[(kind, colorize)]
+
+
 def install():
     """Register the stub modules in sys.modules (idempotent)."""
     def mod(name, **attrs):
@@ -153,12 +200,14 @@ def install():
     mod("isaaclab.renderers", BaseRenderer=BaseRenderer, RenderBufferKind=RenderBufferKind, RenderBufferSpec=RenderBufferSpec)
     mod("isaaclab.renderers.camera_render_spec", CameraRenderSpec=CameraRenderSpec)
     mod("isaaclab.renderers.renderer_cfg", RendererCfg=RendererCfg)
-    mod("isaaclab.utils", configclass=dataclasses.dataclass)
+    mod("isaaclab.utils", configclass=configclass)
     mod("isaaclab.utils.warp", ProxyArray=ProxyArray)
     mod("isaaclab.scene_data", REQUIRES_STAGE_AND_MODEL=REQUIRES_STAGE_AND_MODEL, SceneDataFormat=SceneDataFormat)
     mod("isaaclab.sim", SimulationContext=SimulationContext)
     mod("isaaclab_newton")
     mod("isaaclab_newton.physics", NewtonBackendCfg=NewtonBackendCfg)
+    mod("isaaclab_newton.renderers")
+    mod("isaaclab_newton.renderers.segmentation", NewtonSegmentationMapper=FakeSegmentationMapper)
 
 
 def _methods(source_path, class_name):

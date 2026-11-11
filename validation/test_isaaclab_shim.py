@@ -73,12 +73,16 @@ class FakeSim:
         self.requires_newton_model = False
         self.backend = FakeBackend(model)
         self.provider = FakeProvider(self.backend)
+        self.stage = object()   # the USD stage (only the segmentation mapper reads it)
 
     def get_or_create_backend(self, cfg):
         return self.backend
 
     def get_scene_data_provider(self):
         return self.provider
+
+    def get_clone_plan(self):
+        return None
 
 
 def main():
@@ -262,14 +266,50 @@ def main():
     r.cfg.async_rendering = False
     rs.cleanup(rds)
 
+    # Segmentation outputs: Isaac Lab's mapper turns the per-pixel shape index into semantic / instance ids (a stand-in mapper here, the real
+    # one needs the USD stage); the renderer binds views of the camera's buffers, feeds the shape index and publishes the mapping's info.
+    seg_kinds = ["semantic_segmentation", "instance_segmentation", "depth"]
+    seg_cfg = types.SimpleNamespace(**{**vars(cam_cfg), "data_types": seg_kinds})
+    seg_spec = stubs.CameraRenderSpec(cfg=seg_cfg, device="cpu", num_instances=W, camera_prim_paths=("/s",), view_count=W)
+    for colorize_sem, colorize_inst in ((True, False), (False, True)):
+        r.cfg.colorize_semantic_segmentation, r.cfg.colorize_instance_segmentation = colorize_sem, colorize_inst
+        r._seg_mapper = None
+        rd_seg = r.create_render_data(seg_spec)
+        seg_bufs = {
+            "semantic_segmentation": wp.zeros((W, N, N, 4) if colorize_sem else (W, N, N, 1), dtype=wp.uint8 if colorize_sem else wp.int32, device="cpu"),
+            "instance_segmentation": wp.zeros((W, N, N, 4) if colorize_inst else (W, N, N, 1), dtype=wp.uint8 if colorize_inst else wp.int32, device="cpu"),
+            "depth": wp.zeros((W, N, N, 1), dtype=wp.float32, device="cpu"),
+        }
+        r.set_outputs(rd_seg, {k: Proxy(v) for k, v in seg_bufs.items()})
+        r.update_camera(rd_seg, Proxy(pos), Proxy(ori), Proxy(intr))
+        sim.backend.published = states[0]
+        r.render(rd_seg)
+        cd = types.SimpleNamespace(info={k: None for k in seg_kinds})
+        r.read_output(rd_seg, cd)
+        shape_img = r._scene.render(rd_seg.camera, rd_seg.camera_poses, ("shape",))[0]["shape"][..., 0]
+        expect_ids = stubs.FakeSegmentationMapping("x", False, len(model.shape_label)).ids(shape_img)
+        sem, inst = seg_bufs["semantic_segmentation"].numpy(), seg_bufs["instance_segmentation"].numpy()
+        sem_ids = sem.view(np.uint32)[..., 0] & 0xFF if colorize_sem else sem[..., 0]
+        check(colorize_sem == (sem.shape[-1] == 4) and np.array_equal(sem_ids, expect_ids if not colorize_sem else (expect_ids.astype(np.uint32) * 0x10) & 0xFF),
+              f"semantic_segmentation (colorize={colorize_sem}) is the mapper's lookup of the shape index")
+        inst_ids = inst.view(np.uint32)[..., 0] & 0xFF if colorize_inst else inst[..., 0]
+        check(np.array_equal(inst_ids, expect_ids if not colorize_inst else (expect_ids.astype(np.uint32) * 0x10) & 0xFF),
+              f"instance_segmentation (colorize={colorize_inst}) is the mapper's lookup of the shape index")
+        check(int((expect_ids == 0).sum()) > 0 and int((expect_ids >= 2).sum()) > 0, "the frame has background pixels and shape pixels")
+        check(cd.info["semantic_segmentation"] is not None and "idToLabels" in cd.info["semantic_segmentation"] and cd.info["depth"] is None,
+              "read_output publishes idToLabels for the segmentation outputs only")
+        check(float(seg_bufs["depth"].numpy().max()) > 0.0, "a depth output next to segmentation still renders")
+        r.cleanup(rd_seg)
+    r.cfg.colorize_semantic_segmentation = r.cfg.colorize_instance_segmentation = True
+
     # Unsupported requests fail loudly instead of returning empty buffers.
-    bad = stubs.CameraRenderSpec(cfg=types.SimpleNamespace(**{**vars(cam_cfg), "data_types": ["semantic_segmentation"]}),
+    bad = stubs.CameraRenderSpec(cfg=types.SimpleNamespace(**{**vars(cam_cfg), "data_types": ["rgb_hdr"]}),
                                  device="cpu", num_instances=W, camera_prim_paths=("/x",), view_count=W)
     try:
         r.create_render_data(bad)
-        check(False, "segmentation request is rejected")
+        check(False, "an HDR colour request is rejected")
     except NotImplementedError:
-        check(True, "segmentation request is rejected")
+        check(True, "an HDR colour request is rejected")
     dist_spawn = types.SimpleNamespace(clipping_range=(0.1, FAR), distortion=object())
     try:
         r.create_render_data(stubs.CameraRenderSpec(cfg=types.SimpleNamespace(**{**vars(cam_cfg), "spawn": dist_spawn}),

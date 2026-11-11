@@ -47,6 +47,19 @@ class TtRasterRendererCfg(RendererCfg):
     current; ``camera.data.info[output_name]["capture"]`` carries the image's matching ``pos_w``, ``quat_w_world``,
     ``intrinsic_matrices`` and per-environment ``frame`` indices. One camera per renderer."""
 
+    semantic_filter: str | list[str] = "*:*"
+    """Semantic filter predicate for ``semantic_segmentation`` and ``instance_segmentation`` (``"*:*"``: all types and labels)."""
+
+    colorize_semantic_segmentation: bool = True
+    """``True``: ``semantic_segmentation`` is an (N, H, W, 4) uint8 RGBA image and ``data.info["semantic_segmentation"]["idToLabels"]``
+    maps colours to labels; ``False``: an (N, H, W, 1) int32 id image."""
+
+    colorize_instance_segmentation: bool = True
+    """The same for ``instance_segmentation``."""
+
+    semantic_segmentation_mapping: dict = {}
+    """Optional label to colour mapping used for the colorized ``semantic_segmentation`` (as in the Newton Warp renderer)."""
+
     depth_clipping_behavior: Literal["max", "zero", "none"] = "none"
     """``"max"`` replaces the depth of pixels that hit nothing with the far clip; ``"zero"`` and ``"none"`` leave 0."""
 
@@ -62,6 +75,9 @@ class TtRasterRendererCfg(RendererCfg):
     slower frames)."""
 
     def supported_output_types(self) -> dict[RenderBufferKind, RenderBufferSpec]:
+        def segmentation_spec(colorize: bool) -> RenderBufferSpec:
+            return RenderBufferSpec(4, wp.uint8) if colorize else RenderBufferSpec(1, wp.int32)
+
         return {
             RenderBufferKind.RGBA: RenderBufferSpec(4, wp.uint8),
             RenderBufferKind.RGB: RenderBufferSpec(3, wp.uint8),
@@ -70,4 +86,6 @@ class TtRasterRendererCfg(RendererCfg):
             RenderBufferKind.DISTANCE_TO_CAMERA: RenderBufferSpec(1, wp.float32),
             RenderBufferKind.DISTANCE_TO_IMAGE_PLANE: RenderBufferSpec(1, wp.float32),
             RenderBufferKind.NORMALS: RenderBufferSpec(3, wp.float32),
+            RenderBufferKind.SEMANTIC_SEGMENTATION: segmentation_spec(self.colorize_semantic_segmentation),
+            RenderBufferKind.INSTANCE_SEGMENTATION: segmentation_spec(self.colorize_instance_segmentation),
         }

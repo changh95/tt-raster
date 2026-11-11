@@ -44,7 +44,11 @@ _NATIVE = {
     str(RenderBufferKind.DEPTH): ("forward_depth", 1),
     str(RenderBufferKind.DISTANCE_TO_IMAGE_PLANE): ("forward_depth", 1),
     str(RenderBufferKind.NORMALS): ("normal", 3),
+    # Segmentation is derived from the per-pixel shape index (Newton's global shape index, 0xFFFFFFFF where nothing is hit).
+    str(RenderBufferKind.SEMANTIC_SEGMENTATION): ("shape", 1),
+    str(RenderBufferKind.INSTANCE_SEGMENTATION): ("shape", 1),
 }
+_SEG_KINDS = frozenset({str(RenderBufferKind.SEMANTIC_SEGMENTATION), str(RenderBufferKind.INSTANCE_SEGMENTATION)})
 _DEPTH_KINDS = frozenset(
     {str(RenderBufferKind.DISTANCE_TO_CAMERA), str(RenderBufferKind.DEPTH), str(RenderBufferKind.DISTANCE_TO_IMAGE_PLANE)}
 )
@@ -67,7 +71,10 @@ def _host(array) -> np.ndarray:
 class RenderData:
     """Per-camera state: output bindings, the camera model and the latest poses."""
 
-    def __init__(self, spec: CameraRenderSpec, cfg: TtRasterRendererCfg):
+    def __init__(self, spec: CameraRenderSpec, cfg: TtRasterRendererCfg, seg_mapper=None):
+        self.cfg = cfg
+        self._seg_mapper = seg_mapper   # shared, scene-static lookup builder (None until a segmentation output is requested)
+        self.seg_dests: dict[str, tuple[Any, Any]] = {}   # segmentation kind -> (destination view, mapping)
         c = spec.cfg
         if getattr(c, "isp_cfg", None) is not None:
             raise NotImplementedError("ttraster does not support an ISP pipeline")
@@ -103,6 +110,22 @@ class RenderData:
             )
         self.outputs = {str(k): v for k, v in output_data.items()}
         self.native = tuple(dict.fromkeys(_NATIVE[k][0] for k in self.outputs))
+        # Segmentation family: each requested output is bound to a view of the camera's buffer (colorized RGBA packed as uint32, or
+        # int32 ids) and the lookup of the shared mapper, as the Newton Warp renderer does.
+        import warp as wp
+
+        self.seg_dests = {}
+        for kind, proxy in self.outputs.items():
+            if kind not in _SEG_KINDS:
+                continue
+            if self._seg_mapper is None:
+                raise RuntimeError(f"output '{kind}' needs a segmentation mapper, but none was created (is it in the camera's data_types?)")
+            colorize = bool(self.cfg.colorize_semantic_segmentation if kind == str(RenderBufferKind.SEMANTIC_SEGMENTATION)
+                            else self.cfg.colorize_instance_segmentation)
+            warp_array = getattr(proxy, "warp", proxy)
+            view = wp.array(ptr=warp_array.ptr, dtype=wp.uint32 if colorize else wp.int32, shape=(self.num_envs, 1, self.height, self.width),
+                            device=warp_array.device, copy=False)
+            self.seg_dests[kind] = (view, self._seg_mapper.get_mapping(kind, colorize))
         self._sets = [{}, {}]
         self._started = False
 
@@ -118,7 +141,14 @@ class RenderData:
 
     def publish(self, images: dict[str, np.ndarray], depth_behavior: str) -> None:
         """Copy the rendered images into the bound output buffers."""
+        for kind, (view, mapping) in self.seg_dests.items():
+            import warp as wp
+
+            index = np.ascontiguousarray(images["shape"], dtype=np.uint32).reshape(self.num_envs, 1, self.height, self.width)
+            mapping.convert_shape_index_to_output(wp.array(index, dtype=wp.uint32, device=view.device), view)
         for kind, proxy in self.outputs.items():
+            if kind in _SEG_KINDS:
+                continue
             native, channels = _NATIVE[kind]
             img = images[native]
             if channels != img.shape[-1]:
@@ -148,6 +178,7 @@ class TtRasterRenderer(BaseRenderer):
         self._warned_geometry = False
         self.last_stats: dict | None = None
         self._async_cameras = 0
+        self._seg_mapper = None   # shared, scene-static segmentation lookup builder, created when a camera asks for segmentation
 
     def initialize(self) -> None:
         self.backend = self._sim.get_or_create_backend(self.newton_cfg)
@@ -180,13 +211,24 @@ class TtRasterRenderer(BaseRenderer):
         if unsupported:
             raise NotImplementedError(
                 f"ttraster cannot produce {unsupported}; supported: {sorted(_NATIVE)} "
-                "(segmentation and HDR colour are not implemented)"
+                "(HDR colour is not implemented)"
             )
         if self._scene is not None and spec.num_instances != self._scene.num_worlds:
             raise ValueError(f"camera has {spec.num_instances} instances, the Newton model has {self._scene.num_worlds} worlds")
         if self.cfg.async_rendering and self._async_cameras >= 1:
             raise NotImplementedError("async_rendering supports one camera per renderer (two frames in flight at most)")
-        render_data = RenderData(spec, self.cfg)
+        has_semantic = str(RenderBufferKind.SEMANTIC_SEGMENTATION) in wanted
+        has_instance = str(RenderBufferKind.INSTANCE_SEGMENTATION) in wanted
+        if (has_semantic or has_instance) and self._seg_mapper is None:
+            # Isaac Lab's own mapper (shape index to semantic / instance ids from the USD stage's labels), shared with the Newton Warp renderer.
+            from isaaclab_newton.renderers.segmentation import NewtonSegmentationMapper
+
+            self._seg_mapper = NewtonSegmentationMapper(self.backend.model, self._sim.stage, self.cfg, self._sim.get_clone_plan())
+        if has_semantic:
+            self._seg_mapper.build_mapping(str(RenderBufferKind.SEMANTIC_SEGMENTATION), bool(self.cfg.colorize_semantic_segmentation))
+        if has_instance:
+            self._seg_mapper.build_mapping(str(RenderBufferKind.INSTANCE_SEGMENTATION), bool(self.cfg.colorize_instance_segmentation))
+        render_data = RenderData(spec, self.cfg, seg_mapper=self._seg_mapper)
         self._async_cameras += 1 if self.cfg.async_rendering else 0
         return render_data
 
@@ -292,6 +334,9 @@ class TtRasterRenderer(BaseRenderer):
         """The images were written into the bound buffers by render(); with async_rendering the metadata of the image that
         was just delivered goes into ``camera_data.info[output]["capture"]`` (the pose, calibration and frame indices it was
         rendered with, as Isaac Lab defines for delayed captures)."""
+        if camera_data is not None and camera_data.info is not None:
+            for kind, (_view, mapping) in render_data.seg_dests.items():
+                camera_data.info[kind] = mapping.info   # idToLabels / idToSemantics
         capture, render_data.ready_capture = render_data.ready_capture, None
         if capture is not None and camera_data is not None and camera_data.info is not None:
             for name in camera_data.info:
