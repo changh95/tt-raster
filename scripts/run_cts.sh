@@ -43,7 +43,7 @@ fi
 
 cd "$cts"
 set +e
-"${launch[@]}" ./deqp-vk --deqp-case="$pattern" --deqp-log-filename="$log" --deqp-log-images=disable --deqp-log-shader-sources=disable \
+"${launch[@]}" "$cts/deqp-vk" --deqp-archive-dir="$cts" --deqp-case="$pattern" --deqp-log-filename="$log" --deqp-log-images=disable --deqp-log-shader-sources=disable \
     --deqp-surface-type=fbo --deqp-visibility=hidden "$@" > "$log.out" 2>&1
 rc=$?
 set -e
