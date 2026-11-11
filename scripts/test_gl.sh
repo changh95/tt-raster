@@ -90,6 +90,14 @@ for c in "${cases[@]}"; do
         done
     fi
 done
+# Random fixed-function frames (state, primitives, clipping, mid-frame fallbacks): stock softpipe against the fast path.
+echo "== random GL frames"
+if ! "$py" "$root/mesa/tests/fuzz_gl.py" --count 100 --seed 1 --tame --no-refused --keep "$work/fuzzgl"; then fail=1; fi
+if ! "$py" "$root/mesa/tests/fuzz_gl.py" --count 60 --seed 1000 --tame --keep "$work/fuzzgl2"; then fail=1; fi
+if [[ -n "${TT_METAL_HOME:-}" ]]; then
+    if ! "$py" "$root/mesa/tests/fuzz_gl.py" --count 12 --seed 3000 --tame --backend tensix --node "$node" --keep "$work/fuzzgl_tx"; then fail=1; fi
+fi
+
 # Random GLSL fragment shaders: the translator against stock softpipe (CPU backend), and some of them on the chip.
 echo "== random GLSL shaders"
 if ! "$py" "$root/mesa/tests/fuzz_glsl.py" --count 150 --seed 1 --keep "$work/fuzz"; then fail=1; fi
