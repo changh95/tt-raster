@@ -76,6 +76,8 @@ def _load():
     lib.ttr_add_instance.argtypes = [C.c_void_p, C.c_uint32, C.c_uint32, C.c_uint32, C.c_void_p, C.c_void_p]
     lib.ttr_set_instance_poses.argtypes = [C.c_void_p, C.c_void_p]
     lib.ttr_render.argtypes = [C.c_void_p, C.POINTER(_Camera), C.c_void_p, C.c_void_p, C.POINTER(_Images), C.POINTER(_Stats)]
+    lib.ttr_submit.argtypes = [C.c_void_p, C.POINTER(_Camera), C.c_void_p, C.c_void_p, C.POINTER(_Images)]
+    lib.ttr_collect.argtypes = [C.c_void_p, C.c_int, C.POINTER(_Stats)]
     return lib
 
 
@@ -108,6 +110,7 @@ class Scene:
         if not self._h:
             raise RuntimeError(_l().ttr_last_error().decode())
         self.num_instances = 0
+        self._pending = {}   # ticket -> output arrays kept alive while a frame is in flight
 
     def close(self):
         if self._h:
@@ -147,12 +150,8 @@ class Scene:
     def backend_report(self):
         return _l().ttr_backend_report(self._h).decode()
 
-    def render(self, camera, camera_poses, outputs=("depth",), light_direction=None, out=None):
-        """Returns ({name: array [worlds, H, W, C]}, stats dict).
-
-        `out` may hold preallocated C-contiguous arrays (name -> array of the right shape and dtype) that
-        are filled in place; a render loop should pass the same ones every frame, since fresh multi-MB
-        arrays cost page faults on every frame. Outputs missing from `out` are allocated."""
+    def _prepare(self, camera, camera_poses, outputs, light_direction, out):
+        """The ctypes arguments of a render call: (camera struct, poses, light, image pointers, out dict)."""
         W, H = self.num_worlds, camera.height
         out = {} if out is None else dict(out)
         ptrs = _Images()
@@ -170,8 +169,41 @@ class Scene:
                       camera.vertical_aperture, camera.near_clip, camera.far_clip, camera.background)
         poses = _f32(camera_poses, 7 * W)
         light = None if light_direction is None else _f32(light_direction, 3)
+        return cam, poses, light, ptrs, out
+
+    @staticmethod
+    def _stats(st):
+        return dict(vertex_ms=st.vertex_ms, raster_ms=st.raster_ms, assemble_ms=st.assemble_ms, build_ms=st.build_ms,
+                    total_ms=st.total_ms, triangles=st.triangles, passes=st.passes)
+
+    def render(self, camera, camera_poses, outputs=("depth",), light_direction=None, out=None):
+        """Returns ({name: array [worlds, H, W, C]}, stats dict).
+
+        `out` may hold preallocated C-contiguous arrays (name -> array of the right shape and dtype) that
+        are filled in place; a render loop should pass the same ones every frame, since fresh multi-MB
+        arrays cost page faults on every frame. Outputs missing from `out` are allocated."""
+        cam, poses, light, ptrs, out = self._prepare(camera, camera_poses, outputs, light_direction, out)
         st = _Stats()
         _check(_l().ttr_render(self._h, C.byref(cam), poses.ctypes.data, None if light is None else light.ctypes.data,
                                C.byref(ptrs), C.byref(st)))
-        return out, dict(vertex_ms=st.vertex_ms, raster_ms=st.raster_ms, assemble_ms=st.assemble_ms, build_ms=st.build_ms, total_ms=st.total_ms,
-                         triangles=st.triangles, passes=st.passes)
+        return out, self._stats(st)
+
+    def submit(self, camera, camera_poses, outputs=("depth",), light_direction=None, out=None):
+        """Start a frame on another thread and return a ticket for :meth:`collect`.
+
+        The instance poses are snapshotted now (set them with :meth:`set_instance_poses` before the call); the
+        caller can move them on and submit the next frame while this one renders. At most two frames are in
+        flight, and each needs its own output arrays (`out`), which must not be touched until collect()."""
+        cam, poses, light, ptrs, out = self._prepare(camera, camera_poses, outputs, light_direction, out)
+        ticket = _check(_l().ttr_submit(self._h, C.byref(cam), poses.ctypes.data,
+                                        None if light is None else light.ctypes.data, C.byref(ptrs)))
+        # The C side copied the camera, the poses and the light; only the output arrays must stay alive.
+        self._pending[ticket] = out
+        return ticket
+
+    def collect(self, ticket):
+        """Wait for a submitted frame. Returns ({name: array}, stats dict) like :meth:`render`."""
+        st = _Stats()
+        out = self._pending.pop(ticket, None)
+        _check(_l().ttr_collect(self._h, ticket, C.byref(st)))
+        return out, self._stats(st)

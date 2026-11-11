@@ -8,6 +8,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +45,9 @@ struct DeviceOptions {
     std::map<std::string, std::string> defines;
     // Host threads used to encode the work lists; 0 = one per hardware thread.
     size_t host_threads = 0;
+    // Which of the renderer's kRenderSlots sets of per-frame buffers this frame uses. Frames in flight at
+    // the same time (different threads) need different slots.
+    int slot = 0;
 };
 
 inline uint32_t effective_plane_mask(const DeviceOptions& o) {
@@ -85,7 +89,10 @@ private:
     std::shared_ptr<tt::tt_metal::distributed::MeshDevice> mesh_;
     // Scratch reused from frame to frame: fresh multi-megabyte allocations cost page faults, which
     // serialize badly when several chips are driven from one process.
-    std::vector<uint32_t> words_, raw_;
+    std::vector<uint32_t> words_[kRenderSlots], raw_[kRenderSlots];
+    // One frame at a time uses the chip (buffers, program, upload, run, read-back); encoding and untiling of
+    // frames in other slots overlap with it.
+    std::mutex device_mutex_;
 };
 
 // Plans: every tile of the target, split over `cores` in contiguous row-major chunks.

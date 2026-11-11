@@ -73,6 +73,18 @@ int ttr_render(
     ttr_scene* s, const ttr_camera* camera, const float* camera_poses, const float* light_direction, const ttr_images* out,
     ttr_stats* stats);
 
+/* Pipelined rendering. ttr_submit() takes a snapshot of the instance poses, copies the camera arguments and
+ * starts the frame on another thread; the caller may move poses on and submit the next frame right away. Up to
+ * two frames are in flight (every ticket owns a slot until it is collected). The output buffers named in `out`
+ * must stay valid and untouched until ttr_collect() of that ticket, and two frames in flight need different
+ * buffers. Returns the ticket (>= 0), or -1 (e.g. no free slot: collect the oldest ticket first).
+ * ttr_collect() waits for the frame, fills `stats` and returns 0, or -1 if the frame failed.
+ * A synchronous ttr_render() is refused while frames are in flight. Meshes and instances must not be added
+ * while frames are in flight. */
+int ttr_submit(
+    ttr_scene* s, const ttr_camera* camera, const float* camera_poses, const float* light_direction, const ttr_images* out);
+int ttr_collect(ttr_scene* s, int ticket, ttr_stats* stats);
+
 #ifdef __cplusplus
 }
 #endif

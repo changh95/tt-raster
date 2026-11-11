@@ -3,6 +3,7 @@
 #include "ttraster/ttraster.h"
 
 #include <cstring>
+#include <future>
 #include <memory>
 #include <string>
 
@@ -19,8 +20,73 @@ struct ttr_scene {
     ttr::scene::Scene scene;
     std::unique_ptr<ttr::scene::Backend> backend;
     std::string report;
+    // Pipelined frames: ticket t runs in slot t % kRenderSlots until it is collected.
+    struct Job {
+        std::future<ttr::scene::RenderStats> result;
+        int ticket = -1;
+        bool busy = false;
+    };
+    Job jobs[ttr::kRenderSlots];
+    int next_ticket = 0;
     explicit ttr_scene(uint32_t worlds) : scene(worlds) {}
+    bool in_flight() const {
+        for (const Job& j : jobs) {
+            if (j.busy) return true;
+        }
+        return false;
+    }
+    ~ttr_scene() {
+        for (Job& j : jobs) {
+            if (j.busy) j.result.wait();   // never destroy the scene under a running frame
+        }
+    }
 };
+
+namespace {
+void fill_stats(const ttr::scene::RenderStats& st, ttr_stats* stats) {
+    if (!stats) return;
+    stats->vertex_ms = st.vertex_ms;
+    stats->raster_ms = st.raster_ms;
+    stats->assemble_ms = st.assemble_ms;
+    stats->build_ms = st.build_ms;
+    stats->total_ms = st.total_ms;
+    stats->triangles = st.triangles;
+    stats->passes = st.passes;
+}
+
+// The arguments of a render call, copied out of the caller's structs.
+struct RenderArgs {
+    ttr::scene::Camera cam;
+    std::vector<ttr::scene::Pose> poses;
+    ttr::scene::Light light;
+    ttr::scene::Images img;
+};
+
+RenderArgs make_args(ttr_scene* s, const ttr_camera* camera, const float* camera_poses, const float* light_direction, const ttr_images* out) {
+    RenderArgs a;
+    a.cam.width = camera->width;
+    a.cam.height = camera->height;
+    a.cam.focal_length = camera->focal_length;
+    a.cam.horizontal_aperture = camera->horizontal_aperture;
+    a.cam.vertical_aperture = camera->vertical_aperture;
+    a.cam.near_clip = camera->near_clip;
+    a.cam.far_clip = camera->far_clip;
+    a.cam.background = camera->background;
+    a.poses.resize(s->scene.worlds());
+    for (size_t w = 0; w < a.poses.size(); w++) {
+        std::memcpy(a.poses[w].position, camera_poses + 7 * w, 3 * sizeof(float));
+        std::memcpy(a.poses[w].rotation, camera_poses + 7 * w + 3, 4 * sizeof(float));
+    }
+    if (light_direction) std::memcpy(a.light.direction, light_direction, sizeof a.light.direction);
+    a.img.depth = out->depth;
+    a.img.forward_depth = out->forward_depth;
+    a.img.shape = out->shape;
+    a.img.albedo = out->albedo;
+    a.img.rgb = out->rgb;
+    a.img.normal = out->normal;
+    return a;
+}
+}  // namespace
 
 extern "C" {
 
@@ -115,41 +181,60 @@ int ttr_render(
     ttr_scene* s, const ttr_camera* camera, const float* camera_poses, const float* light_direction, const ttr_images* out,
     ttr_stats* stats) {
     try {
-        ttr::scene::Camera cam;
-        cam.width = camera->width;
-        cam.height = camera->height;
-        cam.focal_length = camera->focal_length;
-        cam.horizontal_aperture = camera->horizontal_aperture;
-        cam.vertical_aperture = camera->vertical_aperture;
-        cam.near_clip = camera->near_clip;
-        cam.far_clip = camera->far_clip;
-        cam.background = camera->background;
-        std::vector<ttr::scene::Pose> poses(s->scene.worlds());
-        for (size_t w = 0; w < poses.size(); w++) {
-            std::memcpy(poses[w].position, camera_poses + 7 * w, 3 * sizeof(float));
-            std::memcpy(poses[w].rotation, camera_poses + 7 * w + 3, 4 * sizeof(float));
+        if (s->in_flight()) {
+            g_error = "frames are in flight: ttr_collect() them before a synchronous ttr_render()";
+            return -1;
         }
-        ttr::scene::Light light;
-        if (light_direction) std::memcpy(light.direction, light_direction, sizeof light.direction);
-        ttr::scene::Images img;
-        img.depth = out->depth;
-        img.forward_depth = out->forward_depth;
-        img.shape = out->shape;
-        img.albedo = out->albedo;
-        img.rgb = out->rgb;
-        img.normal = out->normal;
+        const RenderArgs a = make_args(s, camera, camera_poses, light_direction, out);
         ttr::scene::RenderStats st;
-        s->scene.render(cam, poses, light, img, *s->backend, &st);
+        s->scene.render(a.cam, a.poses, a.light, a.img, *s->backend, &st);
         s->report = st.backend_report;
-        if (stats) {
-            stats->vertex_ms = st.vertex_ms;
-            stats->raster_ms = st.raster_ms;
-            stats->assemble_ms = st.assemble_ms;
-            stats->build_ms = st.build_ms;
-            stats->total_ms = st.total_ms;
-            stats->triangles = st.triangles;
-            stats->passes = st.passes;
+        fill_stats(st, stats);
+        return 0;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+int ttr_submit(
+    ttr_scene* s, const ttr_camera* camera, const float* camera_poses, const float* light_direction, const ttr_images* out) {
+    try {
+        const int ticket = s->next_ticket;
+        ttr_scene::Job& job = s->jobs[ticket % ttr::kRenderSlots];
+        if (job.busy) {
+            g_error = "no free slot: ttr_collect() ticket " + std::to_string(job.ticket) + " first";
+            return -1;
         }
+        auto args = std::make_shared<RenderArgs>(make_args(s, camera, camera_poses, light_direction, out));
+        auto snap = std::make_shared<ttr::scene::Scene::Snapshot>(s->scene.snapshot());   // poses as of now
+        const int slot = ticket % ttr::kRenderSlots;
+        job.result = std::async(std::launch::async, [s, args, snap, slot]() {
+            ttr::scene::RenderStats st;
+            s->scene.render_snapshot(*snap, args->cam, args->poses, args->light, args->img, *s->backend, slot, &st);
+            return st;
+        });
+        job.ticket = ticket;
+        job.busy = true;
+        s->next_ticket++;
+        return ticket;
+    } catch (const std::exception& e) {
+        g_error = e.what();
+        return -1;
+    }
+}
+
+int ttr_collect(ttr_scene* s, int ticket, ttr_stats* stats) {
+    ttr_scene::Job& job = s->jobs[((ticket % ttr::kRenderSlots) + ttr::kRenderSlots) % ttr::kRenderSlots];
+    if (!job.busy || job.ticket != ticket) {
+        g_error = "ttr_collect: ticket " + std::to_string(ticket) + " is not in flight";
+        return -1;
+    }
+    job.busy = false;   // the slot is free again whatever happens below
+    try {
+        const ttr::scene::RenderStats st = job.result.get();
+        s->report = st.backend_report;
+        fill_stats(st, stats);
         return 0;
     } catch (const std::exception& e) {
         g_error = e.what();

@@ -23,7 +23,7 @@ struct MultiChipTimes {
     std::vector<uint64_t> chip_records;
 };
 
-// The frame lives in the renderer and is overwritten by the next render() call.
+// The frame lives in the renderer and is overwritten by the next render() call of the same slot.
 struct MultiChipFrame {
     const Framebuffer* fb = nullptr;
     MultiChipTimes times;
@@ -44,11 +44,13 @@ public:
 
     // Chips write their tiles straight into one shared framebuffer (disjoint tiles), so a frame needs
     // no per-chip allocation and no merge copy.
+    // `opt.slot` selects the shared framebuffer: frames in different slots may be rendered concurrently from
+    // different threads (the chips serialize their device sections).
     MultiChipFrame render(const Frame& frame, const SetupResult& setup, const TileBins& bins, const DeviceOptions& opt = {});
 
 private:
     size_t active_ = 0;
-    Framebuffer fb_;
+    Framebuffer fb_slots_[kRenderSlots];
     std::vector<std::shared_ptr<tt::tt_metal::distributed::MeshDevice>> meshes_;
     std::vector<std::unique_ptr<TensixRenderer>> renderers_;
 };

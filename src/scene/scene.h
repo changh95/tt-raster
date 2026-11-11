@@ -97,17 +97,20 @@ enum Plane : uint32_t {
 class Backend {
 public:
     virtual ~Backend() = default;
-    virtual const Framebuffer& render(const Frame& frame, uint32_t planes) = 0;
-    // One line of phase timings of the most recent render() call, for logs and benchmarks.
-    virtual std::string report() const { return {}; }
+    // `slot` (0 .. kRenderSlots-1) selects the backend's storage for this frame: two frames may be rendered
+    // at the same time on different threads if they use different slots. The returned framebuffer stays
+    // valid until the next call with the same slot.
+    virtual const Framebuffer& render(const Frame& frame, uint32_t planes, int slot = 0) = 0;
+    // One line of phase timings of the most recent render() call of that slot, for logs and benchmarks.
+    virtual std::string report(int slot = 0) const { (void)slot; return {}; }
 };
 
 class ReferenceBackend : public Backend {
 public:
-    const Framebuffer& render(const Frame& frame, uint32_t planes) override;
+    const Framebuffer& render(const Frame& frame, uint32_t planes, int slot = 0) override;
 
 private:
-    Framebuffer fb_;
+    Framebuffer fb_[kRenderSlots];
 };
 
 struct RenderStats {
@@ -121,6 +124,25 @@ struct RenderStats {
     std::string backend_report;   // Backend::report() after the last pass
 };
 
+// One screen-space triangle of a camera slot, ready for the rasterizer (internal to the vertex stage).
+namespace detail {
+struct ScreenTri {
+    float x[3], y[3], z[3];
+    float albedo[3];      // constant per triangle (instance)
+    float lit[3][3];      // per vertex
+    float normal[3][3];   // per vertex
+    uint32_t shape;
+};
+}  // namespace detail
+
+// Storage one in-flight frame owns and reuses from frame to frame (fresh allocations of tens of megabytes
+// per frame would cost page faults that dominate the frame time).
+struct RenderSlot {
+    Frame work_frame;
+    std::vector<uint32_t> shape_cache;
+    std::vector<std::vector<detail::ScreenTri>> per_world;
+};
+
 class Scene {
 public:
     explicit Scene(uint32_t worlds) : worlds_(worlds) {}
@@ -130,19 +152,32 @@ public:
     void set_pose(uint32_t instance, const float position[3], const float rotation[4]);
     size_t instances() const { return instances_.size(); }
 
-    // Render one camera per world (poses.size() == worlds()) with the same intrinsics.
+    // Render one camera per world (poses.size() == worlds()) with the same intrinsics. Uses slot 0.
     void render(
         const Camera& camera, const std::vector<Pose>& poses, const Light& light, const Images& out, Backend& backend,
         RenderStats* stats = nullptr, size_t threads = 0) const;
 
+    // Pipelined use. snapshot() copies the instance poses; render_snapshot() draws that copy later, possibly
+    // on another thread, while the scene's poses move on. Frames in flight at the same time must use
+    // different slots (here and in the backend) and different output buffers. Meshes and instances must not
+    // be added while a frame is in flight.
+    struct Snapshot {
+        std::vector<Instance> instances;
+    };
+    Snapshot snapshot() const { return Snapshot{instances_}; }
+    void render_snapshot(
+        const Snapshot& snapshot, const Camera& camera, const std::vector<Pose>& poses, const Light& light,
+        const Images& out, Backend& backend, int slot, RenderStats* stats = nullptr, size_t threads = 0) const;
+
 private:
+    void render_impl(
+        const std::vector<Instance>& instances, const Camera& camera, const std::vector<Pose>& poses, const Light& light,
+        const Images& out, Backend& backend, int slot, RenderStats* stats, size_t threads) const;
+
     uint32_t worlds_;
     std::vector<Mesh> meshes_;
     std::vector<Instance> instances_;
-    // Frame storage reused between render() calls: a fresh allocation of tens of megabytes per frame
-    // costs page faults that dominate the frame time otherwise.
-    mutable Frame work_frame_;
-    mutable std::vector<uint32_t> shape_cache_;
+    mutable RenderSlot slots_[kRenderSlots];
 };
 
 float srgb_to_linear(float c);

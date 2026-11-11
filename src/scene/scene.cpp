@@ -10,26 +10,18 @@
 #include <stdexcept>
 #include <thread>
 
+#include "ttraster/parallel.h"
+#include "ttraster/trace.h"
+
 namespace ttr::scene {
 
 using Clock = std::chrono::steady_clock;
 namespace {
 
-// Run fn(i) for i in [0, n) on up to `threads` threads (0 = all hardware threads).
+// Run fn(i) for i in [0, n) on up to `threads` threads (0 = all hardware threads) of the shared pool.
 template <typename Fn>
 void parallel_for(uint32_t n, size_t threads, Fn fn) {
-    const size_t hw = threads != 0 ? threads : std::max<size_t>(1, std::thread::hardware_concurrency());
-    const size_t nt = std::min<size_t>(hw, n);
-    if (nt <= 1) {
-        for (uint32_t i = 0; i < n; i++) fn(i);
-        return;
-    }
-    std::atomic<uint32_t> next{0};
-    std::vector<std::thread> pool;
-    for (size_t t = 0; t < nt; t++) {
-        pool.emplace_back([&] { for (uint32_t i = next++; i < n; i = next++) fn(i); });
-    }
-    for (auto& th : pool) th.join();
+    ::ttr::parallel_for(n, threads, [&](size_t i) { fn(static_cast<uint32_t>(i)); });
 }
 
 constexpr float kPi = 3.14159265358979323846f;
@@ -155,11 +147,11 @@ Mesh make_ground(float e) {
     return m;
 }
 
-const Framebuffer& ReferenceBackend::render(const Frame& frame, uint32_t planes) {
+const Framebuffer& ReferenceBackend::render(const Frame& frame, uint32_t planes, int slot) {
     ReferenceOptions opt;
     opt.float_planes = (planes & kPlaneFloat) != 0;
-    fb_ = render_reference(frame, opt);
-    return fb_;
+    fb_[slot] = render_reference(frame, opt);
+    return fb_[slot];
 }
 
 uint32_t Scene::add_mesh(Mesh m) {
@@ -227,20 +219,28 @@ std::vector<CV> clip_depth(std::vector<CV> poly, double near_d, double far_d) {
     return poly;
 }
 
-// One triangle ready for rasterization, in screen space of its camera slot.
-struct ScreenTri {
-    float x[3], y[3], z[3];
-    float albedo[3];      // constant per triangle (instance)
-    float lit[3][3];      // per vertex
-    float normal[3][3];   // per vertex
-    uint32_t shape;
-};
-
 }  // namespace
 
 void Scene::render(
     const Camera& cam, const std::vector<Pose>& poses, const Light& light, const Images& out, Backend& backend,
     RenderStats* stats, size_t threads) const {
+    render_impl(instances_, cam, poses, light, out, backend, 0, stats, threads);
+}
+
+void Scene::render_snapshot(
+    const Snapshot& snapshot, const Camera& cam, const std::vector<Pose>& poses, const Light& light, const Images& out,
+    Backend& backend, int slot, RenderStats* stats, size_t threads) const {
+    render_impl(snapshot.instances, cam, poses, light, out, backend, slot, stats, threads);
+}
+
+void Scene::render_impl(
+    const std::vector<Instance>& instances, const Camera& cam, const std::vector<Pose>& poses, const Light& light,
+    const Images& out, Backend& backend, int slot, RenderStats* stats, size_t threads) const {
+    if (slot < 0 || slot >= kRenderSlots) {
+        throw std::invalid_argument("render slot out of range");
+    }
+    RenderSlot& rs = slots_[slot];
+    trace("frame start", slot);
     if (poses.size() != worlds_) {
         throw std::invalid_argument("one camera pose per world is required");
     }
@@ -266,15 +266,16 @@ void Scene::render(
 
     // ---- Vertex stage, per world in parallel -----------------------------------------------------
     std::vector<std::vector<uint32_t>> by_world(worlds_);
-    for (uint32_t i = 0; i < instances_.size(); i++) {
-        by_world[instances_[i].world].push_back(i);
+    for (uint32_t i = 0; i < instances.size(); i++) {
+        by_world[instances[i].world].push_back(i);
     }
     const double near_d = cam.near_clip, far_d = cam.far_clip;
     const double fx = cam.focal_length / cam.horizontal_aperture * cam.width;   // pixels per unit of x / depth
     const double fy = cam.focal_length / cam.vertical_aperture * cam.height;
     const V3 L = normalize(V3{-light.direction[0], -light.direction[1], -light.direction[2]});
 
-    std::vector<std::vector<ScreenTri>> per_world(worlds_);
+    std::vector<std::vector<detail::ScreenTri>>& per_world = rs.per_world;   // kept between frames (storage reuse)
+    per_world.resize(worlds_);
     auto do_world = [&](uint32_t w) {
         const Pose& pose = poses[w];
         const double cq[4] = {pose.rotation[0], pose.rotation[1], pose.rotation[2], pose.rotation[3]};
@@ -282,9 +283,10 @@ void Scene::render(
         conjugate(cq, cqi);
         const V3 cpos{pose.position[0], pose.position[1], pose.position[2]};
         const Viewport& vp = base.viewports[w];
-        std::vector<ScreenTri>& tris = per_world[w];
+        std::vector<detail::ScreenTri>& tris = per_world[w];
+        tris.clear();
         for (uint32_t ii : by_world[w]) {
-            const Instance& inst = instances_[ii];
+            const Instance& inst = instances[ii];
             const Mesh& mesh = meshes_[inst.mesh];
             const double iq[4] = {inst.rotation[0], inst.rotation[1], inst.rotation[2], inst.rotation[3]};
             const V3 ipos{inst.position[0], inst.position[1], inst.position[2]};
@@ -322,7 +324,7 @@ void Scene::render(
                 }
                 for (size_t k = 1; k + 1 < pr.size(); k++) {
                     const P* tri[3] = {&pr[0], &pr[k], &pr[k + 1]};
-                    ScreenTri st;
+                    detail::ScreenTri st;
                     for (int c = 0; c < 3; c++) {
                         st.x[c] = tri[c]->x; st.y[c] = tri[c]->y; st.z[c] = tri[c]->z;
                         for (int a = 0; a < 3; a++) {
@@ -339,12 +341,13 @@ void Scene::render(
     };
     parallel_for(worlds_, threads, do_world);
     local.vertex_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    trace("vertex stage done", slot);
 
     // ---- Passes ------------------------------------------------------------------------------------
     // Every pass draws the same triangles with a different colour payload; depth and triangle id come
     // with each. Pass 1 is the first one requested.
     enum Payload { kPAlbedo, kPLit, kPNormal };
-    std::vector<uint32_t>& shape_of = shape_cache_;   // per triangle of the frame: shape id (same for all passes)
+    std::vector<uint32_t>& shape_of = rs.shape_cache;   // per triangle of the frame: shape id (same for all passes)
     // Triangles of the frame in world order; shape ids per triangle are the same for every pass.
     std::vector<size_t> first_tri(worlds_ + 1, 0);
     for (uint32_t w = 0; w < worlds_; w++) first_tri[w + 1] = first_tri[w] + per_world[w].size();
@@ -352,7 +355,7 @@ void Scene::render(
     for (uint32_t w = 0; w < worlds_; w++)
         for (size_t k = 0; k < per_world[w].size(); k++) shape_of[first_tri[w] + k] = per_world[w][k].shape;
     auto build = [&](Payload payload) -> Frame& {
-        Frame& f = work_frame_;
+        Frame& f = rs.work_frame;
         f.width = base.width;
         f.height = base.height;
         std::memcpy(f.clear_color, base.clear_color, sizeof f.clear_color);
@@ -368,7 +371,7 @@ void Scene::render(
         f.triangles.resize(first_tri[worlds_]);
         parallel_for(worlds_, threads, [&](uint32_t w) {
             size_t o = first_tri[w];
-            for (const ScreenTri& st : per_world[w]) {
+            for (const detail::ScreenTri& st : per_world[w]) {
                 Triangle& t = f.triangles[o++];
                 t.viewport = w;
                 t.flat = payload == kPAlbedo;
@@ -393,7 +396,9 @@ void Scene::render(
     };
     auto timed_render = [&](const Frame& f, uint32_t planes) -> const Framebuffer& {
         const auto r0 = Clock::now();
-        const Framebuffer& fb = backend.render(f, planes);
+        trace("backend render start", slot);
+        const Framebuffer& fb = backend.render(f, planes, slot);
+        trace("backend render end", slot);
         local.raster_ms += std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
         local.passes++;
         local.triangles = f.triangles.size();
@@ -485,7 +490,8 @@ void Scene::render(
         geometry_from(timed_render(f, kPlaneDepth | kPlaneId));
     }
     local.total_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    local.backend_report = backend.report();
+    trace("frame end", slot);
+    local.backend_report = backend.report(slot);
     if (stats) *stats = local;
 }
 

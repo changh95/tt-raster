@@ -54,6 +54,7 @@ MultiChipFrame MultiChipRenderer::render(
 
     // Every tile belongs to exactly one band, so the chips can write the shared framebuffer
     // concurrently. Size it once; later frames overwrite it.
+    Framebuffer& fb_ = fb_slots_[opt.slot];
     const uint32_t pw = frame.padded_width(), ph = frame.padded_height();
     const size_t n_px = static_cast<size_t>(pw) * ph;
     const uint32_t m = effective_plane_mask(opt);

@@ -12,6 +12,7 @@ add_library(ttraster_core STATIC
     ttraster/oracle.cpp
     ttraster/scenes.cpp
     ttraster/image.cpp
+    ttraster/parallel.cpp
     scene/scene.cpp)
 target_include_directories(ttraster_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ttraster_core PUBLIC ZLIB::ZLIB)

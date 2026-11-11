@@ -2,6 +2,9 @@
 
 #include "tensix/tensix_renderer.h"
 
+#include "ttraster/parallel.h"
+#include "ttraster/trace.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -203,7 +206,7 @@ DeviceFrame TensixRenderer::render(
     }
     // Only headers and the records' words are written; padding is never read by the kernels, so the
     // buffer is not cleared between frames.
-    std::vector<uint32_t>& words = words_;
+    std::vector<uint32_t>& words = words_[opt.slot];
     words.resize(static_cast<size_t>(pages_total) * (kPageBytes / 4));
     struct CoreCounts {
         uint64_t records = 0, vec_partial = 0, vec_full = 0;
@@ -229,22 +232,7 @@ DeviceFrame TensixRenderer::render(
             base += static_cast<size_t>(pages_for_records(static_cast<uint32_t>(entries.size()))) * (kPageBytes / 4);
         }
     };
-    {
-        const size_t hw = opt.host_threads != 0 ? opt.host_threads : std::thread::hardware_concurrency();
-        const size_t n_threads = std::max<size_t>(1, std::min<size_t>(plan.size(), hw));
-        std::atomic<size_t> next{0};
-        std::vector<std::thread> threads;
-        for (size_t t = 0; t < n_threads; t++) {
-            threads.emplace_back([&] {
-                for (size_t c = next++; c < plan.size(); c = next++) {
-                    encode_core(c);
-                }
-            });
-        }
-        for (auto& th : threads) {
-            th.join();
-        }
-    }
+    parallel_for(plan.size(), opt.host_threads, [&](size_t c) { encode_core(c); });
     for (const CoreCounts& cc : counts) {
         out.times.records += cc.records;
         out.times.vec_partial += cc.vec_partial;
@@ -255,12 +243,17 @@ DeviceFrame TensixRenderer::render(
     }
     out.times.build_ms = ms_since(t0);
 
+    const uint32_t mask = effective_plane_mask(opt);
+    const uint32_t planes = static_cast<uint32_t>(__builtin_popcount(mask));
+    std::vector<uint32_t>& raw = raw_[opt.slot];
+    {   // The chip serves one frame at a time; the buffers and the program are destroyed inside the lock.
+    trace("  device lock wait", opt.slot);
+    std::lock_guard<std::mutex> device_lock(device_mutex_);
+    trace("  device lock held", opt.slot);
     // ---- 2. Buffers, program --------------------------------------------------------------------
     t0 = Clock::now();
     auto& cq = mesh_->mesh_command_queue();
     const uint32_t total_pages = static_cast<uint32_t>(words.size() / (kPageBytes / 4));
-    const uint32_t mask = effective_plane_mask(opt);
-    const uint32_t planes = static_cast<uint32_t>(__builtin_popcount(mask));
     distributed::DeviceLocalBufferConfig cfg{.page_size = kPageBytes, .buffer_type = BufferType::DRAM};
     auto in_buf = distributed::MeshBuffer::create(
         distributed::ReplicatedBufferConfig{.size = static_cast<uint64_t>(total_pages) * kPageBytes}, cfg, mesh_.get());
@@ -346,9 +339,10 @@ DeviceFrame TensixRenderer::render(
 
     // ---- 4. Read back ---------------------------------------------------------------------------
     t0 = Clock::now();
-    std::vector<uint32_t>& raw = raw_;
     distributed::EnqueueReadMeshBuffer(cq, raw, out_buf, true);
     out.times.read_ms = ms_since(t0);
+    trace("  device section done", opt.slot);
+    }   // device_lock released, buffers and program destroyed
     // Untile: a tile holds four 16x16 faces (TL, TR, BL, BR), each row-major, so every face row is a
     // 16-word copy into the frame. Colour is a plain copy; depth is a plain copy; the id plane is
     // stored as floats and converted.
@@ -400,21 +394,13 @@ DeviceFrame TensixRenderer::render(
             }
         }
     };
-    {   // Blocks are independent tiles of the frame: untile them on the host threads of this chip.
-        const size_t hw = opt.host_threads != 0 ? opt.host_threads : std::thread::hardware_concurrency();
-        const size_t nt = std::max<size_t>(1, std::min<size_t>(jobs.size() / 64 + 1, hw));
-        std::atomic<size_t> next{0};
-        std::vector<std::thread> pool;
-        for (size_t t = 0; t < nt; t++) {
-            pool.emplace_back([&] {
-                for (size_t i = next++; i < jobs.size(); i = next++) {
-                    decode(jobs[i]);
-                }
-            });
-        }
-        for (auto& th : pool) {
-            th.join();
-        }
+    {   // Blocks are independent tiles of the frame: untile them in groups on the host threads of this chip.
+        constexpr size_t kGroup = 16;
+        parallel_for((jobs.size() + kGroup - 1) / kGroup, opt.host_threads, [&](size_t g) {
+            for (size_t i = g * kGroup; i < std::min(jobs.size(), (g + 1) * kGroup); i++) {
+                decode(jobs[i]);
+            }
+        });
     }
     out.times.readback_ms = ms_since(t0);
     return out;

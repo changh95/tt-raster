@@ -217,3 +217,21 @@ Reading: device and read-back shrink with the chip count (read-back runs on eigh
 | depth, shape, rgb, normals | 2 | 77.4 ms | 13,200 | 165.7 ms | 75.7 ms |
 
 Breakdown of the depth frame (ms), slowest chip where several: vertex stage 3.3, setup 4.6, binning 1.5, record encoding 2.5, upload 3.0 (x1 chip: 14.0), device kernels 1.4, read-back 8.1 (transfer 4.9, untiling 3.2; x1 chip: 27.6 with 24.2 transfer), frame construction 2.6, output assembly 2.7. With eight chips: upload 2.4, device 0.9, read-back 8.1 (transfer 6.9), so the transfer of an eighth of the data per chip takes as long as the whole frame's transfer on the x8 chip. CPU reference backend, same scene, depth: 827 ms for 1,024 environments (256: 219 ms). History of the 1-chip (x8) depth frame: 126 ms (serial setup 25 ms, assembly 27 ms), 57 ms after parallelizing the host stages, 36.5 ms after reusing the frame's triangle storage (frame construction 20.6 ms to 2.4 ms), 32.8 ms after reusing setup and bin storage (setup 6.1 to 4.6 ms, binning 1.6 to 1.5 ms) and writing into preallocated output arrays (assembly 5.2 to 2.7 ms). Quality against Newton Warp is in FINDINGS.md.
+
+### Pipelined frames and the host thread pool
+
+Two changes after the table above. (1) `parallel_for` now runs on one persistent worker pool (`src/ttraster/parallel.h`) instead of creating and joining up to 64 `std::thread`s in every stage; the stages shrank (frame construction 2.5 to 0.8 ms, setup 4.6 to 2.0 ms) and a synchronous depth frame went from about 33 to 25 to 29 ms on the x8 chip. (2) `ttr_submit` / `ttr_collect` (`Scene.submit` / `Scene.collect` in Python) keep two frames in flight: poses are snapshotted at submit, each frame has its own storage slot (triangles, bins, record buffer, read-back buffer, framebuffer), and the chips serialize only their device section (buffers, upload, run, transfer) with a mutex, so the host stages of one frame overlap the device section of the other. Output is bit-identical to synchronous frames (`validation/test_pipeline.py`, CPU and Tensix backends); the price is one frame of latency.
+
+1,024 environments, 96 x 96, depth, steady state over 80 frames, three runs each (`validation/bench_scene.py --pipeline`; the host carried other users' load during these runs, load average 35, so expect +-15 %):
+
+| Chips | Synchronous | Pipelined (2 in flight) | Images/s pipelined | Latency submit to collect |
+| --- | --- | --- | --- | --- |
+| 1 (x8 link, node 5) | 25 to 29 ms | 19.6 to 20.1 ms | about 51,000 | 34 to 35 ms |
+| 8 | 31 to 36 ms | 19.6 to 21.3 ms | about 50,000 | 33 to 39 ms |
+| 1 (x1 link, node 0) | 55.7 ms | 43.8 ms | 23,400 | 81 ms |
+
+Other outputs, one run: rgb + depth 35.2 to 25.2 ms (x8 chip), four outputs 62.5 to 51.9 ms; the multi-pass frames gain less because every pass already keeps the chip busy.
+
+Where the pipelined frame goes (`TTR_TRACE=1` prints a timeline of stage boundaries per slot): one frame is about 38 ms long, a new one starts every 18 to 20 ms. The device section (create buffers, upload, run, transfer) is 10 to 12 ms of it and is mutually exclusive, so a single chip cannot go below that; the rest is host work (vertex 3.5, construction 3, setup 2, binning 3 (still single-threaded), encode 2, untile 2, assemble 2 ms) that now runs concurrently with the other frame. With eight chips the device sections of different chips run in parallel, but the frame still takes as long as with one x8 chip, because the transfer problem described above (eight chips do not read back eight times faster) and the host stages remain.
+
+A process-wide CPU census explains why the first version of the pipeline gained little: a synchronous frame burned 443 ms of CPU time (12 cores busy on average, 65 ms of it system time) before the pool, mostly in creating and joining threads; with the pool the frame is shorter but uses more cores while it runs (750 ms of CPU, 23 cores), so the host stages are now CPU-bound when two frames overlap.

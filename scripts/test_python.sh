@@ -10,7 +10,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 py="${TT_RASTER_PYTHON:-$HOME/experiments/venv-newton/bin/python}"
 
-for t in test_newton_bridge test_isaaclab_shim; do
+for t in test_newton_bridge test_isaaclab_shim test_pipeline; do
     echo "== $t (reference backend)"
     "$py" "$root/validation/$t.py" --backend reference 2>&1 | grep -E "^(ok|FAIL|skip|PASS)|failed|Error|Traceback" 
     [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "$t failed"; exit 1; }
@@ -18,7 +18,7 @@ done
 
 if [[ -n "${TT_METAL_HOME:-}" ]]; then
     node="${TT_RASTER_NODE:-3}"
-    for t in test_newton_bridge test_isaaclab_shim; do
+    for t in test_newton_bridge test_isaaclab_shim test_pipeline; do
         echo "== $t (tensix backend, node $node)"
         "$root/scripts/run.sh" "$node" "$py" "$root/validation/$t.py" --backend tensix 2>&1 | grep -E "^(ok|FAIL|skip|PASS)|failed|Error|Traceback"
         [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "$t failed"; exit 1; }

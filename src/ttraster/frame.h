@@ -18,6 +18,9 @@ inline constexpr int32_t kSubpixelScale = 1 << kSubpixelBits;  // 1/16 pixel gri
 inline constexpr int32_t kMaxTargetSize = 2048;
 // Input vertices beyond this many pixels from the origin are rejected before snapping.
 inline constexpr float kMaxInputCoord = 1048576.0f;  // 2^20
+// Frames that may be in flight at once (pipelined rendering). Backends keep this many independent sets of
+// per-frame storage, selected by a slot index.
+inline constexpr int kRenderSlots = 2;
 
 struct Vertex {
     float x, y;       // window position in pixels, x right, y down

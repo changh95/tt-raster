@@ -2,6 +2,8 @@
 
 #include "ttraster/setup.h"
 
+#include "ttraster/parallel.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -290,7 +292,7 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
     // Triangles are independent: set them up in chunks on several threads and concatenate the chunks in
     // order, so the result is identical to the sequential run (API order is preserved).
     const size_t n = frame.triangles.size();
-    constexpr size_t kChunk = 4096;
+    constexpr size_t kChunk = 1024;
     const size_t n_chunks = (n + kChunk - 1) / kChunk;
     const size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
     if (n < 4 * kChunk || hw == 1) {
@@ -301,20 +303,9 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
     if (ws.parts.size() < n_chunks) ws.parts.resize(n_chunks);
     ws.part_stats.assign(n_chunks, SetupStats{});
     for (size_t c = 0; c < n_chunks; c++) ws.parts[c].clear();
-    const size_t n_threads = std::min(hw, n_chunks);
-
-    auto run_threads = [&](auto&& body) {
-        std::vector<std::thread> pool;
-        for (size_t t = 0; t < n_threads; t++) pool.emplace_back(body);
-        for (auto& th : pool) th.join();
-    };
-
-    std::atomic<size_t> next{0};
-    run_threads([&] {
-        for (size_t c = next++; c < n_chunks; c = next++) {
-            for (size_t src = c * kChunk; src < std::min(n, (c + 1) * kChunk); src++) {
-                process(static_cast<uint32_t>(src), ws.parts[c], ws.part_stats[c]);
-            }
+    parallel_for(n_chunks, hw, [&](size_t c) {
+        for (size_t src = c * kChunk; src < std::min(n, (c + 1) * kChunk); src++) {
+            process(static_cast<uint32_t>(src), ws.parts[c], ws.part_stats[c]);
         }
     });
 
@@ -330,11 +321,8 @@ void setup_frame(const Frame& frame, SetupResult& res, SetupWorkspace& ws) {
     }
     // (No clear() before this resize: the old elements stay and are overwritten by the copy below.)
     res.tris.resize(ws.offset[n_chunks]);
-    next = 0;
-    run_threads([&] {
-        for (size_t c = next++; c < n_chunks; c = next++) {
-            std::copy(ws.parts[c].begin(), ws.parts[c].end(), res.tris.begin() + static_cast<std::ptrdiff_t>(ws.offset[c]));
-        }
+    parallel_for(n_chunks, hw, [&](size_t c) {
+        std::copy(ws.parts[c].begin(), ws.parts[c].end(), res.tris.begin() + static_cast<std::ptrdiff_t>(ws.offset[c]));
     });
 }
 

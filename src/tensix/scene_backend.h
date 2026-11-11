@@ -16,25 +16,29 @@ namespace ttr {
 class TensixSceneBackend : public scene::Backend {
 public:
     explicit TensixSceneBackend(size_t n_chips) : mc_(n_chips) {}
-    const Framebuffer& render(const Frame& frame, uint32_t planes) override;
-    std::string report() const override;
+    const Framebuffer& render(const Frame& frame, uint32_t planes, int slot = 0) override;
+    std::string report(int slot = 0) const override;
 
-    // Phase timings of the most recent render() call.
+    // Phase timings of the most recent render() call (of the given slot).
     struct Timings {
         double setup_ms = 0, bin_ms = 0, device_wall_ms = 0;
         MultiChipTimes chips;
         uint64_t records = 0;
     };
-    const Timings& last() const { return last_; }
+    const Timings& last(int slot = 0) const { return slots_[slot].last; }
     MultiChipRenderer& chips() { return mc_; }
 
 private:
     MultiChipRenderer mc_;
-    Timings last_;
-    // Kept between frames so a render loop reuses the (tens of MB) triangle and bin storage.
-    SetupResult setup_;
-    SetupWorkspace setup_ws_;
-    TileBins bins_;
+    // Per in-flight frame: kept between frames so a render loop reuses the (tens of MB) triangle and bin
+    // storage, and so that two frames can be prepared at the same time.
+    struct SlotState {
+        Timings last;
+        SetupResult setup;
+        SetupWorkspace setup_ws;
+        TileBins bins;
+    };
+    SlotState slots_[kRenderSlots];
 };
 
 std::unique_ptr<scene::Backend> make_tensix_backend(size_t n_chips);

@@ -2,6 +2,8 @@
 
 #include "tensix/scene_backend.h"
 
+#include "ttraster/trace.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -10,28 +12,34 @@ namespace ttr {
 
 using Clock = std::chrono::steady_clock;
 
-const Framebuffer& TensixSceneBackend::render(const Frame& frame, uint32_t planes) {
+const Framebuffer& TensixSceneBackend::render(const Frame& frame, uint32_t planes, int slot) {
+    SlotState& st = slots_[slot];
+    Timings& last_ = st.last;
     auto t0 = Clock::now();
-    setup_frame(frame, setup_, setup_ws_);
+    setup_frame(frame, st.setup, st.setup_ws);
     last_.setup_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    trace("  setup done", slot);
     t0 = Clock::now();
-    bin_triangles(setup_, frame.tiles_x(), frame.tiles_y(), bins_);
+    bin_triangles(st.setup, frame.tiles_x(), frame.tiles_y(), st.bins);
     last_.bin_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    last_.records = bins_.entries;
+    last_.records = st.bins.entries;
+    trace("  bins done", slot);
 
     DeviceOptions opt;
+    opt.slot = slot;
     // Map the requested planes to the device's: colour 1, depth 2, id 4; float colour adds G and B.
     opt.float_planes = (planes & scene::kPlaneFloat) != 0;
     opt.plane_mask = ((planes & scene::kPlaneColor) ? 1u : 0u) | ((planes & scene::kPlaneDepth) ? 2u : 0u) |
                      ((planes & scene::kPlaneId) ? 4u : 0u) | (opt.float_planes ? 8u | 16u : 0u);
     t0 = Clock::now();
-    const MultiChipFrame f = mc_.render(frame, setup_, bins_, opt);
+    const MultiChipFrame f = mc_.render(frame, st.setup, st.bins, opt);
     last_.device_wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     last_.chips = f.times;
     return *f.fb;
 }
 
-std::string TensixSceneBackend::report() const {
+std::string TensixSceneBackend::report(int slot) const {
+    const Timings& last_ = slots_[slot].last;
     double b = 0, u = 0, d = 0, r = 0, rd = 0;
     for (const DeviceTimes& t : last_.chips.chip) {
         b = std::max(b, t.build_ms);

@@ -25,6 +25,8 @@ def main():
     ap.add_argument("--chips", type=int, default=1)
     ap.add_argument("--outputs", default="depth")
     ap.add_argument("--reps", type=int, default=5)
+    ap.add_argument("--pipeline", action="store_true",
+                    help="two frames in flight (submit/collect): reports the time per frame in steady state")
     args = ap.parse_args()
     W, N = args.worlds, args.size
     sc = build_scene(W, args.backend, args.chips, 4, 16)
@@ -53,6 +55,41 @@ def main():
         last = st
     walls = sorted(walls[1:])  # the first call compiles kernels and warms caches
     med = walls[len(walls) // 2]
+    if args.pipeline:
+        def poses_at(rep):
+            poses = base.copy().reshape(W, 4, 7)
+            for w in range(W):
+                x, th = S.world_params(w + rep * 7)
+                poses[w, 0] = (0, 0, 0, 0, 0, 0, 1)
+                poses[w, 1] = (*S.RAIL["center"], 0, 0, 0, 1)
+                poses[w, 2] = (x, 0, 1.0, 0, 0, 0, 1)
+                poses[w, 3] = (x, 0, 1.0, *S.quat_y(th))
+            return poses.reshape(-1, 7)
+
+        frames = max(args.reps, 8) * 2
+        all_poses = [poses_at(k) for k in range(frames + 2)]   # generated outside the timed loop (Python is slow at it)
+        pbufs, tickets, lat = [{}, {}], [], []
+        t_start = None
+        for k in range(frames + 2):
+            if k == 2:   # steady state: the two slots are warm
+                t_start = time.perf_counter()
+            if len(tickets) == 2:
+                t, kk, ts = tickets.pop(0)
+                pbufs[kk % 2], pst = sc.collect(t)
+                lat.append((time.perf_counter() - ts) * 1000)
+            if k < frames + 2:
+                sc.set_instance_poses(all_poses[k])
+                ts = time.perf_counter()
+                tickets.append((sc.submit(cam, cams, outputs, out=pbufs[k % 2]), k, ts))
+        while tickets:
+            t, kk, ts = tickets.pop(0)
+            pbufs[kk % 2], pst = sc.collect(t)
+            lat.append((time.perf_counter() - ts) * 1000)
+        per_frame = (time.perf_counter() - t_start) * 1000 / (frames)
+        print("   last pipelined frame:", {k: round(v, 1) if isinstance(v, float) else v for k, v in pst.items()})
+        print(f"{args.backend} chips={args.chips} worlds={W} {N}x{N} outputs={args.outputs} PIPELINED (2 in flight): "
+              f"{per_frame:.1f} ms per frame ({W / per_frame * 1000:.0f} images/s), latency submit->collect {np.median(lat):.1f} ms")
+        return
     print(f"{args.backend} chips={args.chips} worlds={W} {N}x{N} outputs={args.outputs}: frame {med:.1f} ms median "
           f"({W / med * 1000:.0f} images/s)  vertex {last['vertex_ms']:.1f} raster {last['raster_ms']:.1f} "
           f"assemble {last['assemble_ms']:.1f} build {last['build_ms']:.1f} ms (C++ total {last['total_ms']:.1f}), {last['triangles']} triangles, {last['passes']} pass(es)")
