@@ -51,6 +51,14 @@ public:
 private:
     size_t active_ = 0;
     Framebuffer fb_slots_[kRenderSlots];
+    // Per slot: which tiles of the framebuffer already hold the clear values (so empty tiles need no write).
+    struct SlotFill {
+        std::vector<uint8_t> clean;
+        static constexpr int kKeyWords = 9;
+        uint32_t key[kKeyWords] = {};   // clear values, plane mask and target size the flags refer to
+        bool valid = false;
+    };
+    SlotFill fill_[kRenderSlots];
     std::vector<std::shared_ptr<tt::tt_metal::distributed::MeshDevice>> meshes_;
     std::vector<std::unique_ptr<TensixRenderer>> renderers_;
 };
