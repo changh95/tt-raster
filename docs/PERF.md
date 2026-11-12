@@ -327,3 +327,16 @@ Demo scene (flat Gaussians on a floor, a sphere and a torus), 1280 x 720, node 5
 
 The chip takes about 14 microseconds of one core per (triangle, tile) record for the 20-instruction splat program plus blending (a fixed-function record: 3.5 microseconds), and one core runs a tile's whole list, so eight chips give 1.6 to 1.9 times one chip. The interpreter takes 849 ms against 471 ms compiled for 100,000 synthetic Gaussians.
 
+## Phase P (NoC multicast distribution): measured bottleneck, and why it was not built
+
+Phase P of `docs/PLAN.md` replaces the per-core DRAM record lists with multicast from a sender core, and says to choose what to build "by the measured bottleneck". Where frame time goes, from the tables above and the Gaussian measurements:
+
+| Workload | Host: record build / encode | Upload | Device | Read-back | What the device time is |
+| --- | --- | --- | --- | --- | --- |
+| Test scenes, one chip (above) | 4.4 to 4.9 ms | 2.6 to 4.9 ms | 0.7 to 2.5 ms | 3.7 to 4.1 ms (x1 link) | 0.3 to 0.75 ms of it is the launch |
+| Isaac Lab cameras (356k triangles) | 1.3 ms binning plus encoding | in the 33 ms frame | about 10 ms | 8 ms (x8) | per-tile records and the per-pixel depth test |
+| OpenGL / Vulkan frames with compiled shaders | 3 to 9 ms | 1 to 5 ms | 40 to 800 ms | 0.5 ms | per-instruction cost of the shader: about 13 ns per instruction and pixel vector |
+| Gaussian splatting, 200,000 Gaussians | 42 ms frame build, 61 ms encode | 21 ms | 200 ms | 0.7 ms | 14 microseconds of one core per record for the splat program and the blend |
+
+In the geometry-bound cases the device is the smallest part of the frame (a floor of about 6 ms from encoding and the launch), and multicast changes only how records reach the cores inside the device column; it would not touch the host encoding, the upload or the read-back. In the shader-bound cases the device column is the arithmetic, which distribution does not change either. The one place where it could help is the host encoding and the upload for scenes whose triangles cover many tiles (Gaussians: 1.67 million records for 379,000 triangles, so a triangle-level stream would be about 4 times smaller, at the price of every core doing the bounding-box walk on its RISC-V core). Spike D showed that the mechanism works (one sender delivers about 1.3 to 1.5 TB/s to a 12 x 10 grid) but nothing measured here is limited by record distribution, so Phase P was not started; the next measurement that would change this is a scene whose host encoding exceeds its device time by a factor of several and whose triangles are large, and the Gaussian frames above are the closest (encoding 61 ms against a device time of 200 ms).
+
