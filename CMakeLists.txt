@@ -37,9 +37,10 @@ endif()
 
 # core/     the renderer (library, tools, tests, device spikes)
 # api/      graphics API drivers (api/gl, api/vulkan): built with Mesa by scripts, not by this CMake project
-# plugins/  consumers of the core that are not graphics APIs (plugins/isaaclab; later a Gaussian-splatting renderer)
+# plugins/  consumers of the core that are not graphics APIs (plugins/isaaclab, plugins/gaussian)
 add_subdirectory(core)
 option(TT_RASTER_BUILD_PLUGINS "Build the plugins" ON)
 if(TT_RASTER_BUILD_PLUGINS)
     add_subdirectory(plugins/isaaclab)
+    add_subdirectory(plugins/gaussian)
 endif()

@@ -314,3 +314,16 @@ Load balancing by program length did not help: with a cost model for shader reco
 The `shader` scene (background from `gl_FragCoord`, perspective checkerboard, Phong sphere, discard stripes, translucent layer; 6,524 records at 1920 x 1088): device 4.6 ms minimum, 5.1 ms median, whole `render()` 12.7 ms; the busiest core draws 257 records at 18 us each (a fixed-function record is 3.5 us).
 
 The default test scene of a few large triangles with the per-pixel Phong shader (GLSL fragment shader of 44 translated instructions, `gl_scene --fs phong`) at 1024 x 1024 through Mesa: stock softpipe 73 ms per frame, one chip 9.7 ms per frame (differences of two runs of different length, so start-up cancels): 4.6 ms in the rasterizer call (device 2.2 ms, read-back 0.7 ms, 763 records), 0.3 ms writing the result into softpipe's buffers, the rest is Mesa's vertex stage and the `glReadPixels` of the test program.
+
+## Gaussian splatting (`plugins/gaussian`, `docs/GAUSSIANS.md`)
+
+Demo scene (flat Gaussians on a floor, a sphere and a torus), 1280 x 720, node 5 (x8 link), median of 3 frames after a warm-up, compiled shader. "CPU" is the float reference renderer on 64 threads (binning plus rasterization; projection, 9 to 33 ms, is the same for both and left out). Device time in brackets.
+
+| Gaussians | CPU float reference | one chip, shader triangles | eight chips | PSNR against the float reference |
+| --- | --- | --- | --- | --- |
+| 50,000 | 70 ms | 94 ms (52) | not run | 51.0 dB |
+| 200,000 | 148 ms | 353 ms (200) | 242 ms (111) | 47.0 dB |
+| 800,000 | 600 ms | 1,419 ms (821) | 985 ms (439) | 41.4 dB |
+
+The chip takes about 14 microseconds of one core per (triangle, tile) record for the 20-instruction splat program plus blending (a fixed-function record: 3.5 microseconds), and one core runs a tile's whole list, so eight chips give 1.6 to 1.9 times one chip. The interpreter takes 849 ms against 471 ms compiled for 100,000 synthetic Gaussians.
+

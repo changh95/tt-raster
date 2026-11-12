@@ -19,6 +19,10 @@ for t in test_newton_bridge test_isaaclab_shim test_pipeline test_frame_api; do
     [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "$t failed"; exit 1; }
 done
 
+echo "== test_gaussian (Gaussian splatting plugin, reference backend)"
+TTRASTER_GS_LIB="${TT_RASTER_BUILD_DIR:-$root/build}/plugins/gaussian/libttraster_gaussian.so" "$py" "$root/plugins/gaussian/tests/test_gaussian.py" --backend reference 2>&1 | grep -E "^(ok|FAIL|PASS)|Error|Traceback"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "test_gaussian failed"; exit 1; }
+
 echo "== test_server (device server, CPU reference backend)"
 "$py" "$root/core/tests/test_server.py" 2>&1 | grep -E "^(ok|FAIL|PASS)|Error|Traceback"
 [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "test_server failed"; exit 1; }
@@ -30,5 +34,8 @@ if [[ -n "${TT_METAL_HOME:-}" ]]; then
         "$root/scripts/run.sh" "$node" "$py" "$(testpath "$t")" --backend tensix 2>&1 | grep -E "^(ok|FAIL|skip|PASS)|failed|Error|Traceback"
         [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "$t failed"; exit 1; }
     done
+    echo "== test_gaussian (tensix backend, node $node)"
+    TTRASTER_GS_LIB="${TT_RASTER_BUILD_DIR:-$root/build}/plugins/gaussian/libttraster_gaussian.so" "$root/scripts/run.sh" "$node" "$py" "$root/plugins/gaussian/tests/test_gaussian.py" --backend tensix 2>&1 | grep -E "^(ok|FAIL|PASS)|Error|Traceback"
+    [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "test_gaussian (tensix) failed"; exit 1; }
 fi
 echo "python tests OK"
