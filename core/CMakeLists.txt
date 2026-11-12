@@ -4,6 +4,7 @@
 # tt-metal), the C frame API (libttraster.so) and the tools, tests and spikes that belong to them. No OpenGL, Vulkan, Isaac Lab
 # or Newton code lives here; those are api/ and plugins/.
 find_package(ZLIB REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(ttraster_core STATIC
     src/ttraster/frame.cpp
@@ -12,6 +13,7 @@ add_library(ttraster_core STATIC
     src/ttraster/tile.cpp
     src/ttraster/reference.cpp
     src/ttraster/backend.cpp
+    src/ttraster/remote.cpp
     src/ttraster/oracle.cpp
     src/ttraster/scenes.cpp
     src/ttraster/image.cpp

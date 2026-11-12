@@ -1,0 +1,14 @@
+# Vulkan CTS groups that draw (see docs/EVALUATION_GL_VULKAN.md, "Vulkan CTS through the offload"), one pattern per line.
+# scripts/cts_farm.py splits each into its child groups and runs them on several workers.
+dEQP-VK.draw.renderpass.*
+dEQP-VK.draw.dynamic_rendering.*
+dEQP-VK.rasterization.*
+dEQP-VK.fragment_operations.*
+dEQP-VK.dynamic_state.*
+dEQP-VK.clipping.*
+dEQP-VK.depth.*
+dEQP-VK.ubo.*
+dEQP-VK.renderpasses.renderpass1.*
+dEQP-VK.renderpasses.renderpass2.*
+dEQP-VK.renderpasses.dynamic_rendering.*
+dEQP-VK.glsl.*

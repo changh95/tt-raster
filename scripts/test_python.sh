@@ -19,6 +19,10 @@ for t in test_newton_bridge test_isaaclab_shim test_pipeline test_frame_api; do
     [[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "$t failed"; exit 1; }
 done
 
+echo "== test_server (device server, CPU reference backend)"
+"$py" "$root/core/tests/test_server.py" 2>&1 | grep -E "^(ok|FAIL|PASS)|Error|Traceback"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || { echo "test_server failed"; exit 1; }
+
 if [[ -n "${TT_METAL_HOME:-}" ]]; then
     node="${TT_RASTER_NODE:-3}"
     for t in test_newton_bridge test_isaaclab_shim test_pipeline test_frame_api; do

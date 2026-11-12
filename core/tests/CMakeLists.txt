@@ -23,3 +23,11 @@ ttr_test(test_perspective fast)
 ttr_test(test_state fast)
 ttr_test(test_shader fast)
 ttr_test(test_golden golden)
+
+# The shader manifest lives in the Tensix library; the test opens no device.
+if(TT_RASTER_BUILD_DEVICE)
+    add_executable(test_shader_warm test_shader_warm.cpp)
+    target_link_libraries(test_shader_warm PRIVATE ttraster_tensix)
+    add_test(NAME test_shader_warm COMMAND test_shader_warm)
+    set_tests_properties(test_shader_warm PROPERTIES LABELS fast)
+endif()

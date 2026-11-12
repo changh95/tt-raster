@@ -10,6 +10,14 @@ target_link_libraries(ttr_diff PRIVATE ttraster_core)
 add_executable(ttr_compare ttr_compare.cpp)
 target_link_libraries(ttr_compare PRIVATE ttraster_core)
 
+# The device server; with tt-metal it can also serve a chip, without it only the CPU reference.
+add_executable(ttr_serverd ttr_serverd.cpp)
+target_link_libraries(ttr_serverd PRIVATE ttraster_core Threads::Threads)
+if(TT_RASTER_BUILD_DEVICE)
+    target_link_libraries(ttr_serverd PRIVATE ttraster_tensix)
+    target_compile_definitions(ttr_serverd PRIVATE TT_RASTER_WITH_TENSIX=1)
+endif()
+
 # Device tool: needs tt-metal.
 if(TT_RASTER_BUILD_DEVICE)
     add_executable(probe_device probe_device.cpp)
@@ -30,4 +38,7 @@ if(TT_RASTER_BUILD_DEVICE)
 
     add_executable(ttr_shader_fuzz ttr_shader_fuzz.cpp)
     target_link_libraries(ttr_shader_fuzz PRIVATE ttraster_tensix)
+
+    add_executable(ttr_prewarm ttr_prewarm.cpp)
+    target_link_libraries(ttr_prewarm PRIVATE ttraster_tensix)
 endif()

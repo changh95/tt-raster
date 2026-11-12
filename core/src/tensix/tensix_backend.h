@@ -15,7 +15,8 @@ namespace ttr {
 
 class TensixBackend : public Backend {
 public:
-    explicit TensixBackend(size_t n_chips) : lock_(n_chips), mc_(n_chips) {}
+    // TTR_SHADER_WARM=<manifest>: builds the compiled-shader kernels of a recorded run before the first frame (shader_warm.h).
+    explicit TensixBackend(size_t n_chips);
     const Framebuffer& render(const Frame& frame, uint32_t planes, int slot = 0) override;
     std::string report(int slot = 0) const override;
 

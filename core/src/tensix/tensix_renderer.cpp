@@ -2,6 +2,7 @@
 
 #include "tensix/tensix_renderer.h"
 #include "tensix/shader_codegen.h"
+#include "tensix/shader_warm.h"
 
 #include "ttraster/parallel.h"
 #include "ttraster/trace.h"
@@ -246,6 +247,12 @@ bool env_flag(const char* name) {
     return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// The directory the kernels come from (create_raster_kernels uses the same one).
+std::string kernel_source_dir() {
+    const char* kdir_env = std::getenv("TT_RASTER_KERNEL_DIR");
+    return kdir_env != nullptr ? std::string(kdir_env) + "/" : std::string(TT_RASTER_TENSIX_KERNELS);
+}
+
 // A key over the programs of a frame (code, register counts, interface), for remembering which program sets did not build.
 uint64_t shader_set_key(const std::vector<ShaderProgram>& programs) {
     uint64_t h = 1469598103934665603ull;
@@ -256,6 +263,20 @@ uint64_t shader_set_key(const std::vector<ShaderProgram>& programs) {
         mix(0xfeedu);
     }
     return h & ~3ull;   // the low two bits carry the level
+}
+
+CodegenOptions codegen_options(const DeviceOptions& opt) {
+    if (opt.codegen) {
+        CodegenOptions c = *opt.codegen;
+        c.level = opt.compile_level;
+        return c;
+    }
+    CodegenOptions copt;
+    copt.level = opt.compile_level;
+    if (const char* v = std::getenv("TTR_SHADER_COMPILE_BYTES")) copt.max_code_bytes = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));   // tests
+    if (const char* v = std::getenv("TTR_SHADER_COMPILE_MIN")) copt.min_instructions = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    if (const char* v = std::getenv("TTR_SHADER_COMPILE_PROGRAMS")) copt.max_programs = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+    return copt;
 }
 
 // A copy of the kernel directory plus the generated shader header, in a cache directory named after the contents (tt-metal caches the
@@ -272,9 +293,7 @@ std::string prepare_kernel_dir(const std::string& kernel_dir, const std::string&
         const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         for (char c : text) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
     }
-    const char* root_env = std::getenv("TT_RASTER_SHADER_CACHE");
-    const fs::path root = root_env != nullptr ? fs::path(root_env)
-                                              : fs::path(std::getenv("HOME") != nullptr ? std::getenv("HOME") : "/tmp") / ".cache" / "tt-raster" / "shader-kernels";
+    const fs::path root = shader_cache_root();
     char name[32];
     std::snprintf(name, sizeof name, "%016llx", static_cast<unsigned long long>(h));
     const fs::path dir = root / name;
@@ -307,8 +326,7 @@ RasterKernels create_raster_kernels(
     uint32_t mask, bool shaded, const DeviceOptions& opt) {
     using namespace tt::tt_metal;
     // TT_RASTER_KERNEL_DIR overrides the kernel directory (A/B runs of older kernel versions).
-    const char* kdir_env = std::getenv("TT_RASTER_KERNEL_DIR");
-    const std::string kdir = kdir_env != nullptr ? std::string(kdir_env) + "/" : std::string(TT_RASTER_TENSIX_KERNELS);
+    const std::string kdir = kernel_source_dir();
     std::vector<uint32_t> reader_args, writer_args;
     in_args.append_to(reader_args);
     out_args.append_to(writer_args);
@@ -345,11 +363,7 @@ RasterKernels create_raster_kernels(
     std::string compute_dir = kdir;
     if (shaded && !opt.no_compile && (opt.compile_shaders || env_flag("TTR_SHADER_COMPILE"))) {
         uint32_t n_compiled = 0;
-        CodegenOptions copt;
-        copt.level = opt.compile_level;
-        if (const char* v = std::getenv("TTR_SHADER_COMPILE_BYTES")) copt.max_code_bytes = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));   // tests
-        if (const char* v = std::getenv("TTR_SHADER_COMPILE_MIN")) copt.min_instructions = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
-        if (const char* v = std::getenv("TTR_SHADER_COMPILE_PROGRAMS")) copt.max_programs = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+        const CodegenOptions copt = codegen_options(opt);
         const std::string header = generate_shader_header(frame.shaders, copt, &n_compiled);
         if (n_compiled > 0) {
             compute_dir = prepare_kernel_dir(kdir, header);
@@ -368,34 +382,105 @@ RasterKernels create_raster_kernels(
 
 }  // namespace
 
+namespace {
+
+// A hash over the kernel sources, so that what is remembered about program sets that did not build ends with an edit of a kernel.
+uint64_t kernel_sources_hash() {
+    static const uint64_t h = [] {
+        namespace fs = std::filesystem;
+        uint64_t v = 1469598103934665603ull;
+        std::vector<fs::path> files;
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(kernel_source_dir(), ec)) {
+            if (e.is_regular_file()) files.push_back(e.path());
+        }
+        std::sort(files.begin(), files.end());
+        for (const fs::path& f : files) {
+            std::ifstream in(f, std::ios::binary);
+            const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            for (char c : text) v = (v ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+        }
+        return v;
+    }();
+    return h;
+}
+
+}  // namespace
+
 DeviceFrame TensixRenderer::render(
     const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
     const DeviceOptions& opt, Framebuffer* target) {
     const bool compiling = !frame.shaders.empty() && !opt.no_compile && (opt.compile_shaders || env_flag("TTR_SHADER_COMPILE"));
     if (!compiling) return render_impl(frame, setup, bins, plan, opt, target);
     // Compiled kernels may not build (the code does not fit the core's kernel text, or the compiler runs out of local registers):
-    // try level 2 (values kept in local registers), then level 1 (everything through Dest), then the interpreter, and remember what failed.
+    // try level 2 (values kept in local registers), then level 1 (everything through Dest), then the interpreter, and remember what failed
+    // (in this process, and in the cache directory for the next one).
     const uint64_t key = shader_set_key(frame.shaders);
+    const uint32_t mask = effective_plane_mask(opt);
+    const bool less_equal = frame.depth_func == DepthFunc::LessEqual;
     for (uint32_t level = std::min<uint32_t>(opt.compile_level, 2); level >= 1; level--) {
+        DeviceOptions o = opt;
+        o.compile_level = level;
+        const CodegenOptions copt = codegen_options(o);
+        const uint64_t disk_key = shader_set_hash(frame.shaders, mask, less_equal, level, copt) ^ kernel_sources_hash();
         {
             std::lock_guard<std::mutex> lock(failed_mutex_);
             if (failed_.count(key | level) != 0) continue;
+            if (failed_checked_.insert(key | level).second && shader_set_known_failed(disk_key)) {
+                failed_.insert(key | level);
+                continue;
+            }
         }
         try {
-            DeviceOptions o = opt;
-            o.compile_level = level;
-            return render_impl(frame, setup, bins, plan, o, target);
+            DeviceFrame out = render_impl(frame, setup, bins, plan, o, target);
+            record_shader_set(frame.shaders, mask, less_equal, level, copt);
+            return out;
         } catch (const std::runtime_error& e) {
             std::string why = e.what();
             why = why.substr(0, why.find('\n'));
             std::fprintf(stderr, "tensix: kernel with compiled shaders (level %u) failed (%s); trying the next level\n", level, why.c_str());
             std::lock_guard<std::mutex> lock(failed_mutex_);
             failed_.insert(key | level);
+            remember_shader_set_failed(disk_key);
         }
     }
     DeviceOptions plain = opt;
     plain.no_compile = true;
     return render_impl(frame, setup, bins, plan, plain, target);
+}
+
+double TensixRenderer::prewarm(const ShaderSetRecord& record) {
+    const auto t0 = std::chrono::steady_clock::now();
+    Frame f;
+    f.width = 64;
+    f.height = 64;
+    f.depth_func = record.less_equal ? DepthFunc::LessEqual : DepthFunc::Less;
+    f.shaders = record.programs;
+    // One triangle over the whole frame that runs the first program (program indices count from 1); the kernel does not depend on it.
+    Triangle tri;
+    tri.shader = 1;
+    tri.attr_offset = 0;
+    const float x[3] = {0, 128, 0}, y[3] = {0, 0, 128};
+    for (int j = 0; j < 3; j++) {
+        tri.v[j] = Vertex{};
+        tri.v[j].x = x[j];
+        tri.v[j].y = y[j];
+        tri.v[j].z = 0.5f;
+        tri.v[j].rhw = 1.0f;
+        for (uint32_t k = 0; k < record.programs.front().num_inputs; k++) f.attrs.push_back(0.5f);
+    }
+    f.triangles.push_back(tri);
+    const SetupResult setup = setup_frame(f);
+    const TileBins bins = bin_triangles(setup, f.tiles_x(), f.tiles_y());
+    const auto plan = plan_row_major(worker_cores(), f.tiles_x(), f.tiles_y());
+    DeviceOptions opt;
+    opt.compile_shaders = true;
+    opt.compile_level = record.level;
+    opt.codegen = record.codegen;
+    opt.plane_mask = record.plane_mask;
+    opt.debug_planes = false;
+    render(f, setup, bins, plan, opt);
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
 DeviceFrame TensixRenderer::render_impl(

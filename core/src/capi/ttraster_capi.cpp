@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -15,6 +16,7 @@
 #include "ttraster/backend.h"
 #include "ttraster/frame.h"
 #include "ttraster/parallel.h"
+#include "ttraster/remote.h"
 #ifdef TT_RASTER_WITH_TENSIX
 #include "tensix/tensix_backend.h"
 #endif
@@ -44,6 +46,9 @@ ttr_context* ttr_context_create(const char* backend, uint32_t n_chips) {
         const std::string b = backend ? backend : "reference";
         if (b == "reference") {
             c->backend = std::make_unique<ttr::ReferenceBackend>();
+        } else if (b == "remote" || (b == "tensix" && std::getenv("TTR_SERVER") != nullptr && std::getenv("TTR_SERVER")[0] != '\0')) {
+            // A device server (tools/ttr_serverd) owns the chip; this process never opens one (and falls back to the CPU if it is gone).
+            c->backend = std::make_unique<ttr::RemoteBackend>();
         } else if (b == "tensix") {
 #ifdef TT_RASTER_WITH_TENSIX
             c->backend = ttr::make_tensix_backend(n_chips == 0 ? 1 : n_chips);

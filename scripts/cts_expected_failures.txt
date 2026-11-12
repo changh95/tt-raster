@@ -1,0 +1,43 @@
+# Vulkan CTS cases expected to fail, one per line (a trailing * matches a prefix); scripts/cts_farm.py reports every other failure as new.
+# Written from a run of lavapipe alone over scripts/cts_groups.txt (Mesa 26.3, CTS 1.4.7.1) plus the known differences of the offload.
+
+# lavapipe's own failures (the same without the offload): feedback loops with 4 samples and depth or depth-stencil formats
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d16_unorm_samples_4_loop_Y_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d16_unorm_samples_4_loop_Y_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d16_unorm_samples_4_loop_Y_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d16_unorm_samples_4_loop_Y_sample_1_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d24_unorm_s8_uint_samples_4_loop_Y_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d24_unorm_s8_uint_samples_4_loop_Y_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d24_unorm_s8_uint_samples_4_loop_Y_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d24_unorm_s8_uint_samples_4_loop_Y_sample_1_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d32_sfloat_s8_uint_samples_4_loop_Y_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d32_sfloat_s8_uint_samples_4_loop_Y_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d32_sfloat_s8_uint_samples_4_loop_Y_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.d32_sfloat_s8_uint_samples_4_loop_Y_sample_1_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_NY_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_NY_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_NY_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_NY_sample_1_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YN_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YN_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YN_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YN_sample_1_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YY_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YY_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YY_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_YY_sample_1_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_Y_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_Y_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_Y_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.r8g8b8a8_unorm_samples_4_loop_Y_sample_1_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.s8_uint_samples_4_loop_Y_sample_0  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.s8_uint_samples_4_loop_Y_sample_0_general_layout  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.s8_uint_samples_4_loop_Y_sample_1  # lavapipe alone
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.m10_feedback_loop.s8_uint_samples_4_loop_Y_sample_1_general_layout  # lavapipe alone
+
+# With the offload on (--backend reference or tensix): these draw the same triangle strip through the offload and through llvmpipe and
+# compare the images bit for bit; the colour planes differ by one level at exact x.5 values (docs/EVALUATION_GL_VULKAN.md).
+dEQP-VK.draw.renderpass.output_location.array.b8g8r8a8-unorm-highp  # offload: one-level colour difference
+dEQP-VK.draw.renderpass.output_location.array.b8g8r8a8-unorm-highp-output-vec2  # offload: one-level colour difference
+dEQP-VK.draw.renderpass.output_location.array.b8g8r8a8-unorm-highp-output-vec3  # offload: one-level colour difference
+dEQP-VK.draw.renderpass.output_location.shuffle.inputs-outputs-mod  # offload: one-level colour difference

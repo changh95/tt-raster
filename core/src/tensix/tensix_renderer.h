@@ -8,6 +8,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <set>
 #include <mutex>
@@ -18,6 +19,8 @@
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/host_api.hpp>
 
+#include "tensix/shader_codegen.h"
+#include "tensix/shader_warm.h"
 #include "ttraster/reference.h"
 #include "ttraster/setup.h"
 #include "ttraster/tile.h"
@@ -52,6 +55,9 @@ struct DeviceOptions {
     uint32_t compile_level = 2;
     // Never compile (set when a kernel with compiled shaders failed to build and the frame is run again with the interpreter).
     bool no_compile = false;
+    // Which programs are compiled and how much code is allowed; unset = the defaults, adjusted by TTR_SHADER_COMPILE_* (tests). A
+    // replay of a recorded program set (shader_warm.h) sets it to what the recording used.
+    std::optional<CodegenOptions> codegen;
     // Extra compile-time defines for the kernels, for experiments (name -> value).
     std::map<std::string, std::string> defines;
     // Host threads used to encode the work lists; 0 = one per hardware thread.
@@ -96,6 +102,11 @@ public:
         const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan,
         const DeviceOptions& opt = {}, Framebuffer* target = nullptr);
 
+    // Build (or find in tt-metal's cache) the kernel of a recorded program set by drawing one small frame with it (shader_warm.h).
+    // Returns the host time of that frame in seconds; the set may end up on a lower code generation level or on the interpreter,
+    // as it would in a real frame.
+    double prewarm(const ShaderSetRecord& record);
+
 private:
     DeviceFrame render_impl(
         const Frame& frame, const SetupResult& setup, const TileBins& bins, const std::vector<CorePlan>& plan, const DeviceOptions& opt,
@@ -110,6 +121,7 @@ private:
     // Program sets (a key over the programs and a code generation level) whose compiled kernel did not build: not tried again.
     std::mutex failed_mutex_;
     std::set<uint64_t> failed_;
+    std::set<uint64_t> failed_checked_;   // sets whose entry in the cache directory's list was looked up (once per process)
 };
 
 // Plans: every tile of the target, split over `cores` in contiguous row-major chunks.

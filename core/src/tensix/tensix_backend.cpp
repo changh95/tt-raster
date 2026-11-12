@@ -7,10 +7,33 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <string>
 
 namespace ttr {
 
 using Clock = std::chrono::steady_clock;
+
+TensixBackend::TensixBackend(size_t n_chips) : lock_(n_chips), mc_(n_chips) {
+    const char* manifest = std::getenv("TTR_SHADER_WARM");
+    if (manifest == nullptr || manifest[0] == '\0') return;
+    // The kernel cache does not depend on the chip, so chip 0 builds for all of them.
+    std::string error;
+    const std::vector<ShaderSetRecord> sets = read_shader_manifest(manifest, &error);
+    if (!error.empty()) std::fprintf(stderr, "tensix: TTR_SHADER_WARM: %s\n", error.c_str());
+    const auto t0 = Clock::now();
+    for (const ShaderSetRecord& s : sets) {
+        try {
+            mc_.chip(0).prewarm(s);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "tensix: TTR_SHADER_WARM: a program set did not build (%s)\n", e.what());
+        }
+    }
+    if (!sets.empty()) {
+        std::fprintf(stderr, "tensix: warmed %zu compiled-shader program sets in %.1f s\n", sets.size(), std::chrono::duration<double>(Clock::now() - t0).count());
+    }
+}
 
 const Framebuffer& TensixBackend::render(const Frame& frame, uint32_t planes, int slot) {
     SlotState& st = slots_[slot];
